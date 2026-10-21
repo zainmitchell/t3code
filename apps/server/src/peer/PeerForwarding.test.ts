@@ -158,26 +158,39 @@ const boxLaunches = (seen: Ref.Ref<Seen>) =>
       ),
   });
 
+const boxProjectRecord = (input: {
+  readonly projectId: ProjectId;
+  readonly title: string;
+  readonly workspaceRoot: string;
+}) => ({
+  id: input.projectId,
+  title: input.title,
+  workspaceRoot: input.workspaceRoot,
+  defaultModelSelection: null,
+  scripts: [],
+  createdAt: "2026-10-18T00:00:00.000Z",
+  updatedAt: "2026-10-18T00:00:00.000Z",
+  deletedAt: null,
+});
+
 /** B clones and registers whatever it is asked to, and records it. */
 const boxProjects = (seen: Ref.Ref<Seen>) =>
   Layer.merge(
     Layer.mock(ProjectService.ProjectService)({
+      // A launch from outside a thread there starts from the project's defaults.
+      getById: (projectId) =>
+        Effect.succeed(
+          projectId === boxProject
+            ? Option.some(
+                boxProjectRecord({ projectId, title: "box", workspaceRoot: "/home/box/project" }),
+              )
+            : Option.none(),
+        ),
       create: (input) =>
         Ref.update(seen, (current) => ({
           ...current,
           projects: [...current.projects, input],
-        })).pipe(
-          Effect.as({
-            id: input.projectId,
-            title: input.title,
-            workspaceRoot: input.workspaceRoot,
-            defaultModelSelection: null,
-            scripts: [],
-            createdAt: "2026-10-18T00:00:00.000Z",
-            updatedAt: "2026-10-18T00:00:00.000Z",
-            deletedAt: null,
-          }),
-        ),
+        })).pipe(Effect.as(boxProjectRecord(input))),
     }),
     Layer.mock(SourceControlRepositoryService.SourceControlRepositoryService)({
       cloneRepository: (input) =>
