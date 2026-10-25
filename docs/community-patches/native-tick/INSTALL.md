@@ -1,5 +1,7 @@
 # Build and try the Native model-free tick source preview
 
+The current branch includes [review fixes after preview.1](BRANCH-UPDATES.md). The preview.1 download remains frozen and does not include those fixes. Its MANIFEST.json describes that original patch. Use the branch build below to try the corrected source while review continues.
+
 This preview targets official T3 Code v0.1.2, commit `044f07257c9684ae4543bd1e1ebf9c394e9e3830`. Windows backend setup was exercised with Node 26.12.1 and Vite+ 1.3.0. It provides source code, not a desktop installer or automatic app update. Use disposable state for the first trial.
 
 ## Build the already-patched branch

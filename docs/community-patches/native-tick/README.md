@@ -1,5 +1,7 @@
 # Native model-free ticks for T3 Code v0.1.2
 
+The review branch now includes [fixes after the frozen preview.1 download](BRANCH-UPDATES.md), including their verification and remaining limits. The original archive and raw patch are unchanged.
+
 This standalone community patch lets a scheduled task execute a trusted host-configured command instead of starting a model turn for every check. The command can finish with `{"requests":[]}` and T3 records completion without creating a thread or provider session. When work is needed, it can return validated requests to launch a worker, send a follow-up, or interrupt work it manages. Requested agent work can still consume provider usage.
 
 ## Why this exists
