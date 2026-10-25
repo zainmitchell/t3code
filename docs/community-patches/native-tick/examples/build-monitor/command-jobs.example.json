@@ -1,0 +1,12 @@
+{
+  "jobs": {
+    "check-work": {
+      "projectId": "replace-with-your-example-project-id",
+      "taskIds": ["replace-with-your-disabled-task-id"],
+      "executable": "/absolute/path/to/node",
+      "args": ["/absolute/path/to/watch-build.mjs"],
+      "cwd": "/absolute/path/to/writable-example-directory",
+      "timeoutMs": 10000
+    }
+  }
+}

@@ -53,6 +53,8 @@ import * as ThreadLifecycleService from "./ThreadLifecycleService.ts";
 import * as ThreadForkService from "./ThreadForkService.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
+import * as CommandJobs from "../commandJobs/CommandJobs.ts";
+import * as ProcessRunner from "../processRunner.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 
 export const layerEventInfrastructure = Layer.mergeAll(
@@ -289,6 +291,16 @@ const layerScheduledTaskProvided = ScheduledTaskService.layer.pipe(
       layerThreadManagementProvided,
       layerManagedProjectFoldersProvided,
       layerSecretRequestsProvided,
+      CommandJobs.layer.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            layerThreadLaunchProvided,
+            layerThreadManagementProvided,
+            layerProjectService,
+            ProcessRunner.layer,
+          ),
+        ),
+      ),
     ),
   ),
 );
