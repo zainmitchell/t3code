@@ -204,6 +204,6 @@
   "previewCleanup": "Whitespace-only formatting of one peer test; production code is identical to the previously verified package",
   "originalPackagePatchSha256": "7e4564c13a86f167eac91ec1fe3604b6eee83a029c5d2e4b7caed2f3deec4dbb",
   "artifactScope": "Frozen preview.1 archive and raw patch; these hashes do not describe later branch files.",
-  "reviewFollowupSourceCommit": "eaa1a4ebce0a8ef7565b69383dfe25c274379b9a",
+  "reviewFollowupSourceCommit": "6a42c2359072b859c4cc57d1ac3e70f851f8d744",
   "reviewFollowup": "BRANCH-UPDATES.md"
 }
