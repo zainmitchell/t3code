@@ -46,6 +46,15 @@ The recorded exercise used fresh homes, synthetic projects, disabled providers, 
 
 The launch and Stop improvements also work locally. Supply a stable `clientRequestId` for one top-level launch and reuse it when recovering that same unanswered request. Follow the returned thread and run to determine actual preparation and execution success. `t3_thread_interrupt` with `stop: true` requests the broader Stop operation; acceptance does not prove every arbitrary process ended.
 
-For another environment, run the built CLI's `environment link --help` and use its destination pairing code and access options. The agent discovers links with `t3_environment_links` and uses `environmentId` only on supported native tools. Both servers need compatible code. Keep pairing details private and use owner-trusted environments. The destination can revoke its connection.
+For another environment, run the built CLI's `environment link --help` and obtain a pairing code from the destination. Store the link in the same home used by the server above:
+
+```sh
+node apps/server/dist/bin.mjs environment link https://peer.example --pairing-code DESTINATION_PAIRING_CODE --access approval-required --base-dir /path/to/new-example-home
+node apps/server/dist/bin.mjs environment list --base-dir /path/to/new-example-home
+```
+
+Replace the destination URL and pairing-code placeholder. Use the same absolute `--base-dir` for `serve`, `environment link`, and `environment list`. Without that flag or a matching `T3CODE_HOME`, the CLI can store the link in a different home from the running server.
+
+The agent discovers links with `t3_environment_links` and uses `environmentId` only on supported native tools. Both servers need compatible code. Keep pairing details private and use owner-trusted environments. The destination can revoke its connection.
 
 The patch adds peer-link migration 68 after the official stable history. A custom fork that already used that number requires integration. Before any existing-state upgrade, stop the server and retain a complete backup. Reversing source code does not restore an earlier database. This preview does not include the later link-origin ownership, remote delegation, or handoff layers described in UPSTREAM.md.

@@ -136,8 +136,28 @@ it.effect("links with a pairing code, and the peer holds its agents to the limit
       expect(yield* probe(a)).toEqual({ caller: "T3 Code · Laptop", modes: "auto/default" });
 
       // A refusal keeps the peer's reason.
+      yield* a.links.recordOutcome(box.environmentId, { error: "Earlier transport failure." });
       const notFound = yield* probe(a, undefined, "refuse").pipe(Effect.flip);
       expect(notFound).toMatchObject({ code: "thread_not_found", message: "No such thread." });
+      expect(yield* a.links.get(box.environmentId)).toMatchObject({
+        _tag: "Some",
+        value: { lastError: null },
+      });
+
+      const mismatch = yield* a.peer
+        .call({
+          environmentId: box.environmentId,
+          tool: "probe",
+          arguments: {},
+          limits: { runtimeMode: "auto", interactionMode: "default" },
+          success: Schema.Struct({ incompatible: Schema.String }),
+        })
+        .pipe(Effect.flip);
+      expect(mismatch.message).toContain("did not match this version");
+      expect(yield* a.links.get(box.environmentId)).toMatchObject({
+        _tag: "Some",
+        value: { lastError: null },
+      });
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
@@ -220,6 +240,10 @@ it.effect("tells the agent to link again once the peer revokes the link or it ex
       const revoked = yield* probe(a).pipe(Effect.flip);
       expect(revoked.code).toBe("capability_denied");
       expect(revoked.message).toContain("revoked there");
+      expect(yield* a.links.get(box.environmentId)).toMatchObject({
+        _tag: "Some",
+        value: { lastError: revoked.message },
+      });
 
       yield* TestClock.adjust(Duration.days(31));
       expect((yield* a.links.list).map((link) => link.status)).toEqual(["expired"]);

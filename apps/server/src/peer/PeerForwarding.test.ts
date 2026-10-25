@@ -398,6 +398,7 @@ it.effect("an agent here works on a linked environment's threads within its own 
 
       // A plan-mode agent here may not steer that thread there: the box
       // refuses it, because the call carries the agent's own modes.
+      yield* a.links.recordOutcome(box.environmentId, { error: "Earlier transport failure." });
       const planned = yield* a.call("thread:laptop-plan", "t3_thread_send", {
         environmentId: box.environmentId,
         threadId: boxThread,
@@ -405,6 +406,10 @@ it.effect("an agent here works on a linked environment's threads within its own 
       });
       expect(failureOf(planned)).toMatchObject({ code: "interaction_mode_escalation_denied" });
       expect((yield* Ref.get(seen)).sends).toHaveLength(1);
+      expect(yield* a.links.get(box.environmentId)).toMatchObject({
+        _tag: "Some",
+        value: { lastError: null },
+      });
 
       // stop=true stops the thread there as its Stop button does: the whole
       // thread and the tasks it delegated, not just the running turn.
