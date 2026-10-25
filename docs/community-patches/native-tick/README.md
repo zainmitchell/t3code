@@ -54,3 +54,18 @@ On POSIX, a command-job process can survive a hard server crash. Restart reconci
 The package includes the MIT license and required upstream notice in [LICENSE](LICENSE). Keep those notices with copies or substantial portions. Preserve applicable dependency notices when distributing a built app. The license includes no warranty.
 
 The additional [publication checks](CHECKS.md) passed 178 selected tests, typechecks, and static checks. Final example import cleanup passed lint/format and a [direct replay](DIRECT-EXAMPLE-VERIFICATION.json); these counts overlap the focused evidence above.
+
+## Maintenance and upstream intent
+
+This is a temporary community patch fork. The owner maintains these patches and tracks bugs in [this fork's Issues](https://github.com/zainmitchell/t3code/issues) until T3 ships the capability or a better replacement. The intent is to retire the fork-specific patches as upstream meets the need.
+
+We would welcome upstream adoption of suitable changes through maintainer-approved direction and focused contributions. This preview carries no upstream endorsement, approval, merge commitment, or promise that its complete stable bundle will be merged as one PR.
+
+## AI models and roles
+
+| Model               | Role in this fork/release work                                                                                                                                                                        | Harness                    |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------- |
+| **Claude Opus 5.5** | Fork implementation and integration work. Existing T3 code retains its original authorship and upstream credits.                                                                                      | T3 Code's Claude provider. |
+| **GPT-6.1 Sol**     | Source extraction, limited cleanup, source/evidence and documentation review, focused verification, examples, and publication preparation. The tick documentation also received a GPT-6.1 Sol review. | Codex harness in T3 Code.  |
+
+These roles do not claim an independent full code audit of every upstream revision. CodeRabbit review of the source release has not been established; automated PR statuses and human/agent verification are reported separately.
