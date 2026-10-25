@@ -1353,7 +1353,13 @@ it.effect.each([
   }).pipe(Effect.provide(layerTest)),
 );
 
-it.effect("thread.stop interrupts background work past a queue cancelled before it ran", () =>
+it.effect.each([
+  { later: "ordinary", phase: "stop" },
+  { later: "newer active run", phase: "stop" },
+  { later: "newer completed run", phase: "stop" },
+  { later: "newer active run", phase: "settle" },
+  { later: "newer completed run", phase: "settle" },
+] as const)("$phase interrupts bounded background work with $later", ({ later, phase }) =>
   Effect.gen(function* () {
     const orchestrator = yield* Orchestrator.OrchestratorV2;
     const projections = yield* ProjectionStore.ProjectionStoreV2;
@@ -1422,27 +1428,119 @@ it.effect("thread.stop interrupts background work past a queue cancelled before 
       payload: { ...run!, status: "completed", startedAt: now, completedAt: now },
     });
 
-    yield* orchestrator.dispatch({
-      type: "thread.stop",
-      commandId: CommandId.make("stop-background"),
+    const throughSequence = yield* orchestrator.getThreadEventSequence(threadId);
+    const newerBackgroundId = TurnItemId.make("item:stop-background:newer");
+    if (later !== "ordinary") {
+      yield* send(threadId, "newer work", "start_immediately");
+      const newerProjection = yield* orchestrator.getThreadProjection(threadId);
+      const newer = newerProjection.runs.at(-1)!;
+      const newerProviderThread = newerProjection.providerThreads.find(
+        (thread) => thread.id === newer.providerThreadId,
+      )!;
+      yield* projections.apply({
+        id: EventId.make("event:stop-background:newer-roster"),
+        type: "provider-thread.updated",
+        threadId,
+        runId: newer.id,
+        occurredAt: now,
+        payload: {
+          ...newerProviderThread,
+          lastRunOrdinal: newer.ordinal,
+          pendingBackgroundTasks: [{ taskId: "newer-roster-task", kind: "command" }],
+          updatedAt: now,
+        },
+      });
+      yield* projections.apply({
+        id: EventId.make("event:stop-background:newer-item"),
+        type: "turn-item.updated",
+        threadId,
+        runId: newer.id,
+        occurredAt: now,
+        payload: {
+          id: newerBackgroundId,
+          threadId,
+          runId: newer.id,
+          nodeId: newer.rootNodeId!,
+          providerThreadId: newer.providerThreadId!,
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal: 1,
+          status: "running",
+          title: "Newer background command",
+          startedAt: now,
+          completedAt: null,
+          updatedAt: now,
+          type: "command_execution",
+          input: "newer work",
+        },
+      });
+      yield* send(threadId, "newer queued work", "queue_after_active");
+      if (later === "newer completed run")
+        yield* projections.apply({
+          id: EventId.make("event:stop-background:newer-completed"),
+          type: "run.updated",
+          threadId,
+          runId: newer.id,
+          occurredAt: now,
+          payload: { ...newer, status: "completed", startedAt: now, completedAt: now },
+        });
+      yield* watch(threadId, 43);
+    }
+    const before = yield* threadState(threadId);
+    const beforeProviderWork = (yield* orchestrator.getThreadProjection(
       threadId,
-    });
+    )).providerThreads.map((thread) => ({
+      id: thread.id,
+      pendingBackgroundTasks: thread.pendingBackgroundTasks,
+    }));
+    if (phase === "settle")
+      yield* orchestrator.dispatch({
+        type: "thread.background-work.settle",
+        commandId: CommandId.make("settle-background"),
+        threadId,
+        providerThreadId: run!.providerThreadId!,
+        providerTurnId,
+      });
+    else
+      yield* orchestrator.dispatch({
+        type: "thread.stop",
+        commandId: CommandId.make("stop-background"),
+        threadId,
+        ...(later === "ordinary" ? {} : { throughSequence }),
+      });
     const stopped = yield* orchestrator.getThreadProjection(threadId);
     assert.notInclude(
       ["pending", "running", "waiting"],
       stopped.turnItems.find((item) => item.id === backgroundId)?.status,
     );
-    assert.deepEqual(
-      stopped.turnItems
-        .filter((item) => item.type === "run_interrupt_request")
-        .map((item) => item.runId),
-      [run!.id],
-    );
-    assert.isTrue(Exit.isFailure(yield* Effect.exit(watch(threadId, 43))));
-    assert.deepEqual(yield* threadState(threadId), {
-      runs: ["completed", "cancelled"],
-      watched: [],
-    });
+    if (phase === "stop")
+      assert.deepEqual(
+        stopped.turnItems
+          .filter((item) => item.type === "run_interrupt_request")
+          .map((item) => item.runId),
+        [run!.id],
+      );
+    if (later === "ordinary") {
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(watch(threadId, 43))));
+      assert.deepEqual(yield* threadState(threadId), {
+        runs: ["completed", "cancelled"],
+        watched: [],
+      });
+    } else {
+      assert.deepEqual(yield* threadState(threadId), before);
+      assert.equal(
+        stopped.turnItems.find((item) => item.id === newerBackgroundId)?.status,
+        "running",
+      );
+      assert.deepEqual(
+        stopped.providerThreads.map((thread) => ({
+          id: thread.id,
+          pendingBackgroundTasks: thread.pendingBackgroundTasks,
+        })),
+        beforeProviderWork,
+      );
+    }
   }).pipe(Effect.provide(layerTest)),
 );
 

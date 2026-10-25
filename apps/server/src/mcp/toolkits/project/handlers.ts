@@ -10,6 +10,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as ThreadLaunch from "../../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadMessageIntake from "../../../orchestration-v2/ThreadMessageIntake.ts";
+import * as ThreadManagement from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as Claims from "../../../orchestration-v2/AttachmentClaims.ts";
 import * as Project from "../../../project/ProjectService.ts";
 import * as ManagedProjectFolders from "../../../project/ManagedProjectFolders.ts";
@@ -107,8 +108,8 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
                 ),
               )).projectId
             : yield* resolveProjectId(context, input.projectId);
-        // Accepted creates skip mutable base/default-model preflights.
-        // Message intake still handles their replay and preparation.
+        // Accepted creates reuse their model. Only their first message needs
+        // base validation; message replays reuse stored preparation.
         const acceptedLaunch =
           input.clientRequestId === undefined
             ? undefined
@@ -137,7 +138,18 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
         // A launch is accepted before its worktree is provisioned, so a base
         // ref that cannot resolve is refused while the agent can still act on it.
         const strategy = input.workspaceStrategy;
-        if (acceptedLaunch === undefined && strategy?.type === "worktree")
+        const acceptedIdleFirstMessage =
+          acceptedLaunch !== undefined &&
+          strategy?.type === "worktree" &&
+          (input.message !== undefined || attachments.length > 0) &&
+          (yield* ThreadManagement.ThreadManagementService.pipe(
+            Effect.flatMap((threads) => threads.getMessageCount(threadId)),
+            Effect.mapError(unavailable),
+          )) === 0;
+        if (
+          (acceptedLaunch === undefined || acceptedIdleFirstMessage) &&
+          strategy?.type === "worktree"
+        )
           yield* ThreadLaunch.ThreadLaunchService.pipe(
             Effect.flatMap((launches) =>
               launches.checkWorktreeBase({ projectId, workspaceStrategy: strategy }),
@@ -146,7 +158,7 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
               (error) =>
                 new OrchestratorMcpFailure({
                   code: "invalid_request",
-                  message: `${error.message} No thread was created. Pass a branch, tag, or commit that exists there${
+                  message: `${error.message} ${acceptedLaunch === undefined ? "No thread was created." : "The accepted thread remains idle."} Pass a branch, tag, or commit that exists there${
                     strategy.startFromOrigin === true
                       ? "; the project has no usable remote to fetch it from."
                       : ", or set startFromOrigin:true if it exists only on a remote."
