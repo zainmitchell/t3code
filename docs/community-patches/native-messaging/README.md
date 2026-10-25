@@ -8,6 +8,19 @@ For example, a coding agent can start a reviewer, send an existing worker a chan
 
 This preview integrates T3's existing coordination work with selected reliability changes. [Upstream PR attribution and package scope](UPSTREAM.md) identifies the original and support PRs; this release does not replace that contribution route.
 
+## Upstream PR dependencies and support fixes
+
+| Required feature layer          | Original feature PR                                      | Support/integration PR                                   | What the layer supplies                                                              |
+| ------------------------------- | -------------------------------------------------------- | -------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| Caller mode limits              | [#16653](https://github.com/pingdotgg/t3code/pull/16653) | [#22445](https://github.com/pingdotgg/t3code/pull/22445) | Runtime and interaction ceilings for forwarded calls.                                |
+| Launch request keys             | [#16654](https://github.com/pingdotgg/t3code/pull/16654) | [#22446](https://github.com/pingdotgg/t3code/pull/22446) | Recover accepted launches on retry, with caller and worktree validation.             |
+| Peer links                      | [#16655](https://github.com/pingdotgg/t3code/pull/16655) | [#22447](https://github.com/pingdotgg/t3code/pull/22447) | Pairing, credentials, storage, MCP client, migration 68, and response/cleanup fixes. |
+| Native linked-environment tools | [#16684](https://github.com/pingdotgg/t3code/pull/16684) | [#22448](https://github.com/pingdotgg/t3code/pull/22448) | Native-tool forwarding plus Stop, validation, and wire-codec fixes.                  |
+
+The original feature order is mode limits → launch request keys → peer links → native-tool forwarding. Each support PR targets its matching original feature branch. These are paired feature/support routes, not eight independent patches to apply sequentially. Current PR heads can advance independently; this table is not a verified cherry-pick recipe for current main.
+
+For the published v0.1.2 preview, the selected supporting changes are already bundled in the single source patch. No separate PR application is required. Do not apply these PRs on top of that download. The preview is a reduced, version-pinned integration, not an assertion that it contains every change in the latest PR heads. The evidence attached to a newer PR head does not automatically validate this stable package.
+
 ## What the patch adds
 
 T3 v0.1.2 already provides local thread messaging and the queue, steer, and restart send modes. The patch extends those existing tools with the following behavior.

@@ -2,18 +2,20 @@
 
 This community preview integrates existing T3 work with selected reliability changes on the exact stable v0.1.2 source base. It does not originate the underlying native thread-control or linked-environment design. The complete delivered code delta is identified by MANIFEST.json and the source-patch checksum.
 
-## Existing upstream PRs
+## Upstream PR dependencies and support fixes
 
-The core upstream route is the original stack, checked on 2026-10-25:
+| Required feature layer          | Original feature PR                                      | Support/integration PR                                   | What the layer supplies                                                              |
+| ------------------------------- | -------------------------------------------------------- | -------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| Caller mode limits              | [#16653](https://github.com/pingdotgg/t3code/pull/16653) | [#22445](https://github.com/pingdotgg/t3code/pull/22445) | Runtime and interaction ceilings for forwarded calls.                                |
+| Launch request keys             | [#16654](https://github.com/pingdotgg/t3code/pull/16654) | [#22446](https://github.com/pingdotgg/t3code/pull/22446) | Recover accepted launches on retry, with caller and worktree validation.             |
+| Peer links                      | [#16655](https://github.com/pingdotgg/t3code/pull/16655) | [#22447](https://github.com/pingdotgg/t3code/pull/22447) | Pairing, credentials, storage, MCP client, migration 68, and response/cleanup fixes. |
+| Native linked-environment tools | [#16684](https://github.com/pingdotgg/t3code/pull/16684) | [#22448](https://github.com/pingdotgg/t3code/pull/22448) | Native-tool forwarding plus Stop, validation, and wire-codec fixes.                  |
 
-| PR                                                       | Role                                                                     | Observed status |
-| -------------------------------------------------------- | ------------------------------------------------------------------------ | --------------- |
-| [#16653](https://github.com/pingdotgg/t3code/pull/16653) | Forwarded runtime and interaction ceilings through `T3-Mode-Limit`.      | Open, unmerged. |
-| [#16654](https://github.com/pingdotgg/t3code/pull/16654) | Caller-scoped `clientRequestId` for native top-level launches.           | Open, unmerged. |
-| [#16655](https://github.com/pingdotgg/t3code/pull/16655) | Outgoing environment links, OAuth pairing, storage, CLI, and MCP client. | Open, unmerged. |
-| [#16684](https://github.com/pingdotgg/t3code/pull/16684) | Native tool targeting and forwarding to a linked environment.            | Open, unmerged. |
+The original feature order is mode limits → launch request keys → peer links → native-tool forwarding. Each support PR targets its matching original feature branch. These are paired feature/support routes, not eight independent patches to apply sequentially. Current PR heads can advance independently; this table is not a verified cherry-pick recipe for current main.
 
-The later replacement stack [#21670](https://github.com/pingdotgg/t3code/pull/21670), [#21671](https://github.com/pingdotgg/t3code/pull/21671), [#21672](https://github.com/pingdotgg/t3code/pull/21672), and [#21673](https://github.com/pingdotgg/t3code/pull/21673) was closed without merge. The [closure explanation](https://github.com/pingdotgg/t3code/pull/21673#issuecomment-6301888964) says the maintainer retained the original stack. Existing support PRs [#22445](https://github.com/pingdotgg/t3code/pull/22445), [#22446](https://github.com/pingdotgg/t3code/pull/22446), [#22447](https://github.com/pingdotgg/t3code/pull/22447), and [#22448](https://github.com/pingdotgg/t3code/pull/22448) target those original layers. This preview creates no replacement PR and requests no merge of the older closed stack.
+For the published v0.1.2 preview, the selected supporting changes are already bundled in the single source patch. No separate PR application is required. Do not apply these PRs on top of that download. The preview is a reduced, version-pinned integration, not an assertion that it contains every change in the latest PR heads. The evidence attached to a newer PR head does not automatically validate this stable package.
+
+The later replacement stack [#21670](https://github.com/pingdotgg/t3code/pull/21670), [#21671](https://github.com/pingdotgg/t3code/pull/21671), [#21672](https://github.com/pingdotgg/t3code/pull/21672), and [#21673](https://github.com/pingdotgg/t3code/pull/21673) was closed without merge. The [closure explanation](https://github.com/pingdotgg/t3code/pull/21673#issuecomment-6301888964) says the maintainer retained the original stack. This preview creates no replacement PR and requests no merge of the older closed stack.
 
 The package is a reduced source integration, not a byte-for-byte copy of the current PR heads or the full cross-environment stack. It includes launch-retry, forwarded-limit, Stop-retry, and peer response/cleanup changes present in its recorded source snapshot. Tests and runtime evidence here apply to this package, not to every upstream PR revision.
 
