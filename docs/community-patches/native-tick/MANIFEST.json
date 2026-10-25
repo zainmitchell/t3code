@@ -34,6 +34,6 @@
   "format": "Unified source diff; no contributor history or author metadata included",
   "privacyScreen": "Patch and complete changed-file contents screened; no findings",
   "artifactScope": "Frozen preview.1 archive and raw patch; these hashes do not describe later branch files.",
-  "reviewFollowupSourceCommit": "1262f3c69522acbb5c6a7c498ad4e3481b3def91",
+  "reviewFollowupSourceCommit": "25ab7ae764471316da5fe74532c159a5cc718fa6",
   "reviewFollowup": "BRANCH-UPDATES.md"
 }
