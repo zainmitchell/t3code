@@ -19,6 +19,21 @@ The later replacement stack [#21670](https://github.com/pingdotgg/t3code/pull/21
 
 The package is a reduced source integration, not a byte-for-byte copy of the current PR heads or the full cross-environment stack. It includes launch-retry, forwarded-limit, Stop-retry, and peer response/cleanup changes present in its recorded source snapshot. Tests and runtime evidence here apply to this package, not to every upstream PR revision.
 
+## Historical PR route
+
+The four capabilities remain necessary for this linked-environment design. Their older replacement PRs were closed without merging when maintainers retained the original feature stack. Applicable fixes now have the original/support integration routes below. Closed here records contribution history; it is not a finding that the code was broken.
+
+| Closed replacement PR                                    | Capability                      | Current original / support route                                                                                    |
+| -------------------------------------------------------- | ------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| [#21670](https://github.com/pingdotgg/t3code/pull/21670) | Forwarded caller mode limits    | [#16653](https://github.com/pingdotgg/t3code/pull/16653) / [#22445](https://github.com/pingdotgg/t3code/pull/22445) |
+| [#21671](https://github.com/pingdotgg/t3code/pull/21671) | Recoverable launch request keys | [#16654](https://github.com/pingdotgg/t3code/pull/16654) / [#22446](https://github.com/pingdotgg/t3code/pull/22446) |
+| [#21672](https://github.com/pingdotgg/t3code/pull/21672) | Peer links and credentials      | [#16655](https://github.com/pingdotgg/t3code/pull/16655) / [#22447](https://github.com/pingdotgg/t3code/pull/22447) |
+| [#21673](https://github.com/pingdotgg/t3code/pull/21673) | Native-tool forwarding          | [#16684](https://github.com/pingdotgg/t3code/pull/16684) / [#22448](https://github.com/pingdotgg/t3code/pull/22448) |
+
+The [closure explanation](https://github.com/pingdotgg/t3code/pull/21673#issuecomment-6301888964) records why the original route was retained. These historical replacements are not four extra patches to apply on top of the current integrations or the bundled stable download.
+
+See [REVIEW-STATUS.md](REVIEW-STATUS.md) for the merge state, CI execution, and exact revision evidence.
+
 ## What must be applied
 
 For the exact official v0.1.2 base, all supporting changes in this package are bundled in one patch. Do not apply the linked PR stack in addition to this ZIP. It needs no native tick or software factory patch and introduces no new dependency manifest or lockfile.
@@ -27,6 +42,6 @@ Both participating servers need compatible code for forwarded limits. Link acces
 
 The later [link-origin layer #16695](https://github.com/pingdotgg/t3code/pull/16695), linked-environment UI, remote `delegate_task`, conversation import, and thread handoff are outside this package. A remote top-level launch does not become a delegated child with automatic result delivery. A separate 3669 package remains a different, unfinished target.
 
-Original upstream design and implementation are credited through the PRs above. The owner reports Opus-generated additions; this preparation used GPT-6.1 Sol through Codex for extraction, small cleanup, verification, examples, and documentation. The full upstream MIT copyright and permission notice is retained in LICENSE. This community release carries no maintainer endorsement.
+Original upstream design and implementation are credited through the PRs above. The owner identifies Claude Opus 5.5 for the fork additions; this preparation used GPT-6.1 Sol through Codex for extraction, small cleanup, verification, examples, and documentation. The full upstream MIT copyright and permission notice is retained in LICENSE. This community release carries no maintainer endorsement.
 
 Related feature discussions include [launch request keys #16186](https://github.com/pingdotgg/t3code/discussions/16186) and [Claude-specific cross-machine messaging #16230](https://github.com/pingdotgg/t3code/discussions/16230). This version-pinned preview shares integration and verification evidence; it does not open a competing feature PR.

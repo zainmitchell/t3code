@@ -21,6 +21,8 @@ The original feature order is mode limits → launch request keys → peer links
 
 For the published v0.1.2 preview, the selected supporting changes are already bundled in the single source patch. No separate PR application is required. Do not apply these PRs on top of that download. The preview is a reduced, version-pinned integration, not an assertion that it contains every change in the latest PR heads. The evidence attached to a newer PR head does not automatically validate this stable package.
 
+See the [current PR status and exact revision evidence](REVIEW-STATUS.md), including CI that did not execute and reported local checks. The [upstream map](UPSTREAM.md#historical-pr-route) preserves the closed replacement history.
+
 ## What the patch adds
 
 T3 v0.1.2 already provides local thread messaging and the queue, steer, and restart send modes. The patch extends those existing tools with the following behavior.
@@ -92,3 +94,18 @@ Useful feedback includes which coordination failure matters most in your workflo
 This is community fork work, with no upstream endorsement or merge commitment claimed. The source and documentation retain the [MIT notice](LICENSE). A source release must retain its required copyright and permission notice and applicable upstream dependency notices.
 
 The additional [publication checks](CHECKS.md) passed static checks and 536 selected tests but recorded three Windows fixture failures. The aggregate test gate is not green on this host. The preview adds only formatter cleanup in one test to the previously exercised code.
+
+## Maintenance and upstream intent
+
+This is a temporary community patch fork. The owner maintains these patches and tracks bugs in [this fork's Issues](https://github.com/zainmitchell/t3code/issues) until T3 ships the capability or a better replacement. The intent is to retire the fork-specific patches as upstream meets the need.
+
+We would welcome upstream adoption of suitable changes through maintainer-approved direction and focused contributions. This preview carries no upstream endorsement, approval, merge commitment, or promise that its complete stable bundle will be merged as one PR.
+
+## AI models and roles
+
+| Model               | Role in this fork/release work                                                                                                                                                                        | Harness                    |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------- |
+| **Claude Opus 5.5** | Fork implementation and integration work. Existing T3 code retains its original authorship and upstream credits.                                                                                      | T3 Code's Claude provider. |
+| **GPT-6.1 Sol**     | Source extraction, limited cleanup, source/evidence and documentation review, focused verification, examples, and publication preparation. The tick documentation also received a GPT-6.1 Sol review. | Codex harness in T3 Code.  |
+
+These roles do not claim an independent full code audit of every upstream revision. CodeRabbit review of the source release has not been established; automated PR statuses and human/agent verification are reported separately.
