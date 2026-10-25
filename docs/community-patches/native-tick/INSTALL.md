@@ -32,7 +32,13 @@ The HEAD output before application must be `044f07257c9684ae4543bd1e1ebf9c394e9e
 
 ## Start with a new T3 home
 
-Choose an unused loopback port and new disposable directories. From the source checkout:
+Choose an unused loopback port and new disposable directories. Create the example project directory, then register it in the disposable T3 home before starting the server:
+
+```sh
+node apps/server/dist/bin.mjs project add /path/to/example-project --title "Tick example" --base-dir /path/to/new-example-home
+```
+
+Record the project ID printed by `project add`. The `serve` command's final directory argument sets the working directory and does not create a project. From the same source checkout, start the server with the same home and project directory:
 
 ```sh
 node apps/server/dist/bin.mjs serve --host 127.0.0.1 --port 47831 --base-dir /path/to/new-example-home --no-browser /path/to/example-project
@@ -46,7 +52,7 @@ The recorded exercise used fresh homes, synthetic projects, disabled providers, 
 
 The executable is trusted host code. T3's action limits do not sandbox its filesystem, process, or network access.
 
-1. In the disposable environment, create a disabled scheduled task for an example project with prompt `command-job:check-work`. Record its project and task IDs. The ordinary task model selection remains part of its record, but command-job dispatch does not send this reference as a model prompt.
+1. In the disposable environment, create a disabled scheduled task for the project registered above with prompt `command-job:check-work`. Record its task ID and use the recorded project ID. The ordinary task model selection remains part of its record, but command-job dispatch does not send this reference as a model prompt.
 2. Copy `examples/check-work.mjs` and `examples/command-jobs.example.json` to an example area. Put the configuration at `<example-home>/userdata/command-jobs.json`.
 3. Replace the ID placeholders. Set the actual Node executable, script argument, and `cwd` to absolute paths. Use forward slashes or valid JSON escaping on Windows. `.cmd` and `.bat` launchers are not accepted.
 4. Enable or manually run the bound task. Inspect its recorded terminal result. Run-now acknowledges queueing before the pass completes; use the scheduler's status/subscription to observe completion.

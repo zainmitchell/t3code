@@ -138,6 +138,7 @@ const setup = Effect.fn("setup")(function* (options: {
   readonly timeoutMs?: number;
   readonly args?: ReadonlyArray<string>;
   readonly acceptedCommands?: ReadonlySet<string>;
+  readonly failLaunchOnce?: "accepted" | "unaccepted";
   readonly baseRefMissing?: boolean;
   readonly events?: Queue.Queue<OrchestrationV2DomainEvent>;
   readonly processes?: Layer.Layer<ProcessRunner.ProcessRunner>;
@@ -226,6 +227,7 @@ const setup = Effect.fn("setup")(function* (options: {
     fs.readFileString(jobFile(name)).pipe(Effect.map((text) => JSON.parse(text)));
 
   const calls: Calls = { launches: [], sends: [], sendLimits: [], interrupts: [] };
+  const acceptedCommands = new Set(options.acceptedCommands);
   const layer = CommandJobs.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
@@ -252,8 +254,17 @@ const setup = Effect.fn("setup")(function* (options: {
               : Effect.void,
           // Like the real service, a replayed command id resolves to the thread it created.
           launch: (input) =>
-            Effect.sync(() => {
+            Effect.gen(function* () {
               calls.launches.push(input);
+              if (options.failLaunchOnce !== undefined && calls.launches.length === 1) {
+                if (options.failLaunchOnce === "accepted") acceptedCommands.add(input.commandId);
+                return yield* new ThreadLaunchService.ThreadLaunchError({
+                  operation: "dispatch-message",
+                  commandId: input.commandId,
+                  projectId: input.projectId,
+                  cause: new Error("Initial message dispatch failed."),
+                });
+              }
               return {
                 threadId: ThreadId.make(`thread:${input.commandId}`),
                 resumed: false,
@@ -267,8 +278,7 @@ const setup = Effect.fn("setup")(function* (options: {
               : Effect.sync(() => (options.shell?.current ?? null) as never),
           getThreadRecords: () =>
             Effect.sync(() => (options.records?.current ?? { runs: [], subagents: [] }) as never),
-          hasReceipt: (commandId) =>
-            Effect.succeed(options.acceptedCommands?.has(commandId) ?? false),
+          hasReceipt: (commandId) => Effect.succeed(acceptedCommands.has(commandId)),
           sendToThread: (input) =>
             Effect.gen(function* () {
               calls.sends.push(input);
@@ -471,9 +481,9 @@ it.live("checks every request against the job's ceiling before acting on it", ()
         'Model "frontier" is not a',
         'Runtime mode "full-access',
         'Branch must start with "f',
-        "Invalid request: Expecte",
+        "Invalid request: the output does not match the request schema.",
         "Only workers this job la",
-        "Invalid request: Expecte",
+        "Invalid request: the output does not match the request schema.",
         "Launch limit for this pa",
       ].map((reason) => reason.slice(0, 24)),
     );
@@ -599,6 +609,22 @@ it.live("a timeout kills the job's whole process tree and is reported", () =>
     const failure = yield* runJob(fixture.jobs);
     assert.equal(failure._tag === "Some" ? failure.value.message : null, "Timed out after 1000ms.");
     const grandchild = Number(yield* fixture.fs.readFileString(fixture.pidPath));
+    if (windowsHost) {
+      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const wait = yield* spawner.spawn(
+        ChildProcess.make(
+          "powershell.exe",
+          [
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            `Get-Process -Id ${grandchild} -ErrorAction SilentlyContinue | Wait-Process -Timeout 5 -ErrorAction SilentlyContinue`,
+          ],
+          { stdout: "ignore", stderr: "ignore" },
+        ),
+      );
+      yield* wait.exitCode;
+    }
     const alive = (() => {
       try {
         process.kill(grandchild, 0);
@@ -625,12 +651,35 @@ it.live("a failing exit is visible and its logs stay bounded", () =>
     });
     const failure = yield* runJob(fixture.jobs);
     const message = failure._tag === "Some" ? failure.value.message : "";
-    assert.match(message, /^Exited with code 3: /);
-    assert.isAtMost(message.length, 540);
+    assert.equal(message, "Exited with code 3.");
+    assert.notInclude(message, "final reason");
+    assert.include((yield* fixture.readJson("status.json")).error, "noise");
     // Requests from a failed run are never acted on.
     assert.lengthOf(fixture.calls.launches, 0);
     const log = yield* fixture.fs.stat(fixture.jobFile("last-run.log"));
     assert.isBelow(Number(log.size), 3 * 64 * 1024);
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.live("a failed process preserves its cause without copying its message", () =>
+  Effect.gen(function* () {
+    const cause = new ProcessRunner.ProcessSpawnError({
+      command: "sensitive-command-example",
+      argumentCount: 0,
+      cause: new Error("sensitive-underlying-detail"),
+    });
+    const fixture = yield* setup({
+      processes: Layer.succeed(ProcessRunner.ProcessRunner, {
+        run: () => Effect.fail(cause),
+      }),
+    });
+    const failure = yield* runJob(fixture.jobs);
+    assert.equal(failure._tag, "Some");
+    if (failure._tag === "None") return;
+    assert.strictEqual(failure.value.cause, cause);
+    assert.equal(failure.value.operation, "run");
+    assert.equal(failure.value.job, "tick");
+    assert.notInclude(failure.value.message, "sensitive-");
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
@@ -701,6 +750,60 @@ it.live("stop ends a running pass and interrupts its process", () =>
     assert.equal(yield* Ref.get(gate.count), 1);
     assert.equal((yield* fixture.readJson("status.json")).status, "failed");
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.live("a failed pass still runs its coalesced follow-up", () =>
+  Effect.gen(function* () {
+    const gate = yield* gatedProcesses;
+    const processes = Layer.effect(
+      ProcessRunner.ProcessRunner,
+      Effect.map(ProcessRunner.ProcessRunner, (runner) => ({
+        run: (input: ProcessRunner.ProcessRunInput) =>
+          runner.run(input).pipe(
+            Effect.flatMap((result) =>
+              Ref.get(gate.count).pipe(
+                Effect.map((count) => ({
+                  ...result,
+                  code: ChildProcessSpawner.ExitCode(count === 1 ? 1 : 0),
+                })),
+              ),
+            ),
+          ),
+      })),
+    ).pipe(Layer.provide(gate.layer));
+    const fixture = yield* setup({ processes });
+    const running = yield* runJob(fixture.jobs).pipe(Effect.forkChild);
+    yield* Queue.take(gate.started);
+    assert.isTrue(yield* fixture.jobs.requestPass(task, "tick"));
+    yield* Deferred.succeed(gate.release, undefined);
+    const failure = yield* Fiber.join(running);
+    assert.equal(yield* Ref.get(gate.count), 2);
+    assert.equal(failure._tag, "None");
+    assert.equal((yield* fixture.readJson("status.json")).status, "succeeded");
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.live.each(["accepted", "unaccepted"] as const)(
+  "a new %s launch failure retains only accepted intent",
+  (acceptance) =>
+    Effect.gen(function* () {
+      const fixture = yield* setup({ launch: ceiling, failLaunchOnce: acceptance });
+      yield* fixture.writePlan({ output: JSON.stringify({ requests: [launchRequest("w1")] }) });
+      const failure = yield* runJob(fixture.jobs);
+      assert.equal(failure._tag, "Some");
+      const { receipts } = yield* fixture.readJson("receipts.json");
+      assert.lengthOf(receipts, acceptance === "accepted" ? 1 : 0);
+      if (acceptance === "accepted") {
+        assert.isNull(receipts[0].threadId);
+        assert.match(receipts[0].recoveryError, /launch failed/);
+        yield* fixture.writePlan({});
+        yield* runJob(fixture.jobs);
+        const recovered = yield* fixture.readJson("receipts.json");
+        assert.equal(recovered.receipts[0].threadId, "thread:command-job:tick:w1");
+        assert.notProperty(recovered.receipts[0], "recoveryError");
+        assert.lengthOf(fixture.calls.launches, 2);
+      }
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
 it.live("a worker finishing wakes its idle job's task", () =>
@@ -855,10 +958,14 @@ it.live.runIf(windowsHost)(
       );
       yield* fixture.writePlan({ sleepMs: 120_000, pidFile: true });
       const server = yield* spawner.spawn(
-        ChildProcess.make(process.execPath, [harness, fixture.stateDir, JSON.stringify(task)], {
-          stdout: "ignore",
-          stderr: "ignore",
-        }),
+        ChildProcess.make(
+          process.execPath,
+          ["--experimental-strip-types", harness, fixture.stateDir, JSON.stringify(task)],
+          {
+            stdout: "ignore",
+            stderr: "ignore",
+          },
+        ),
       );
       yield* awaitFile(fixture.fs, fixture.fixtureDir, fixture.jobPidPath);
       const job = Number(yield* fixture.fs.readFileString(fixture.jobPidPath));

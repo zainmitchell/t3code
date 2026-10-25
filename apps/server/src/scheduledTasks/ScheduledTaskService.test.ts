@@ -19,6 +19,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as Fiber from "effect/Fiber";
 import * as Stream from "effect/Stream";
 import * as Deferred from "effect/Deferred";
+import * as Context from "effect/Context";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
@@ -29,8 +30,65 @@ import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ScheduledTaskService from "./ScheduledTaskService.ts";
+import * as CommandJobs from "../commandJobs/CommandJobs.ts";
 
 const isScheduledTaskError = Schema.is(ScheduledTaskError);
+
+it.effect("rechecks command-job coalescing before a busy task retry", () =>
+  Effect.gen(function* () {
+    const requests = yield* Ref.make(0);
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const context = yield* Layer.build(
+      ScheduledTaskService.layer.pipe(
+        Layer.provideMerge(
+          Layer.mergeAll(
+            SqlitePersistence.layerMemory,
+            Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+            Layer.mock(ThreadManagementService.ThreadManagementService)({}),
+            Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+              namedProjectsRoot: "/projects",
+              isScratchProject: () => Effect.succeed(false),
+            }),
+            Layer.mock(SecretRequests.SecretRequests)({}),
+            Layer.succeed(CommandJobs.CommandJobs, {
+              requestPass: () =>
+                Ref.updateAndGet(requests, (count) => count + 1).pipe(
+                  Effect.map((count) => count >= 3),
+                ),
+              run: () =>
+                Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+              stop: () => Effect.void,
+              wakeups: Stream.never,
+            }),
+            NodeCrypto.layer,
+            Scheduler.layer,
+          ),
+        ),
+      ),
+    );
+    const tasks = Context.get(context, ScheduledTaskService.ScheduledTaskService);
+    const sql = Context.get(context, SqlClient.SqlClient);
+    const id = ScheduledTaskId.make("task:retry-job");
+    yield* insertRow(
+      sql,
+      {
+        id,
+        next: null,
+        enabled: 0,
+        status: "never",
+        prompt: "command-job:tick",
+      },
+      "2026-09-09T12:00:00.000Z",
+    );
+    yield* tasks.runNow({ id });
+    yield* Deferred.await(entered);
+    yield* tasks.runNow({ id });
+    yield* TestClock.adjust("1 second");
+    assert.equal(yield* Ref.get(requests), 3);
+    yield* Deferred.succeed(release, undefined);
+  }).pipe(Effect.scoped),
+);
 
 const insertRow = (
   sql: SqlClient.SqlClient,

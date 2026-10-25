@@ -214,10 +214,36 @@ const decodeStatus = Schema.decodeUnknownEffect(Schema.fromJsonString(StatusFile
 const decodeRequest = Schema.decodeUnknownEffect(JobRequest);
 
 export class CommandJobError extends Schema.TaggedError<CommandJobError>()("CommandJobError", {
-  message: Schema.String,
-}) {}
+  operation: Schema.Literals([
+    "validate",
+    "hash",
+    "read",
+    "write",
+    "decode",
+    "prepare",
+    "launch",
+    "run",
+    "dispatch",
+  ]),
+  job: Schema.optional(Schema.String),
+  path: Schema.optional(Schema.String),
+  reason: Schema.optional(Schema.String),
+  cause: Schema.optional(Schema.Defect()),
+}) {
+  override get message(): string {
+    if (this.reason !== undefined) return this.reason;
+    const subject = this.job === undefined ? "Command job" : `Command job "${this.job}"`;
+    const location = this.path === undefined ? "" : ` at ${this.path}`;
+    return `${subject} ${this.operation} failed${location}.`;
+  }
+}
 
-const fail = (message: string) => Effect.fail(new CommandJobError({ message }));
+const fail = (
+  reason: string,
+  context: Omit<ConstructorParameters<typeof CommandJobError>[0], "reason"> = {
+    operation: "validate",
+  },
+) => Effect.fail(new CommandJobError({ ...context, reason }));
 
 const isoOrNull = (value: DateTime.DateTime | null | undefined) =>
   value == null ? null : DateTime.formatIso(value);
@@ -293,7 +319,7 @@ export const layer = Layer.effect(
         Effect.map((bytes) =>
           Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(""),
         ),
-        Effect.mapError((cause) => new CommandJobError({ message: cause.message })),
+        Effect.mapError((cause) => new CommandJobError({ operation: "hash", cause })),
       );
     const configPath = path.join(stateDir, COMMAND_JOBS_CONFIG_FILE);
     const jobDir = (job: string) => path.join(stateDir, "command-jobs", job);
@@ -320,23 +346,33 @@ export const layer = Layer.effect(
         Effect.provideService(FileSystem.FileSystem, fs),
         Effect.provideService(Path.Path, path),
         Effect.mapError(
-          (cause) =>
-            new CommandJobError({ message: `Could not write ${filePath}: ${cause.message}` }),
+          (cause) => new CommandJobError({ operation: "write", path: filePath, cause }),
         ),
       );
 
-    const readText = Effect.fnUntraced(function* (filePath: string, limit?: number) {
+    const readText = Effect.fn("CommandJobs.readText")(function* (
+      filePath: string,
+      limit?: number,
+    ) {
       if (!(yield* fs.exists(filePath).pipe(Effect.orElseSucceed(() => false)))) return null;
       if (limit !== undefined) {
         const info = yield* fs
           .stat(filePath)
-          .pipe(Effect.mapError((cause) => new CommandJobError({ message: cause.message })));
+          .pipe(
+            Effect.mapError(
+              (cause) => new CommandJobError({ operation: "read", path: filePath, cause }),
+            ),
+          );
         if (Number(info.size) > limit)
           return yield* fail(`${path.basename(filePath)} is larger than ${limit} bytes.`);
       }
       const bytes = yield* fs
         .readFile(filePath)
-        .pipe(Effect.mapError((cause) => new CommandJobError({ message: cause.message })));
+        .pipe(
+          Effect.mapError(
+            (cause) => new CommandJobError({ operation: "read", path: filePath, cause }),
+          ),
+        );
       const text = decodeTextFile(bytes);
       if (text === null) return yield* fail(`${path.basename(filePath)} must be UTF-8 text.`);
       return text;
@@ -351,7 +387,10 @@ export const layer = Layer.effect(
         Effect.mapError(
           (cause) =>
             new CommandJobError({
-              message: `Invalid ${COMMAND_JOBS_CONFIG_FILE}: ${cause.message}`,
+              operation: "decode",
+              path: configPath,
+              job,
+              cause,
             }),
         ),
       );
@@ -383,7 +422,13 @@ export const layer = Layer.effect(
       if (text === null) return [] as ReadonlyArray<Receipt>;
       return (yield* decodeReceipts(text).pipe(
         Effect.mapError(
-          (cause) => new CommandJobError({ message: `Invalid receipts.json: ${cause.message}` }),
+          (cause) =>
+            new CommandJobError({
+              operation: "decode",
+              job,
+              path: path.join(jobDir(job), "receipts.json"),
+              cause,
+            }),
         ),
       )).receipts;
     });
@@ -421,7 +466,7 @@ export const layer = Layer.effect(
     });
 
     /** Records the worker's worktree path once its workspace is ready; nothing else changes. */
-    const observeWorktree = Effect.fnUntraced(function* (
+    const observeWorktree = Effect.fn("CommandJobs.observeWorktree")(function* (
       threadId: ThreadId,
       record: LaunchRecord,
       projectId: ProjectId,
@@ -433,7 +478,10 @@ export const layer = Layer.effect(
         : { ...record, worktreePath: shell.worktreePath };
     });
 
-    const workerSnapshot = Effect.fnUntraced(function* (receipt: Receipt, projectId: ProjectId) {
+    const workerSnapshot = Effect.fn("CommandJobs.workerSnapshot")(function* (
+      receipt: Receipt,
+      projectId: ProjectId,
+    ) {
       // A failed read is not a missing thread: both leave the worker's state unknown, but only
       // a thread T3 no longer has is reported missing.
       const read =
@@ -537,7 +585,11 @@ export const layer = Layer.effect(
       const dir = jobDir(job);
       yield* fs
         .makeDirectory(dir, { recursive: true })
-        .pipe(Effect.mapError((cause) => new CommandJobError({ message: cause.message })));
+        .pipe(
+          Effect.mapError(
+            (cause) => new CommandJobError({ operation: "prepare", job, path: dir, cause }),
+          ),
+        );
       const nowIso = DateTime.now.pipe(Effect.map(DateTime.formatIso));
       const started = yield* DateTime.now;
       const startedAt = DateTime.formatIso(started);
@@ -565,7 +617,7 @@ export const layer = Layer.effect(
           ? null
           : yield* resolveBaseCommit(config.projectId, config.launch.baseRef);
 
-      const validateLaunch = Effect.fnUntraced(function* (
+      const validateLaunch = Effect.fn("CommandJobs.validateLaunch")(function* (
         request: LaunchRequest,
         ceiling: LaunchCeiling,
         base: string | null,
@@ -590,9 +642,12 @@ export const layer = Layer.effect(
           .checkWorktreeBase({ projectId: config.projectId, workspaceStrategy })
           .pipe(
             Effect.mapError(
-              () =>
+              (cause) =>
                 new CommandJobError({
-                  message: `Base ref "${ceiling.baseRef}" is not in the project.`,
+                  operation: "validate",
+                  job,
+                  reason: `Base ref "${ceiling.baseRef}" is not in the project.`,
+                  cause,
                 }),
             ),
           );
@@ -617,7 +672,7 @@ export const layer = Layer.effect(
         },
       });
 
-      const launch = Effect.fnUntraced(function* (
+      const launch = Effect.fn("CommandJobs.launch")(function* (
         request: LaunchRequest,
         { modelSelection, runtimeMode, interactionMode, workspaceStrategy }: LaunchSettings,
       ) {
@@ -640,9 +695,7 @@ export const layer = Layer.effect(
             creationSource: "server",
           })
           .pipe(
-            Effect.mapError(
-              (cause) => new CommandJobError({ message: `Launch failed: ${cause.message}` }),
-            ),
+            Effect.mapError((cause) => new CommandJobError({ operation: "launch", job, cause })),
           );
         return launched.threadId;
       });
@@ -740,7 +793,7 @@ export const layer = Layer.effect(
             Effect.map((result) => ({ _tag: "exited" as const, result })),
             Effect.mapError(
               (cause) =>
-                new CommandJobError({ message: `Could not run the job: ${cause.message}` }),
+                new CommandJobError({ operation: "run", job, path: config.executable, cause }),
             ),
           ),
         Deferred.await(stop).pipe(Effect.as({ _tag: "stopped" as const })),
@@ -783,7 +836,12 @@ export const layer = Layer.effect(
       if (processError !== null) {
         yield* fs.remove(outputPath).pipe(Effect.ignore);
         yield* writeStatus("failed", processError);
-        return yield* fail(processError);
+        return yield* fail(
+          finished._tag === "exited" && !finished.result.timedOut
+            ? `Exited with code ${String(finished.result.code)}.`
+            : processError,
+          { operation: "run", job },
+        );
       }
       const outputText = yield* Effect.result(readText(outputPath, OUTPUT_LIMIT_BYTES));
       yield* fs.remove(outputPath).pipe(Effect.ignore);
@@ -796,17 +854,23 @@ export const layer = Layer.effect(
                 decodeOutput(outputText.success).pipe(
                   Effect.mapError(
                     (cause) =>
-                      new CommandJobError({ message: `Invalid output file: ${cause.message}` }),
+                      new CommandJobError({ operation: "decode", job, path: outputPath, cause }),
                   ),
                 ),
               );
       if (output !== null && output._tag === "Failure") {
         yield* writeStatus("blocked", output.failure.message);
-        return yield* fail(`Blocked: ${output.failure.message}`);
+        return yield* fail(`Blocked: ${output.failure.message}`, {
+          operation: "decode",
+          job,
+          path: outputPath,
+          cause: output.failure,
+        });
       }
 
       const requests = output?.success.requests ?? [];
       let launchesLeft = config.launch?.maxLaunchesPerPass ?? DEFAULT_MAX_LAUNCHES_PER_PASS;
+      let dispatchFailure: CommandJobError | undefined;
       for (const [index, raw] of requests.entries()) {
         if (yield* Deferred.isDone(stop)) break;
         const decoded = yield* Effect.result(decodeRequest(raw));
@@ -822,7 +886,7 @@ export const layer = Layer.effect(
           outcome.rejected.push({
             index,
             ...(workId === undefined ? {} : { workId }),
-            reason: `Invalid request: ${decoded.failure.message}`,
+            reason: "Invalid request: the output does not match the request schema.",
           });
           continue;
         }
@@ -874,18 +938,23 @@ export const layer = Layer.effect(
             },
             worktreePath: null,
           };
-          receipts.set(request.workId, {
+          const receipt = {
             workId: request.workId,
             taskId: task.id,
             threadId: null,
             request,
             recordedAt,
             launch: intent,
-          });
+          };
+          receipts.set(request.workId, receipt);
           yield* saveReceipts();
           const launched = yield* Effect.result(launch(request, valid.success));
           if (launched._tag === "Failure") {
-            receipts.delete(request.workId);
+            if (yield* threads.hasReceipt(launchCommandId(job, request.workId))) {
+              receipts.set(request.workId, { ...receipt, recoveryError: launched.failure.message });
+            } else {
+              receipts.delete(request.workId);
+            }
             yield* saveReceipts();
             outcome.failed.push({
               index,
@@ -972,8 +1041,14 @@ export const layer = Layer.effect(
                 reason: "Interrupted by its command job.",
               }),
         );
-        if (result._tag === "Failure")
-          outcome.failed.push({ index, workId: request.workId, reason: String(result.failure) });
+        if (result._tag === "Failure") {
+          dispatchFailure = new CommandJobError({
+            operation: "dispatch",
+            job,
+            cause: result.failure,
+          });
+          outcome.failed.push({ index, workId: request.workId, reason: dispatchFailure.message });
+        }
       }
 
       const problems = [...outcome.rejected, ...outcome.failed];
@@ -981,7 +1056,7 @@ export const layer = Layer.effect(
       const first = problems[0]!;
       const message = `Blocked: ${problems.length} of ${requests.length} request(s) not run. ${first.workId ?? `#${first.index}`}: ${first.reason}`;
       yield* writeStatus("blocked", message);
-      return yield* fail(message);
+      return yield* fail(message, { operation: "dispatch", job, cause: dispatchFailure });
     });
 
     const run: CommandJobs["Service"]["run"] = Effect.fn("CommandJobs.run")(function* ({
@@ -1000,7 +1075,7 @@ export const layer = Layer.effect(
       if (!claimed) return;
       yield* Effect.gen(function* () {
         for (let pass = 1; ; pass += 1) {
-          yield* runPass({ task, job: jobName, config, stop, pass });
+          const result = yield* Effect.result(runPass({ task, job: jobName, config, stop, pass }));
           const again = yield* Ref.modify(passes, (current) => {
             const state = current.get(jobName);
             const next = new Map(current);
@@ -1015,7 +1090,10 @@ export const layer = Layer.effect(
             next.delete(jobName);
             return [false, next] as const;
           });
-          if (!again) return;
+          if (!again) {
+            if (result._tag === "Failure") return yield* Effect.fail(result.failure);
+            return;
+          }
         }
       }).pipe(
         Effect.ensuring(

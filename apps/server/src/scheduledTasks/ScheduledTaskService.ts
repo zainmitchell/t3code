@@ -1066,9 +1066,11 @@ export const layer = Layer.effect(
       task: ScheduledTask,
       jobName: string,
     ) {
-      if (Option.isSome(commandJobs) && (yield* commandJobs.value.requestPass(task, jobName)))
-        return;
-      yield* runTask(task, "manual").pipe(
+      yield* Effect.gen(function* () {
+        if (Option.isSome(commandJobs) && (yield* commandJobs.value.requestPass(task, jobName)))
+          return;
+        yield* runTask(task, "manual");
+      }).pipe(
         // The previous pass may still be releasing the task.
         Effect.retry({ times: 5, schedule: Schedule.spaced("1 second") }),
         Effect.catch((cause) =>

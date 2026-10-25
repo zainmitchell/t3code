@@ -33,5 +33,7 @@ if (build.status !== "pending" && previous?.fingerprint !== fingerprint) {
     "utf8",
   );
 }
-NodeFS.writeFileSync(".build-monitor-state.json", `${JSON.stringify({ fingerprint })}\n`, "utf8");
+const temporaryState = `.build-monitor-state.${process.pid}.tmp`;
+NodeFS.writeFileSync(temporaryState, `${JSON.stringify({ fingerprint })}\n`, "utf8");
+NodeFS.renameSync(temporaryState, ".build-monitor-state.json");
 NodeFS.writeFileSync(outputPath, `${JSON.stringify({ requests: [] })}\n`, "utf8");
