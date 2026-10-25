@@ -27,6 +27,7 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 
 import * as ServerConfig from "../config.ts";
 import * as DispatchModeLimit from "../orchestration-v2/DispatchModeLimit.ts";
+import * as CommandReceiptStore from "../orchestration-v2/CommandReceiptStore.ts";
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as ProcessRunner from "../processRunner.ts";
@@ -138,6 +139,7 @@ const setup = Effect.fn("setup")(function* (options: {
   readonly timeoutMs?: number;
   readonly args?: ReadonlyArray<string>;
   readonly acceptedCommands?: ReadonlySet<string>;
+  readonly receiptReadFailure?: { current: boolean; readonly afterLaunch?: boolean };
   readonly failLaunchOnce?: "accepted" | "unaccepted";
   readonly baseRefMissing?: boolean;
   readonly events?: Queue.Queue<OrchestrationV2DomainEvent>;
@@ -278,7 +280,11 @@ const setup = Effect.fn("setup")(function* (options: {
               : Effect.sync(() => (options.shell?.current ?? null) as never),
           getThreadRecords: () =>
             Effect.sync(() => (options.records?.current ?? { runs: [], subagents: [] }) as never),
-          hasReceipt: (commandId) => Effect.succeed(acceptedCommands.has(commandId)),
+          hasReceipt: (commandId) =>
+            options.receiptReadFailure?.current === true &&
+            (options.receiptReadFailure.afterLaunch !== true || calls.launches.length > 0)
+              ? Effect.fail(new CommandReceiptStore.CommandReceiptStoreReadError({ commandId }))
+              : Effect.succeed(acceptedCommands.has(commandId)),
           sendToThread: (input) =>
             Effect.gen(function* () {
               calls.sends.push(input);
@@ -804,6 +810,66 @@ it.live.each(["accepted", "unaccepted"] as const)(
         assert.lengthOf(fixture.calls.launches, 2);
       }
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.live("an unreadable receipt retains recovery intent without replaying it", () =>
+  Effect.gen(function* () {
+    const receiptReadFailure = { current: true };
+    const fixture = yield* setup({
+      launch: ceiling,
+      acceptedCommands: new Set(["command-job:tick:w1"]),
+      receiptReadFailure,
+    });
+    yield* writeReceipts(fixture, [
+      {
+        workId: "w1",
+        taskId: task.id,
+        threadId: null,
+        request: launchRequest("w1"),
+        recordedAt: "2026-10-22T00:00:00.000Z",
+      },
+    ]);
+    yield* fixture.writePlan({});
+    const failure = yield* runJob(fixture.jobs);
+    assert.equal(failure._tag, "Some");
+    const { receipts } = yield* fixture.readJson("receipts.json");
+    assert.lengthOf(receipts, 1);
+    assert.isNull(receipts[0].threadId);
+    assert.include(receipts[0].recoveryError, "read failed");
+    assert.lengthOf(fixture.calls.launches, 0);
+    receiptReadFailure.current = false;
+    yield* runJob(fixture.jobs);
+    assert.equal(
+      (yield* fixture.readJson("receipts.json")).receipts[0].threadId,
+      "thread:command-job:tick:w1",
+    );
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.live("an unreadable receipt after launch failure retains intent and a recovery error", () =>
+  Effect.gen(function* () {
+    const fixture = yield* setup({
+      launch: ceiling,
+      failLaunchOnce: "accepted",
+      receiptReadFailure: { current: true, afterLaunch: true },
+    });
+    yield* fixture.writePlan({ output: JSON.stringify({ requests: [launchRequest("w1")] }) });
+    assert.equal((yield* runJob(fixture.jobs))._tag, "Some");
+    const { receipts } = yield* fixture.readJson("receipts.json");
+    assert.lengthOf(receipts, 1);
+    assert.include(receipts[0].recoveryError, "read failed");
+    assert.lengthOf(fixture.calls.launches, 1);
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.live("an unreadable receipt prevents a fresh launch without local intent", () =>
+  Effect.gen(function* () {
+    const fixture = yield* setup({ launch: ceiling, receiptReadFailure: { current: true } });
+    yield* fixture.writePlan({ output: JSON.stringify({ requests: [launchRequest("w1")] }) });
+    const failure = yield* runJob(fixture.jobs);
+    assert.equal(failure._tag === "Some" ? failure.value.operation : null, "read");
+    assert.lengthOf(fixture.calls.launches, 0);
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
 it.live("a worker finishing wakes its idle job's task", () =>

@@ -725,6 +725,7 @@ it.effect.each([
   { name: "disabling", changes: { enabled: false } },
   { name: "pointing it away from its job", changes: { prompt: "Audit the repository." } },
   { name: "pointing it at another job", changes: { prompt: "command-job:other" } },
+  { name: "moving it to another project", changes: { projectId: otherProjectId } },
 ])("an edit $name stops the task's running job", ({ changes }) => {
   const openedSessions: Array<string> = [];
   return Effect.gen(function* () {
@@ -738,6 +739,7 @@ it.effect.each([
       yield* tasks.runNow({ id: task.id });
       yield* Queue.take(gate.started);
       yield* editTask(enabled, changes);
+      if (changes.projectId !== undefined) yield* Deferred.succeed(gate.release, undefined);
       const run = yield* Fiber.join(settled);
       assert.equal(run.lastRunStatus, "failed");
       assert.include(run.lastRunError ?? "", "Stopped.");

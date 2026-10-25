@@ -700,6 +700,11 @@ export const layer = Layer.effect(
         return launched.threadId;
       });
 
+      const readReceipt = (workId: string) =>
+        threads
+          .hasReceipt(launchCommandId(job, workId))
+          .pipe(Effect.mapError((cause) => new CommandJobError({ operation: "read", job, cause })));
+
       // Launches whose intent was recorded but whose thread was not. Ones the orchestrator never
       // saw are forgotten, so a runner that still wants the work asks again. Accepted ones are
       // finished from what was pinned before dispatch (the replay returns the same thread); if
@@ -707,7 +712,17 @@ export const layer = Layer.effect(
       // consumer may release its claim.
       for (const receipt of receipts.values()) {
         if (receipt.threadId !== null) continue;
-        if (!(yield* threads.hasReceipt(launchCommandId(job, receipt.workId)))) {
+        const accepted = yield* Effect.result(readReceipt(receipt.workId));
+        if (accepted._tag === "Failure") {
+          receipts.set(receipt.workId, { ...receipt, recoveryError: accepted.failure.message });
+          outcome.failed.push({
+            index: -1,
+            workId: receipt.workId,
+            reason: accepted.failure.message,
+          });
+          continue;
+        }
+        if (!accepted.success) {
           receipts.delete(receipt.workId);
           continue;
         }
@@ -907,7 +922,11 @@ export const layer = Layer.effect(
           // Accepted before, but its local receipt is gone (pruned or lost): a fresh intent would
           // claim today's base, model and prompt for a thread launched with others. Its facts
           // are unknown, so this fails, and the work stays claimed until someone reconciles it.
-          if (yield* threads.hasReceipt(launchCommandId(job, request.workId))) {
+          if (
+            yield* readReceipt(request.workId).pipe(
+              Effect.tapError((error) => writeStatus("blocked", error.message)),
+            )
+          ) {
             outcome.failed.push({
               index,
               workId: request.workId,
@@ -950,16 +969,18 @@ export const layer = Layer.effect(
           yield* saveReceipts();
           const launched = yield* Effect.result(launch(request, valid.success));
           if (launched._tag === "Failure") {
-            if (yield* threads.hasReceipt(launchCommandId(job, request.workId))) {
-              receipts.set(request.workId, { ...receipt, recoveryError: launched.failure.message });
-            } else {
+            const accepted = yield* Effect.result(readReceipt(request.workId));
+            const error = accepted._tag === "Failure" ? accepted.failure : launched.failure;
+            if (accepted._tag === "Success" && !accepted.success) {
               receipts.delete(request.workId);
+            } else {
+              receipts.set(request.workId, { ...receipt, recoveryError: error.message });
             }
             yield* saveReceipts();
             outcome.failed.push({
               index,
               workId: request.workId,
-              reason: launched.failure.message,
+              reason: error.message,
             });
             continue;
           }

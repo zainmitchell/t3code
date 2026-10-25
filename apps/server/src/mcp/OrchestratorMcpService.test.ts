@@ -1327,6 +1327,60 @@ describe("OrchestratorMcpService provider resolution", () => {
     );
   });
 
+  it.effect.each(["delegation", "creation"] as const)(
+    "reports receipt-read failures during %s as operation errors",
+    (operation) =>
+      Effect.gen(function* () {
+        const dependencies = Layer.mergeAll(
+          NodeServices.layer,
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadRecords: () => Effect.succeed(parentProjection([])),
+            hasReceipt: (commandId) =>
+              Effect.fail(new CommandReceiptStore.CommandReceiptStoreReadError({ commandId })),
+          }),
+          providerRegistryLayer([
+            providerSnapshot({
+              instanceId: codexInstanceId,
+              driver: ProviderDriverKind.make("codex"),
+              model: "gpt-5.4",
+            }),
+          ]),
+          adapterRegistryLayer([codexInstanceId]),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+          ServerSettings.layerTest(),
+        );
+        yield* Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          if (operation === "delegation") {
+            const result = yield* service
+              .delegateTask(scope, {
+                task: "Summarize the diff.",
+                target: { providerInstanceId: codexInstanceId },
+                mode: "async",
+                clientRequestId: "receipt-read-delegation",
+              })
+              .pipe(Effect.flip);
+            assert.equal(result.code, "orchestration_error");
+          } else {
+            const result = yield* service
+              .createThreads(scope, {
+                threads: [
+                  {
+                    prompt: "Summarize the diff.",
+                    target: { providerInstanceId: codexInstanceId },
+                  },
+                ],
+                clientRequestId: "receipt-read-creation",
+              })
+              .pipe(Effect.flip);
+            assert.equal(result.code, "orchestration_error");
+          }
+        }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
+      }),
+  );
+
   it.effect("rejects delegation to a provider without a registered adapter", () =>
     Effect.gen(function* () {
       const forkOnlyInstanceId = ProviderInstanceId.make("forkOnly");
