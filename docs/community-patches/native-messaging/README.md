@@ -1,5 +1,7 @@
 # Native agent messaging for T3 Code v0.1.2
 
+The review branch now includes [fixes after the frozen preview.1 download](BRANCH-UPDATES.md), including their verification and remaining limits. The original archive and raw patch are unchanged.
+
 This community source preview extends T3's existing native thread tools with recoverable launches, full Stop/retry behavior, forwarded permission ceilings, and selected tools for explicitly linked environments. It is a reduced stable integration of existing T3 work and selected fixes, with the PR relationships and verification limits below.
 
 ## Why this exists
