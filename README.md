@@ -1,3 +1,5 @@
+> Community native messaging preview for T3 Code v0.1.2: [overview](docs/community-patches/native-messaging/README.md), [setup](docs/community-patches/native-messaging/INSTALL.md), and [source-patch download](https://github.com/zainmitchell/t3code/releases/tag/community-native-messaging-v0.1.2-preview.1). Independent fork; the upstream project README follows.
+
 # T3 Code
 
 T3 Code is an "agent harness control surface". It enables control of the agents on your machine with a best-in-class mobile app ([iOS](https://apps.apple.com/us/app/t3-code-remote-claude-more/id6787819824), [Android](https://play.google.com/store/apps/details?id=com.t3tools.t3code)), [web app](https://app.t3.codes) and [Electron-based desktop app](https://t3.codes).

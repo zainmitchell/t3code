@@ -1,0 +1,206 @@
+{
+  "feature": "native-messaging",
+  "target": "T3 Code v0.1.2",
+  "baseCommit": "044f07257c9684ae4543bd1e1ebf9c394e9e3830",
+  "patch": "t3-v0.1.2-native-messaging.patch",
+  "patchSha256": "3556c7e4b0ffa39cf131d507396c8d7263558d1d4b8bcb5d7241911a934f7771",
+  "files": [
+    {
+      "path": "apps/server/src/auth/RpcAuthorization.ts",
+      "sha256": "e78cb6d1cb81f3bdc756b78dad47e4b2048a7a4eb027c704082f3364d5e72056"
+    },
+    {
+      "path": "apps/server/src/binCli.ts",
+      "sha256": "c549d86f3fd7f8332317bbb36ef3c8a79439d809dc72ea7564543b01e4e69b46"
+    },
+    {
+      "path": "apps/server/src/cli/environment.ts",
+      "sha256": "172e89ef2f88b35429d93069e775a867aa1ef9b84e53b70c5a0357540225c167"
+    },
+    {
+      "path": "apps/server/src/environment/ServerEnvironment.ts",
+      "sha256": "22dccb94768fe1db4f163c319eec6ab37595fb25188d9c99aed6baae79bba20e"
+    },
+    {
+      "path": "apps/server/src/mcp/McpHttpServer.test.ts",
+      "sha256": "7eecf3a4d17f5f4d6d2387b564cf0ea3a6d1a9cc16531965fd0385c349564ae4"
+    },
+    {
+      "path": "apps/server/src/mcp/McpHttpServer.ts",
+      "sha256": "b0dabeb950e83d16ec6cfd255c5823887d52860afb8c6e06547222349160affb"
+    },
+    {
+      "path": "apps/server/src/mcp/McpInvocationContext.ts",
+      "sha256": "2e8e6ac8a94ded58f680068795939a186f9895982cc18593fc0c9d4a909ace11"
+    },
+    {
+      "path": "apps/server/src/mcp/McpToolAccess.test.ts",
+      "sha256": "fb9c9cfe1e0acbf63ad8ec4a15d26f5eac89b3072c1553ba46c1d593cf7684ec"
+    },
+    {
+      "path": "apps/server/src/mcp/McpToolAccess.ts",
+      "sha256": "674f1a36a6692e6554b921c1ce3eb162f391f312a572b3644652149bd9c495e8"
+    },
+    {
+      "path": "apps/server/src/mcp/OrchestratorMcpService.ts",
+      "sha256": "eff6fff44650f4f6b0fa3e15c386fd8050dfca0f74a15d93afb95a230dfcd322"
+    },
+    {
+      "path": "apps/server/src/mcp/OrchestratorMcpToolkit.integration.test.ts",
+      "sha256": "29f3530126b5abc502ce1263c5ca368522af2ce561302fde57f42e8029b3b690"
+    },
+    {
+      "path": "apps/server/src/mcp/threadAccess.ts",
+      "sha256": "53dfdaedcfe21f1b26a8920a45118ecea1a6bbc85c6cb188cd514ed5c15eb5e3"
+    },
+    {
+      "path": "apps/server/src/mcp/toolkits/core.test.ts",
+      "sha256": "8ef7e6d79e73a65c15e9b74f477c5dd7bc796d60d4dd7005a33a49acdf7950c0"
+    },
+    {
+      "path": "apps/server/src/mcp/toolkits/orchestrator/handlers.ts",
+      "sha256": "feb50dadcf2e622d00ce0e7149b0efde6f4a53713c8a8c2799165f7216c138e7"
+    },
+    {
+      "path": "apps/server/src/mcp/toolkits/orchestrator/tools.ts",
+      "sha256": "b8ba1c87fcefc7dd53f794bb1fb9fe2f673e2c00e19c035cf5619a86e8c2a6d0"
+    },
+    {
+      "path": "apps/server/src/mcp/toolkits/project/handlers.test.ts",
+      "sha256": "45e23026016bcca7841b95f83811b622df11cb29d8a40ed024f1bcfb52e681b4"
+    },
+    {
+      "path": "apps/server/src/mcp/toolkits/project/handlers.ts",
+      "sha256": "1b49a0de2b5ac66c6d291409f88299aa74527483d1c2c0faa1baf7e60f5245bf"
+    },
+    {
+      "path": "apps/server/src/mcp/toolkits/project/tools.ts",
+      "sha256": "bb3ff81c497f41a0712152558abb1f5f4941533bd7a8b5ec6d9e7a69d25e406e"
+    },
+    {
+      "path": "apps/server/src/observability/RpcInstrumentation.ts",
+      "sha256": "9c33cf6e9f10342e2024c29e03413dbdf61108511b86743fe428ac6013a70142"
+    },
+    {
+      "path": "apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts",
+      "sha256": "ef86666e632ff589726f10815ca508e2def0ca5e15d4fb8184300e3b8d856821"
+    },
+    {
+      "path": "apps/server/src/orchestration-v2/EventSink.ts",
+      "sha256": "8269187be612e9de9855abac3a41844e446dca6b28a240b5c55100ceb81bff36"
+    },
+    {
+      "path": "apps/server/src/orchestration-v2/Orchestrator.ts",
+      "sha256": "c71b08648dd1ceb907d958fed12834d179fc6efa12c5584013ca606ec611b7f1"
+    },
+    {
+      "path": "apps/server/src/orchestration-v2/ThreadLaunchService.test.ts",
+      "sha256": "ff4decbfdf3c29994a484c38f52e36d500c54a4f83f3dcfaf3072379df0ef0cc"
+    },
+    {
+      "path": "apps/server/src/orchestration-v2/ThreadLaunchService.ts",
+      "sha256": "481b2806dc7be11caa497c4103e1979910247c6dcca460cc55eca0da270ab25c"
+    },
+    {
+      "path": "apps/server/src/orchestration-v2/ThreadManagementService.ts",
+      "sha256": "bffae4c868071fc8ef867e602377a799cb32435dfc4264974b58713f922694cd"
+    },
+    {
+      "path": "apps/server/src/orchestration-v2/ThreadStop.test.ts",
+      "sha256": "65053c430f20f0510b6fc47b52dc492bb7e1375ac4ebbaabc8d39d6e9812ab30"
+    },
+    {
+      "path": "apps/server/src/peer/PeerForwarding.test.ts",
+      "sha256": "7cbd913e0b456a7775aa1055f67a0493735cf6ee21a87a25df3d412bc73acebe"
+    },
+    {
+      "path": "apps/server/src/peer/PeerForwarding.ts",
+      "sha256": "7df568fb8d004789fe2238a7d08f43035238ddd359bfa58db510a8b11d5ea887"
+    },
+    {
+      "path": "apps/server/src/peer/PeerLinks.test.ts",
+      "sha256": "dd1db16508c34b80b2c902881aad52220218e16287c091d7b56842ae2d8e5b4c"
+    },
+    {
+      "path": "apps/server/src/peer/PeerLinks.testkit.ts",
+      "sha256": "b508650556fcaae33d091641d24e04803c3b1d2370b0e4d7de5a5cea9dd63248"
+    },
+    {
+      "path": "apps/server/src/peer/PeerLinks.ts",
+      "sha256": "8ea2e467a65ab7be37d6cf8b6a7b7ac7e1c113821a22af0608ec89379af0a784"
+    },
+    {
+      "path": "apps/server/src/peer/PeerMcpClient.ts",
+      "sha256": "8ea28a7cb960ca78dac2739387e77a27767966668116c5b7dbdc0c061c1366f5"
+    },
+    {
+      "path": "apps/server/src/persistence/Migrations.ts",
+      "sha256": "582b186d05f419d890438ab30675189bb1838d0a60831c1936069c5c2ccc531a"
+    },
+    {
+      "path": "apps/server/src/persistence/Migrations/068_PeerLinks.ts",
+      "sha256": "142095a7f4f0452c2cd495b412d7ac48552a705c066ec3122836a64b5be72a62"
+    },
+    {
+      "path": "apps/server/src/persistence/reconcileV2PreviewMigration.test.ts",
+      "sha256": "b59632ffc23913deab2bf10b2e7616765870833ec426b515272b34023d68647f"
+    },
+    {
+      "path": "apps/server/src/server.ts",
+      "sha256": "5e95f17e2114e86a728146f25183521adddb1fcbab6c85b3490b7065ffee9651"
+    },
+    {
+      "path": "apps/server/src/ws.test.ts",
+      "sha256": "a3c0a9e623c87153c5068993d778bc772693ef65121b0fd9f0e469cd80800e07"
+    },
+    {
+      "path": "apps/server/src/ws.ts",
+      "sha256": "78cd7cd75b7ac340e6431abbde2c47ea7bbc5e780da2493f26537118b57de05a"
+    },
+    {
+      "path": "packages/client-runtime/src/t3ToolSummary.ts",
+      "sha256": "9a8078166863153b873856975e8f3adb3cf59b4e3d6e7ba79beef98b1c842ca4"
+    },
+    {
+      "path": "packages/contracts/src/environment.ts",
+      "sha256": "9011f75b91ba51614606202703f726d10414e6af7ea1e55d287aee306c52f0e8"
+    },
+    {
+      "path": "packages/contracts/src/index.ts",
+      "sha256": "4463c76f97f288781e4d1afb243a4de70b54c307bf70277ee291a3b3cddb319d"
+    },
+    {
+      "path": "packages/contracts/src/orchestrationV2.ts",
+      "sha256": "2a21c9fa0dd99336d9761adfc29b8dc7d52396a489a67ffca1de6d9dec2a163d"
+    },
+    {
+      "path": "packages/contracts/src/orchestratorMcp.ts",
+      "sha256": "b660da3811d8bf1c2cbdda7c69cda68ce7509b21491eabea7570490465e2e918"
+    },
+    {
+      "path": "packages/contracts/src/peerLink.ts",
+      "sha256": "e5ab7f1f2046655adb9320fa366e0ff4b6c59419fe0988bec858488c1e5c46f6"
+    },
+    {
+      "path": "packages/contracts/src/rpc.test.ts",
+      "sha256": "7868ff2223d2a3d53d1c8d684974ff03021d676bcc10236954ea2199e40ba81a"
+    },
+    {
+      "path": "packages/contracts/src/rpc.ts",
+      "sha256": "48712970ee2bb77daf03028d91eb0d16f7b02a79bf37af69197d0b3e85957acc"
+    },
+    {
+      "path": "packages/provider-core/src/server/orchestrationInstructions.ts",
+      "sha256": "4894921fcc3663173446c4899bc29a42e14d5d93d680ac8193f7e63967d795e4"
+    },
+    {
+      "path": "packages/shared/src/t3McpToolPresentation.ts",
+      "sha256": "925ba48c5d1039cdba3719f80dde0754169af83d146ef4f0cd15880465eb57d0"
+    }
+  ],
+  "license": "MIT; retain included upstream copyright and permission notice",
+  "format": "Unified source diff; no contributor history or author metadata included",
+  "privacyScreen": "Patch and complete changed-file contents screened; no findings",
+  "previewCleanup": "Whitespace-only formatting of one peer test; production code is identical to the previously verified package",
+  "originalPackagePatchSha256": "7e4564c13a86f167eac91ec1fe3604b6eee83a029c5d2e4b7caed2f3deec4dbb"
+}
