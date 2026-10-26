@@ -1,0 +1,37 @@
+{
+  "target": "Official T3 Code v0.1.2 source",
+  "baseCommit": "044f07257c9684ae4543bd1e1ebf9c394e9e3830",
+  "patchSha256": "3555bc6ce024e7fa8d26f2a38490ea6ca040275f7d779538eacd1ad09038dc11",
+  "host": "Windows x64",
+  "node": "26.12.1",
+  "focused": {
+    "tests": 46,
+    "files": 4,
+    "exitCode": 0
+  },
+  "supplemental": null,
+  "postCleanupPeerRecheck": null,
+  "typecheck": "passed",
+  "format": "passed",
+  "lint": "passed with warnings",
+  "unusedCodeCheck": "passed",
+  "serverBundle": "passed",
+  "applyChecks": "passed alone and in either order with the other package; identical combined tree",
+  "combinedFocused": {
+    "tests": 242,
+    "files": 12,
+    "exitCode": 0
+  },
+  "combinedTypecheck": "passed",
+  "combinedServerBundle": "passed",
+  "exampleSmoke": "passed; empty request list",
+  "notVerified": [
+    "Full repository test suite",
+    "Physical cross-machine routes or real T3 Connect",
+    "Real provider/model execution",
+    "Browser/desktop/mobile runtime behavior",
+    "Other operating systems",
+    "Installation against existing production state"
+  ],
+  "distribution": "Source patch only. No application binary, private evidence, account identity, or fork history."
+}

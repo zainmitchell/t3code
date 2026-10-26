@@ -1,0 +1,39 @@
+{
+  "feature": "native-tick",
+  "target": "T3 Code v0.1.2",
+  "baseCommit": "044f07257c9684ae4543bd1e1ebf9c394e9e3830",
+  "patch": "t3-v0.1.2-native-tick.patch",
+  "patchSha256": "3555bc6ce024e7fa8d26f2a38490ea6ca040275f7d779538eacd1ad09038dc11",
+  "files": [
+    {
+      "path": "apps/server/src/commandJobs/CommandJobs.integration.test.ts",
+      "sha256": "281627a4314e387ba7705c2c0add01cf233d6bc2b622fc996d2901e2bee79a67"
+    },
+    {
+      "path": "apps/server/src/commandJobs/CommandJobs.test.ts",
+      "sha256": "4d6b6b0894a4d048c5e528af056b8270b04f7406342f73d0688143a300619668"
+    },
+    {
+      "path": "apps/server/src/commandJobs/CommandJobs.ts",
+      "sha256": "45afb783bcb9cc899a152059008373d762678aab795392432b3207214cff31b1"
+    },
+    {
+      "path": "apps/server/src/orchestration-v2/runtimeLayer.ts",
+      "sha256": "c4a2406d3c0386271cc580eb035a6b1c3150b886808a1305905cd13a39aa4ee8"
+    },
+    {
+      "path": "apps/server/src/provider/testFixtures/command-job-crash-harness.mjs",
+      "sha256": "47e4e3631a43f6cc935c745f5b84295e34a5feb2d557f597742d8b6fbb2e7857"
+    },
+    {
+      "path": "apps/server/src/scheduledTasks/ScheduledTaskService.ts",
+      "sha256": "b09c4c8e4fbff503dbe1c3a13a2c6fb96c6f6dda20ad5985e7c9ae7924183b9f"
+    }
+  ],
+  "license": "MIT; retain included upstream copyright and permission notice",
+  "format": "Unified source diff; no contributor history or author metadata included",
+  "privacyScreen": "Patch and complete changed-file contents screened; no findings",
+  "artifactScope": "Frozen preview.1 archive and raw patch; these hashes do not describe later branch files.",
+  "reviewFollowupSourceCommit": "25ab7ae764471316da5fe74532c159a5cc718fa6",
+  "reviewFollowup": "BRANCH-UPDATES.md"
+}

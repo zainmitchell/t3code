@@ -1,0 +1,55 @@
+{
+  "sourceBase": "044f07257c9684ae4543bd1e1ebf9c394e9e3830",
+  "patchSha256": "3555bc6ce024e7fa8d26f2a38490ea6ca040275f7d779538eacd1ad09038dc11",
+  "host": "Windows x64",
+  "node": "26.12.1",
+  "feature": "native-tick",
+  "observed": {
+    "cleanArchiveApply": "passed; identical prior standalone source tree",
+    "offlinePinnedDependencyInstall": "passed",
+    "sourceBundleBuild": "passed",
+    "freshHomeStartup": "passed",
+    "authenticatedClientRpc": "passed",
+    "idleSchedulerRun": "succeeded without a thread",
+    "missingJob": "failed without a thread or model fallback",
+    "completionObservation": "scheduler subscription, after queue acknowledgement",
+    "disableTask": "passed",
+    "buildMonitorNotificationCounts": [0, 1, 1],
+    "threadAndSessionProjections": 0
+  },
+  "enabledProviders": 0,
+  "proofServersStopped": true,
+  "notVerified": [
+    "Manual task-creation UI steps",
+    "Desktop installation or production-state upgrade",
+    "Real provider turns or worker-directed actions",
+    "External CI integration",
+    "Physical host-to-host routes or T3 Connect",
+    "Other operating systems",
+    "Full client/device acceptance",
+    "MCP OAuth client acceptance"
+  ],
+  "scope": "Windows disposable backend proof; no live production installation",
+  "additionalBuildMonitor": {
+    "sourceBase": "044f07257c9684ae4543bd1e1ebf9c394e9e3830",
+    "tickPatchSha256": "3555bc6ce024e7fa8d26f2a38490ea6ca040275f7d779538eacd1ad09038dc11",
+    "demoScriptSha256": "af797bffee943b28acdab3a5b0ff42c3d2e5bf2d54c7c25783ac03aa969c8b9e",
+    "host": "Windows x64",
+    "node": "26.12.1",
+    "execution": "Configured command job through authenticated application RPC; completion awaited on scheduler subscription",
+    "inputs": ["pending", "passed", "passed"],
+    "notificationCounts": [0, 1, 1],
+    "schedulerRunStatuses": ["succeeded", "succeeded", "succeeded"],
+    "enabledProviders": 0,
+    "threadAndSessionProjections": 0,
+    "workerRequests": [],
+    "externalBuildServiceUsed": false,
+    "limits": [
+      "No worker-directed action or real provider turn",
+      "No external CI integration",
+      "Normal-repeat suppression only; crash can repeat a notification",
+      "Windows backend proof only"
+    ],
+    "originalTickArchiveUnchanged": true
+  }
+}

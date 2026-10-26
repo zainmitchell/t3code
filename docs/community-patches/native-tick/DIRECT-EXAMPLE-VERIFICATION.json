@@ -1,0 +1,22 @@
+{
+  "execution": "Direct local Node execution of final distributed example bytes; separate from earlier scheduler proof",
+  "host": "Windows x64",
+  "node": "26.12.1",
+  "idleOutput": {
+    "requests": []
+  },
+  "monitorInputs": ["pending", "passed", "passed"],
+  "notificationCounts": [0, 1, 1],
+  "workerRequests": [],
+  "externalServiceUsed": false,
+  "files": [
+    {
+      "path": "examples/check-work.mjs",
+      "sha256": "6b08970d6b8746b0fe0eafa2b8bde03dd571b943fa1ab718efc2b9ee61e91b81"
+    },
+    {
+      "path": "examples/build-monitor/watch-build.mjs",
+      "sha256": "e54d367bb36274b848e5cb6d1be94967a2755bdfef620bda9b310fe3c3150be7"
+    }
+  ]
+}

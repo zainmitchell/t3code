@@ -1,0 +1,24 @@
+{
+  "sourceBase": "044f07257c9684ae4543bd1e1ebf9c394e9e3830",
+  "tickPatchSha256": "3555bc6ce024e7fa8d26f2a38490ea6ca040275f7d779538eacd1ad09038dc11",
+  "demoScriptSha256": "af797bffee943b28acdab3a5b0ff42c3d2e5bf2d54c7c25783ac03aa969c8b9e",
+  "host": "Windows x64",
+  "node": "26.12.1",
+  "execution": "Configured command job through authenticated application RPC; completion awaited on scheduler subscription",
+  "inputs": ["pending", "passed", "passed"],
+  "notificationCounts": [0, 1, 1],
+  "schedulerRunStatuses": ["succeeded", "succeeded", "succeeded"],
+  "enabledProviders": 0,
+  "threadAndSessionProjections": 0,
+  "workerRequests": [],
+  "externalBuildServiceUsed": false,
+  "limits": [
+    "No worker-directed action or real provider turn",
+    "No external CI integration",
+    "Normal-repeat suppression only; crash can repeat a notification",
+    "Windows backend proof only"
+  ],
+  "originalTickArchiveUnchanged": true,
+  "distributedExampleSha256": "e54d367bb36274b848e5cb6d1be94967a2755bdfef620bda9b310fe3c3150be7",
+  "exampleCleanup": "Formatting and namespace Node imports only; final direct replay recorded separately in ../../DIRECT-EXAMPLE-VERIFICATION.json"
+}

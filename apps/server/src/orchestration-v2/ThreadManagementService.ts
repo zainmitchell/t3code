@@ -391,7 +391,9 @@ export interface ThreadManagementServiceShape {
    * replay the recorded result, never start anything new, so the filter would
    * just refuse a retry the project's settings no longer allow fresh.
    */
-  readonly hasReceipt: (commandId: CommandId) => Effect.Effect<boolean>;
+  readonly hasReceipt: (
+    commandId: CommandId,
+  ) => Effect.Effect<boolean, CommandReceiptStore.CommandReceiptStoreV2Error>;
   readonly waitForThread: (
     input: ThreadManagementWaitInput,
   ) => Effect.Effect<ThreadManagementWaitResult, ThreadManagementError>;
@@ -546,10 +548,7 @@ const make = Effect.gen(function* () {
       );
 
   const hasReceipt: ThreadManagementServiceShape["hasReceipt"] = (commandId) =>
-    receipts.getByCommandId(commandId).pipe(
-      Effect.orElseSucceed(() => Option.none()),
-      Effect.map(Option.isSome),
-    );
+    receipts.getByCommandId(commandId).pipe(Effect.map(Option.isSome));
 
   const ensureLegacyTranscript = Effect.fn(
     "orchestrationV2.threadManagement.ensureLegacyTranscript",
