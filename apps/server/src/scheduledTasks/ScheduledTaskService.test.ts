@@ -8,6 +8,7 @@ import {
   ProviderInstanceId,
   ScheduledTaskError,
   ScheduledTaskId,
+  ScheduledTaskUpsertInput,
   ThreadId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
@@ -33,6 +34,76 @@ import * as ScheduledTaskService from "./ScheduledTaskService.ts";
 import * as CommandJobs from "../commandJobs/CommandJobs.ts";
 
 const isScheduledTaskError = Schema.is(ScheduledTaskError);
+const decodeUpsertInput = Schema.decodeUnknownEffect(ScheduledTaskUpsertInput);
+
+it.effect.each([
+  { name: "editing a disabled task", enabled: false, nextEnabled: false, stop: false },
+  { name: "editing an enabled task", enabled: true, nextEnabled: true, stop: false },
+  { name: "enabling a task", enabled: false, nextEnabled: true, stop: false },
+  { name: "disabling an enabled task", enabled: true, nextEnabled: false, stop: true },
+  {
+    name: "changing a disabled task's job",
+    enabled: false,
+    nextEnabled: false,
+    prompt: "command-job:other",
+    stop: true,
+  },
+  {
+    name: "changing a disabled task's project",
+    enabled: false,
+    nextEnabled: false,
+    projectId: "project:other",
+    stop: true,
+  },
+])("stops the old command job only when needed while $name", (scenario) =>
+  Effect.gen(function* () {
+    const stopped = yield* Ref.make<Array<string>>([]);
+    const dependencies = Layer.mergeAll(
+      NodeCrypto.layer,
+      Scheduler.layer,
+      Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+      Layer.mock(ThreadManagementService.ThreadManagementService)({}),
+      Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+        namedProjectsRoot: "/projects",
+        isScratchProject: () => Effect.succeed(false),
+      }),
+      Layer.mock(SecretRequests.SecretRequests)({}),
+      Layer.succeed(CommandJobs.CommandJobs, {
+        requestPass: () => Effect.succeed(false),
+        run: () => Effect.void,
+        stop: (task, job) => Ref.update(stopped, (calls) => [...calls, `${task.projectId}:${job}`]),
+        wakeups: Stream.never,
+      }),
+    );
+    yield* Effect.gen(function* () {
+      const tasks = yield* ScheduledTaskService.ScheduledTaskService;
+      const input = yield* decodeUpsertInput({
+        id: "task:edit-job",
+        title: "Tick",
+        prompt: "command-job:tick",
+        enabled: scenario.enabled,
+        schedule: { type: "interval", everyMs: 60_000 },
+        projectId: "project:test",
+        workspaceStrategy: { type: "root" },
+        modelSelection: { instanceId: "codex", model: "gpt-5.4" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+      });
+      yield* tasks.upsert(input);
+      assert.deepEqual(yield* Ref.get(stopped), []);
+      const update = yield* decodeUpsertInput({
+        ...input,
+        requireExisting: true,
+        title: "Edited tick",
+        enabled: scenario.nextEnabled,
+        prompt: scenario.prompt ?? input.prompt,
+        projectId: scenario.projectId ?? input.projectId,
+      });
+      yield* tasks.upsert(update);
+      assert.deepEqual(yield* Ref.get(stopped), scenario.stop ? ["project:test:tick"] : []);
+    }).pipe(Effect.provide(ScheduledTaskService.layer.pipe(Layer.provide(dependencies))));
+  }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
+);
 
 it.effect("rechecks command-job coalescing before a busy task retry", () =>
   Effect.gen(function* () {

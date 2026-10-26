@@ -1256,7 +1256,7 @@ export const layer = Layer.effect(
         existingTask === null ? null : CommandJobs.commandJobName(existingTask.prompt);
       if (
         previousJob !== null &&
-        (!input.enabled ||
+        ((existingTask?.enabled === true && !input.enabled) ||
           CommandJobs.commandJobName(input.prompt) !== previousJob ||
           existingTask?.projectId !== input.projectId)
       )

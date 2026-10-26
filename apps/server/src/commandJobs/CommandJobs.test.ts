@@ -22,6 +22,7 @@ import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 
@@ -35,6 +36,7 @@ import * as ProjectService from "../project/ProjectService.ts";
 import * as CommandJobs from "./CommandJobs.ts";
 
 const projectId = ProjectId.make("project:factory");
+const isReceiptReadError = Schema.is(CommandReceiptStore.CommandReceiptStoreReadError);
 const windowsHost = HostProcess.Platform.defaultValue() === "win32";
 const builder = { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" };
 
@@ -869,6 +871,48 @@ it.live("an unreadable receipt prevents a fresh launch without local intent", ()
     const failure = yield* runJob(fixture.jobs);
     assert.equal(failure._tag === "Some" ? failure.value.operation : null, "read");
     assert.lengthOf(fixture.calls.launches, 0);
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.live("receipt read failures retain their cause and allow later worker requests", () =>
+  Effect.gen(function* () {
+    const receiptReadFailure = { current: false };
+    const fixture = yield* setup({
+      launch: ceiling,
+      receiptReadFailure,
+      shell: { current: launchedShell() },
+    });
+    yield* fixture.writePlan({ output: JSON.stringify({ requests: [launchRequest("w1")] }) });
+    yield* runJob(fixture.jobs);
+    receiptReadFailure.current = true;
+    yield* fixture.writePlan({
+      output: JSON.stringify({
+        requests: [
+          launchRequest("w2"),
+          launchRequest("w3"),
+          { type: "send", workId: "w1", sendId: "after-read-failure", text: "Continue." },
+          { type: "interrupt", workId: "w1" },
+        ],
+      }),
+    });
+    const failure = yield* runJob(fixture.jobs);
+    assert.isTrue(Option.isSome(failure));
+    if (Option.isNone(failure)) return;
+    assert.equal(failure.value.operation, "read");
+    const cause = failure.value.cause;
+    assert.isTrue(isReceiptReadError(cause));
+    if (isReceiptReadError(cause)) {
+      assert.equal(cause.commandId, "command-job:tick:w2");
+    }
+    assert.lengthOf(fixture.calls.launches, 1);
+    assert.lengthOf(fixture.calls.sends, 1);
+    assert.lengthOf(fixture.calls.interrupts, 1);
+    const status = yield* fixture.readJson("status.json");
+    assert.deepEqual(
+      status.failed.map((item: { workId: string }) => item.workId),
+      ["w2", "w3"],
+    );
+    assert.equal(status.status, "blocked");
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 

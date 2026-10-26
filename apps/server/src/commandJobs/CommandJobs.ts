@@ -886,6 +886,7 @@ export const layer = Layer.effect(
       const requests = output?.success.requests ?? [];
       let launchesLeft = config.launch?.maxLaunchesPerPass ?? DEFAULT_MAX_LAUNCHES_PER_PASS;
       let dispatchFailure: CommandJobError | undefined;
+      let receiptFailure: CommandJobError | undefined;
       for (const [index, raw] of requests.entries()) {
         if (yield* Deferred.isDone(stop)) break;
         const decoded = yield* Effect.result(decodeRequest(raw));
@@ -922,11 +923,17 @@ export const layer = Layer.effect(
           // Accepted before, but its local receipt is gone (pruned or lost): a fresh intent would
           // claim today's base, model and prompt for a thread launched with others. Its facts
           // are unknown, so this fails, and the work stays claimed until someone reconciles it.
-          if (
-            yield* readReceipt(request.workId).pipe(
-              Effect.tapError((error) => writeStatus("blocked", error.message)),
-            )
-          ) {
+          const launchedBefore = yield* Effect.result(readReceipt(request.workId));
+          if (launchedBefore._tag === "Failure") {
+            receiptFailure ??= launchedBefore.failure;
+            outcome.failed.push({
+              index,
+              workId: request.workId,
+              reason: launchedBefore.failure.message,
+            });
+            continue;
+          }
+          if (launchedBefore.success) {
             outcome.failed.push({
               index,
               workId: request.workId,
@@ -1077,6 +1084,7 @@ export const layer = Layer.effect(
       const first = problems[0]!;
       const message = `Blocked: ${problems.length} of ${requests.length} request(s) not run. ${first.workId ?? `#${first.index}`}: ${first.reason}`;
       yield* writeStatus("blocked", message);
+      if (receiptFailure !== undefined) return yield* Effect.fail(receiptFailure);
       return yield* fail(message, { operation: "dispatch", job, cause: dispatchFailure });
     });
 
