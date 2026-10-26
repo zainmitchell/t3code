@@ -180,3 +180,4 @@ The experimental [nightly 3669 factory source preview](https://github.com/zainmi
 
 Only the complete final source is installable; module patches are not separate supported installations. Full lifecycle acceptance, final-source restart/no-duplicate/idle proof, web/mobile verification and legacy-loop retirement remain open. This targets nightly 3669, separately from the stable v0.1.2 messaging/tick previews.
 
+Share feedback in the [factory Ideas discussion](https://github.com/pingdotgg/t3code/discussions/25487). [PR dependencies and history](https://github.com/zainmitchell/t3code/blob/574682104ff850d2265f6b23e91c6f207bc4c206/docs/community/native-factory-preview/PR-LINEAGE.md) distinguish required, optional and closed work.
