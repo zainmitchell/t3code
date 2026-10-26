@@ -6,7 +6,7 @@ It is an experimental source preview over [official nightly 3717](https://github
 
 The factory builds on the separate native messaging patch for 3717. Apply messaging first, then the three factory components. Only the complete final source is installable. [Dependencies](DEPENDENCIES.md), [installation](INSTALL.md), [PR lineage](PR-LINEAGE.md) and [verification](VERIFICATION.md) give the exact revisions, order and checks.
 
-This local candidate has not been published or qualified as a new release. The required affected-file gate is blocked by the preparation host's Application Control rejection of the installed Vite+ native module. See [verification](VERIFICATION.md). Prospective download names are not live URLs.
+UNQUALIFIED EXPERIMENTAL SOURCE PREVIEW. Required frozen-lockfile installation, focused Vite+ tests, formatting/lint and affected-package typechecks did not complete because the validation host's Application Control rejected the installed Vite+ native module. The repository's affected-file gate is not passed. No qualified toolchain is established. Separately, native Windows-helper tests remain unproved. No executable binary distribution is included. See [verification](VERIFICATION.md) for the narrow Node-only and paused CLI evidence; those checks do not replace the blocked gate or establish production, lifecycle, platform, client or upgrade acceptance.
 
 ## Who this helps
 

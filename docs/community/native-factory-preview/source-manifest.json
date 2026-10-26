@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "base": "1316d48b0c68151afd8b47eb0c11a114cf0b4daa",
   "candidate": "native-factory-nightly3717-preview.1",
-  "status": "Local candidate; publication blocked by required validation toolchain.",
+  "status": "Experimental source preview with blocked/unverified required validation; publication is not acceptance.",
   "files": [
     {
       "path": "apps/mobile/src/Stack.tsx",
@@ -701,13 +701,13 @@
     },
     {
       "path": "docs/community/native-factory-preview/DEPENDENCIES.md",
-      "bytes": 7487,
-      "sha256": "f3f0448f686487471c797a4bad5bc8baa9807ddd0d6dcc74521b182bafc9d2c9"
+      "bytes": 7544,
+      "sha256": "bfe625ba30da83c0487bb4f13cfb8615f3007d28feb4a8263cc6e8967db461c7"
     },
     {
       "path": "docs/community/native-factory-preview/INSTALL.md",
-      "bytes": 6219,
-      "sha256": "13706c6ab0a0df36a827307f7a3eaa5536e035d3ac49f7817b5f52327d327696"
+      "bytes": 6612,
+      "sha256": "334abe6e6b3815faf321abdf69103d9f72fa95ecb6b737a79465c39312bcac0b"
     },
     {
       "path": "docs/community/native-factory-preview/NOTICES.md",
@@ -717,17 +717,17 @@
     {
       "path": "docs/community/native-factory-preview/PR-LINEAGE.md",
       "bytes": 16047,
-      "sha256": "863b4ba5a02849a07754aa8f4b3ed75fff54d4547b79c324b1df2fdd66905983"
+      "sha256": "90d376ef6524eb0c61e00444e3fc147d0fea3b55b762dd8a834ce34b9c731068"
     },
     {
       "path": "docs/community/native-factory-preview/README.md",
-      "bytes": 13556,
-      "sha256": "7cffd0f1a1564fe0015feb8e90d9e5891c773ca9a823d9d172c941fabc423f95"
+      "bytes": 13922,
+      "sha256": "c536fb277d58f7471459c3a14bdb4bccbc3734ed760e48d2ac6f6c61735f6f18"
     },
     {
       "path": "docs/community/native-factory-preview/VERIFICATION.md",
-      "bytes": 2992,
-      "sha256": "f22ba67759cbc8f58bacf6dd5d270e00162c44c760535f3eed72503661c5adf5"
+      "bytes": 3433,
+      "sha256": "8bc78de2bcc6edcfc0002e7177f9002153f7db370832ccef68428ce16602ff5b"
     },
     {
       "path": "docs/community/native-factory-preview/muse-sdk-LICENSE.txt",
@@ -737,7 +737,7 @@
     {
       "path": "docs/community/native-factory-preview/pr-catalog.json",
       "bytes": 19700,
-      "sha256": "55b4cd92a76ec3c5c77fefe205259f1a1197a297527913457552d81fd8c9f2b0"
+      "sha256": "c507fccaddba1d4cbd4d165ba1c1516b4d25c25d03003f07876b5f5173f2c3c5"
     },
     {
       "path": "docs/internals/factory-lifecycle.md",

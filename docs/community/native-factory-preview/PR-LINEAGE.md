@@ -1,6 +1,6 @@
 # Public PR lineage
 
-GitHub primary metadata checked at 2026-10-26T17:23:46.007506+00:00. All47 prior links are retained, with no new PR links added in this update. These are capability relationships and history, not a blanket cherry-pick list. The complete final source is the factory installation unit; module-only revisions are not supported installations.
+GitHub primary metadata checked at 2026-10-26T18:12:09.935525+00:00. All47 prior links are retained, with no new PR links added in this update. These are capability relationships and history, not a blanket cherry-pick list. The complete final source is the factory installation unit; module-only revisions are not supported installations.
 
 ## Required capability lineage
 

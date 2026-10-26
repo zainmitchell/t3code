@@ -2,7 +2,7 @@
 
 The only supported base is official nightly 3717, commit `1316d48b0c68151afd8b47eb0c11a114cf0b4daa`. The factory needs the native messaging patch for that base. Apply the four parts in order. Only the last revision is installable; the earlier revisions are review and apply boundaries, not build targets.
 
-The four component patches are messaging, command-job/tick modules, factory modules, and shared integration. `PATCH-SERIES.json` in the local asset set records their exact public base, intermediate commits/trees, patch checksums and order. The complete combined patch from the official base and factory-over-messaging patch reproduce the same final tree. These are local candidate identities until publication is verified.
+The four component patches are messaging, command-job/tick modules, factory modules, and shared integration. `PATCH-SERIES.json` in the release assets records their exact public base, intermediate commits/trees, patch checksums and order. The complete combined patch from the official base and factory-over-messaging patch reproduce the same final tree. The manifest identifies the exact public source and every review/apply boundary; it does not establish validation acceptance.
 
 The messaging layer preserves the pinned public candidate's behavior, including its nine-tool forwarding limit. The factory module and shared integration layers add verified-artifact review bases and owner-decision cards. The series retains shared runtime coupling. Module-only revisions are not supported installations.
 

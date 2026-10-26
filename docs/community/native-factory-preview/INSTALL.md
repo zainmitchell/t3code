@@ -4,7 +4,7 @@ This is source, with no signed installer or built desktop or mobile binary. Chec
 
 ## Get the source
 
-This is an unpublished local candidate pending the verification gate. Download names below describe the prepared asset set, not existing public downloads. Use the complete source archive or all four ordered patches. Only the complete final source is the factory installation unit; module-only revisions are not supported installations.
+UNQUALIFIED EXPERIMENTAL SOURCE PREVIEW. Required frozen-lockfile installation, focused Vite+ tests, formatting/lint and affected-package typechecks did not complete because the validation host's Application Control rejected the installed Vite+ native module. The repository's affected-file gate is not passed. No qualified toolchain is established. Separately, native Windows-helper tests remain unproved. No executable binary distribution is included. The commands below are reuse instructions, not a claim they completed on the validation host. Use the complete source archive or all four ordered patches. Only the complete final source is the factory installation unit; module-only revisions are not supported installations.
 
 For the complete source archive:
 
