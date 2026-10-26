@@ -189,6 +189,11 @@ export interface EventSinkV2Shape {
   readonly latestSequence: (input?: {
     readonly threadId?: ThreadId;
   }) => Effect.Effect<number, EventSinkV2Error>;
+  readonly read: (input: {
+    readonly threadId: ThreadId;
+    readonly throughSequence: number;
+    readonly eventType: OrchestrationV2DomainEvent["type"];
+  }) => Stream.Stream<OrchestrationV2StoredEvent, EventSinkStreamError>;
   readonly readByCommandId: (input: {
     readonly commandId: CommandId;
   }) => Stream.Stream<OrchestrationV2StoredEvent, EventSinkV2Error>;
@@ -652,11 +657,14 @@ const layerBase: Layer.Layer<
             events: normalized,
           });
           // A Stop that changes nothing can still queue the stop of its delegated tasks.
+          // Its receipt bounds that walk across threads, so it records the global sequence.
           const sequence =
             storedEvents.at(-1)?.sequence ??
             (input.effects.length === 0
               ? undefined
-              : yield* eventStore.latestSequence({ threadId: input.threadId }));
+              : yield* eventStore.latestSequence(
+                  input.commandType === "thread.stop" ? undefined : { threadId: input.threadId },
+                ));
           if (sequence === undefined) {
             return yield* Effect.die(
               new Error(`Command ${input.commandId} produced no orchestration events.`),
@@ -977,6 +985,14 @@ const layerBase: Layer.Layer<
               }),
           ),
         ),
+      read: (input) =>
+        eventStore
+          .read(input)
+          .pipe(
+            Stream.mapError(
+              (cause) => new EventSinkStreamError({ threadId: input.threadId, cause }),
+            ),
+          ),
       readByCommandId: (input) =>
         eventStore.readByCommandId(input).pipe(
           Stream.mapError(

@@ -1,4 +1,10 @@
-import { MessageId, ThreadId, OrchestratorMcpFailure, ProjectId } from "@t3tools/contracts";
+import {
+  CommandId,
+  MessageId,
+  ThreadId,
+  OrchestratorMcpFailure,
+  ProjectId,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
@@ -13,6 +19,7 @@ import * as ServerSettings from "../../../serverSettings.ts";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import { formatThreadLink } from "@t3tools/shared/threadLinks";
 import { resolveRuntimeMode } from "../../OrchestratorMcpService.ts";
+import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import { newCommandId, readCaller, resolveProjectId, unavailable } from "../../threadAccess.ts";
 import { ProjectToolkit } from "./tools.ts";
@@ -57,9 +64,18 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
     (input) => input,
     (input, { runtimeMode, interactionMode }) =>
       Effect.gen(function* () {
+        const scope = yield* McpInvocationContext.McpInvocationContext;
         const context = yield* readCaller();
         const { caller } = context;
-        const commandId = yield* newCommandId();
+        // A retry with the same key replays the first launch: the ids derive
+        // from the caller and the key, and the launch service replays a
+        // command it already accepted.
+        const commandId =
+          input.clientRequestId === undefined
+            ? yield* newCommandId()
+            : CommandId.make(
+                `mcp:launch:${encodeURIComponent(scope.requestNamespace)}:${encodeURIComponent(input.clientRequestId)}`,
+              );
         const threadId = ThreadId.make(commandId);
         const messageId = MessageId.make(commandId);
         const attachments = input.attachments ?? [];
@@ -90,11 +106,36 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
                 ),
               )).projectId
             : yield* resolveProjectId(context, input.projectId);
+        // Accepted creates reuse their model. Only their first message needs
+        // base validation; message replays reuse stored preparation.
+        const acceptedLaunch =
+          input.clientRequestId === undefined
+            ? undefined
+            : Option.getOrUndefined(
+                yield* ThreadLaunch.ThreadLaunchService.pipe(
+                  Effect.flatMap((launches) =>
+                    launches.getAcceptedLaunch({ commandId, threadId, projectId }),
+                  ),
+                  Effect.mapError(unavailable),
+                ),
+              );
         const readProject = Project.ProjectService.pipe(
           Effect.flatMap((projects) => projects.getById(projectId)),
           Effect.mapError(unavailable),
           Effect.map(Option.getOrUndefined),
         );
+        // A retry of an accepted launch replays it: it keeps the model it started
+        // with and skips the checks only a new launch needs, which the project
+        // may no longer pass, such as a base branch deleted since.
+        const launched =
+          input.clientRequestId === undefined
+            ? null
+            : yield* context.threads.getThreadShell(threadId).pipe(Effect.mapError(unavailable));
+        const launchedModel =
+          launched === null || launched.deletedAt !== null ? undefined : launched.modelSelection;
+        const replaying = launchedModel !== undefined;
+        // A retry may bind a workspace to an idle accepted launch, so membership
+        // is checked on every launch, unlike the checks below.
         if (input.workspaceStrategy?.type === "existing_worktree") {
           const project = yield* readProject;
           if (project === undefined)
@@ -104,9 +145,19 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
             });
           yield* assertProjectWorktree(project.workspaceRoot, input.workspaceStrategy.worktreePath);
         }
-        // Reject unresolved base refs before accepting a launch; worktree provisioning happens later.
+        // A launch is accepted before its worktree is provisioned, so a base ref
+        // that cannot resolve is refused while the agent can still act on it:
+        // before acceptance, or before an accepted idle thread's first message.
         const strategy = input.workspaceStrategy;
-        if (strategy?.type === "worktree")
+        const accepted = acceptedLaunch !== undefined || replaying;
+        if (
+          strategy?.type === "worktree" &&
+          (!accepted ||
+            ((input.message !== undefined || attachments.length > 0) &&
+              (yield* context.threads
+                .getMessageCount(threadId)
+                .pipe(Effect.mapError(unavailable))) === 0))
+        )
           yield* ThreadLaunch.ThreadLaunchService.pipe(
             Effect.flatMap((launches) =>
               launches.checkWorktreeBase({ projectId, workspaceStrategy: strategy }),
@@ -115,7 +166,7 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
               (error) =>
                 new OrchestratorMcpFailure({
                   code: "invalid_request",
-                  message: `${error.message} No thread was created. Pass a branch, tag, or commit that exists there${
+                  message: `${error.message} ${accepted ? "The accepted thread remains idle." : "No thread was created."} Pass a branch, tag, or commit that exists there${
                     strategy.startFromOrigin === true
                       ? "; the project has no usable remote to fetch it from."
                       : ", or set startFromOrigin:true if it exists only on a remote."
@@ -127,7 +178,7 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
         // project's effective defaults, as the composer does. Its mode stays
         // within the ceiling it was approved with.
         const projectDefaults =
-          caller === undefined
+          caller === undefined && !replaying
             ? yield* ServerSettings.ServerSettingsService.pipe(
                 Effect.flatMap((settings) => settings.getSettings),
                 Effect.mapError(unavailable),
@@ -140,7 +191,9 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
               )
             : undefined;
         const modelSelection =
+          acceptedLaunch?.modelSelection ??
           input.modelSelection ??
+          launchedModel ??
           caller?.modelSelection ??
           projectDefaults?.defaultModelSelection ??
           undefined;

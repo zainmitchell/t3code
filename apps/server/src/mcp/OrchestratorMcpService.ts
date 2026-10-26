@@ -106,7 +106,7 @@ import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import {
-  clientRuntimeModeCeiling,
+  clientModeCeiling,
   type McpInvocationScope,
   type McpThreadInvocationScope,
   requireThreadScope,
@@ -1153,10 +1153,7 @@ const make = Effect.gen(function* () {
     if (scope.thread === undefined) {
       return {
         parent: undefined,
-        limits: {
-          runtimeMode: clientRuntimeModeCeiling(scope.client),
-          interactionMode: "default",
-        } satisfies { runtimeMode: RuntimeMode; interactionMode: ProviderInteractionMode },
+        limits: clientModeCeiling(scope.client),
       } as const;
     }
     const parent = yield* loadProjection(scope.thread.threadId);
@@ -2910,6 +2907,54 @@ const make = Effect.gen(function* () {
       yield* resolveRuntimeMode(limits.runtimeMode, target.thread.runtimeMode);
       yield* resolveInteractionMode(limits.interactionMode, target.thread.interactionMode);
       const key = yield* requestKey(input.clientRequestId);
+      // A peer from before `stop` drops it when decoding, so it interrupts
+      // the run instead, as this call did then.
+      if (input.stop === true) {
+        const commandId = stableCommandId({ scope, requestKey: key, operation: "thread-stop" });
+        // The cause goes to the log; the caller learns only that the stop failed.
+        const stopFailed = (error: unknown) =>
+          Effect.logWarning("orchestrator-mcp.thread-stop-failed", {
+            threadId: input.threadId,
+            error,
+          }).pipe(
+            Effect.andThen(
+              Effect.fail(
+                failure("orchestration_error", `Unable to stop thread ${input.threadId}.`),
+              ),
+            ),
+          );
+        const stopped = yield* threadManagement
+          .dispatch({
+            type: "thread.stop",
+            commandId,
+            threadId: input.threadId,
+            ...(input.reason === undefined ? {} : { reason: input.reason }),
+          })
+          .pipe(Effect.catch(stopFailed));
+        yield* threadManagement
+          .stopDelegatedTasks({ threadId: input.threadId, commandId, reason: input.reason })
+          .pipe(Effect.catch(stopFailed));
+        // Queue holds and completion disposal also update runs. Only the
+        // original interrupt request identifies the run Stop reached.
+        const request = stopped.storedEvents.find(
+          (stored) =>
+            stored.event.type === "turn-item.updated" &&
+            stored.event.payload.type === "run_interrupt_request" &&
+            (stored.event.payload.providerTurnId !== null ||
+              stopped.storedEvents.some(
+                (updated) =>
+                  updated.event.type === "run.updated" &&
+                  updated.event.runId === stored.event.runId &&
+                  updated.event.payload.status === "interrupted",
+              )),
+        );
+        const interrupted = request?.event.runId;
+        return {
+          threadId: input.threadId,
+          runId: interrupted ?? null,
+          status: interrupted === undefined ? "no_active_run" : "interrupt_requested",
+        } satisfies OrchestratorMcpThreadInterruptResult;
+      }
       const result = yield* threadManagement
         .interruptThread({
           projectId: target.thread.projectId,
