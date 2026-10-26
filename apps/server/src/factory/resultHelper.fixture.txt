@@ -1,0 +1,1 @@
+Synthetic helper bytes for packet hash verification. This fixture is never executed.
