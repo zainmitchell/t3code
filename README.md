@@ -173,3 +173,10 @@ Read [CONTRIBUTING.md](./CONTRIBUTING.md) before reporting a bug or opening a PR
 Have a feature request? Start an [Ideas discussion](https://github.com/pingdotgg/t3code/discussions/categories/ideas).
 
 Need support? Join the [Discord](https://discord.gg/jn4EGJjrvv).
+
+## Native software factory source preview
+
+The experimental [nightly 3669 factory source preview](https://github.com/zainmitchell/t3code/releases/tag/community-native-factory-nightly3669-preview.1) includes complete source, a four-part ordered patch series and checksums. [Read the detailed guide](https://github.com/zainmitchell/t3code/blob/574682104ff850d2265f6b23e91c6f207bc4c206/docs/community/native-factory-preview/README.md) for setup, dependencies, trust boundaries and evidence.
+
+Only the complete final source is installable; module patches are not separate supported installations. Full lifecycle acceptance, final-source restart/no-duplicate/idle proof, web/mobile verification and legacy-loop retirement remain open. This targets nightly 3669, separately from the stable v0.1.2 messaging/tick previews.
+
