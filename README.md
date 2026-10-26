@@ -181,3 +181,12 @@ The experimental [nightly 3669 factory source preview](https://github.com/zainmi
 Only the complete final source is installable; module patches are not separate supported installations. Full lifecycle acceptance, final-source restart/no-duplicate/idle proof, web/mobile verification and legacy-loop retirement remain open. This targets nightly 3669, separately from the stable v0.1.2 messaging/tick previews.
 
 Share feedback in the [factory Ideas discussion](https://github.com/pingdotgg/t3code/discussions/25487). [PR dependencies and history](https://github.com/zainmitchell/t3code/blob/574682104ff850d2265f6b23e91c6f207bc4c206/docs/community/native-factory-preview/PR-LINEAGE.md) distinguish required, optional and closed work.
+
+## Native factory nightly3717 experimental source preview
+
+**UNQUALIFIED EXPERIMENTAL SOURCE PREVIEW. Required frozen-lockfile installation, focused Vite+ tests, formatting/lint and affected-package typechecks did not complete because the validation host's Application Control rejected the installed Vite+ native module. The repository's affected-file gate is not passed. No qualified toolchain is established. Separately, native Windows-helper tests remain unproved. No executable binary distribution is included.**
+
+The [nightly3717 source release](https://github.com/zainmitchell/t3code/releases/tag/community-native-factory-nightly3717-preview.1) provides complete source, an ordered four-component patch series, combined alternatives and checksums. [Read the exact source guide](https://github.com/zainmitchell/t3code/blob/c3420fceee60dc8f9a06b7a4324fca552a46403b/docs/community/native-factory-preview/README.md) for mechanisms, dependencies, setup/reuse/disable, attribution and limitations. Only the complete final factory source is the installation unit; factory/command-job module-only revisions are not supported installations.
+
+Passed evidence is limited to13 Node-only stage cases,154 syntax checks with2 unsupported mobile cases, and paused disposable CLI proof on retained dependencies. These do not replace the repository gate or prove production, lifecycle, client, platform, native-containment or upgrade acceptance. [Factory Ideas Discussion25487](https://github.com/pingdotgg/t3code/discussions/25487) retains the separate proposal. The [historical3669 preview](https://github.com/zainmitchell/t3code/releases/tag/community-native-factory-nightly3669-preview.1) and stable messaging/tick previews remain available separately.
+
