@@ -9,6 +9,7 @@ import {
   RunId,
   ThreadId,
 } from "@t3tools/contracts";
+import { CurrentExecutionJoin, ExecutionJoin, type JoinFor } from "@t3tools/shared/ExecutionJoin";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -59,8 +60,9 @@ export const layer: Layer.Layer<
     const eventSink = yield* EventSink.EventSinkV2;
     const ids = yield* IdAllocator.IdAllocatorV2;
     const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const executionJoin = yield* ExecutionJoin;
 
-    const execute = Effect.fn("orchestrationV2.checkpointCapture.execute")(function* (input: {
+    const captureNow = Effect.fn("orchestrationV2.checkpointCapture.captureNow")(function* (input: {
       readonly threadId: ThreadId;
       readonly runId: RunId;
       readonly scopeId: CheckpointScopeId;
@@ -229,6 +231,20 @@ export const layer: Layer.Layer<
               ]),
         ],
       });
+    });
+
+    // Capture runs Git in the worktree, which can run programs the worktree's own config names
+    // (clean filters, an fsmonitor hook). For a contained thread those join its run's container;
+    // if that cannot be held, the Git spawn is refused rather than run outside it.
+    const execute = Effect.fn("orchestrationV2.checkpointCapture.execute")(function* (input: {
+      readonly threadId: ThreadId;
+      readonly runId: RunId;
+      readonly scopeId: CheckpointScopeId;
+    }) {
+      const contained = yield* executionJoin
+        .forThread(input.threadId)
+        .pipe(Effect.catch((refused) => Effect.succeedSome<JoinFor>(() => Effect.fail(refused))));
+      return yield* captureNow(input).pipe(Effect.provideService(CurrentExecutionJoin, contained));
     });
 
     return CheckpointCaptureServiceV2.of({

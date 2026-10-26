@@ -4,8 +4,15 @@ import * as NodeUtil from "node:util";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { assert, it } from "@effect/vitest";
 import {
+  FactoryDecisionKey,
+  FactoryId,
+  FactoryItemKey,
+  FactoryPoolId,
+  CommandId,
+  NodeId,
   ProjectId,
   ProviderInstanceId,
+  RunId,
   ScheduledTaskError,
   ScheduledTaskId,
   ThreadId,
@@ -14,6 +21,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
+import * as Option from "effect/Option";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as Fiber from "effect/Fiber";
@@ -28,6 +36,7 @@ import * as ThreadManagementService from "../orchestration-v2/ThreadManagementSe
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
+import * as FactoryStore from "../factory/FactoryStore.ts";
 import * as ScheduledTaskService from "./ScheduledTaskService.ts";
 
 const isScheduledTaskError = Schema.is(ScheduledTaskError);
@@ -401,4 +410,122 @@ it.effect("thread cleanup notifies subscribers and a finishing run cannot recrea
       assert.lengthOf((yield* service.list()).tasks, 0);
     }).pipe(Effect.provide(layer));
   }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
+);
+
+it.effect(
+  "factory worker schedules keep their factory origin; other schedules stay out of its reach",
+  () =>
+    Effect.gen(function* () {
+      const launches = yield* Ref.make<ReadonlyArray<string>>([]);
+      const layer = Layer.mergeAll(ScheduledTaskService.layer, FactoryStore.layer).pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            Layer.mock(ThreadLaunchService.ThreadLaunchService)({
+              launch: (input) =>
+                Ref.update(launches, (all) => [...all, input.title]).pipe(
+                  // The scheduler reads only the launched thread id.
+                  Effect.as({
+                    threadId: ThreadId.make(`thread:launched:${input.title}`),
+                  } as unknown as ThreadLaunchService.ThreadLaunchResult),
+                ),
+            }),
+            Layer.mock(ThreadManagementService.ThreadManagementService)({}),
+            Layer.mock(SecretRequests.SecretRequests)({}),
+            Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+              namedProjectsRoot: "/projects",
+              isScratchProject: () => Effect.succeed(false),
+            }),
+            NodeCrypto.layer,
+            Scheduler.layer,
+          ),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        const service = yield* ScheduledTaskService.ScheduledTaskService;
+        const factory = yield* FactoryStore.FactoryStore;
+        const sql = yield* SqlClient.SqlClient;
+        const projectId = ProjectId.make("project:test");
+        const modelSelection = { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" };
+        const worker = ThreadId.make("thread:factory-worker");
+
+        // Bind the worker thread to a factory reservation through the store's own admission.
+        const configuration = yield* factory.configure({
+          factoryId: FactoryId.make("beta"),
+          projectId,
+          policyRevision: "policy-r1",
+          enabled: true,
+          pools: [{ poolId: FactoryPoolId.make("builders"), capacityUnits: 1 }],
+          execution: { modelSelection, runtimeMode: "full-access", interactionMode: "default" },
+          packet: { briefSchemaVersion: "brief-v1", helper: null },
+          artifactRoot: "/artifacts",
+        });
+        const recorded = yield* factory.recordItemObservation({
+          factoryId: FactoryId.make("beta"),
+          itemKey: FactoryItemKey.make("github:beta#401"),
+          itemVersion: "v1",
+          generation: yield* factory.beginCollection(FactoryId.make("beta")),
+          complete: true,
+          evidence: [],
+          sources: [],
+          claims: [],
+        });
+        if (recorded.type !== "recorded") throw new Error("expected a recorded observation");
+        const observation = recorded.observation;
+        yield* sql.withTransaction(
+          factory.reserveExecution({
+            commandId: CommandId.make("factory:beta:decision:401"),
+            executionThreadId: worker,
+            runId: RunId.make("run:factory-worker"),
+            taskNodeId: NodeId.make("node:factory-worker"),
+            modelSelection,
+            origin: {
+              type: "admission",
+              admission: {
+                factoryId: FactoryId.make("beta"),
+                configRevision: configuration.revision,
+                decisionKey: FactoryDecisionKey.make("401"),
+                itemKey: FactoryItemKey.make("github:beta#401"),
+                itemVersion: "v1",
+                taskKind: "implement",
+                policyRevision: "policy-r1",
+                poolId: FactoryPoolId.make("builders"),
+                units: 1,
+                packetDigest: "packet-401",
+                observationId: observation.observationId,
+                basisDigest: observation.basisDigest,
+                deadline: DateTime.add(yield* DateTime.now, { hours: 1 }),
+              },
+            },
+          }),
+        );
+
+        const freshThreadTask = (title: string) => ({
+          title,
+          prompt: "Check progress",
+          enabled: true,
+          schedule: { type: "interval" as const, everyMs: 60_000 },
+          projectId,
+          threadId: null,
+          workspaceStrategy: { type: "root" as const },
+          modelSelection,
+          runtimeMode: "full-access" as const,
+          interactionMode: "default" as const,
+        });
+        const { task: workerTask } = yield* service.upsert(freshThreadTask("worker"), {
+          callerThreadId: worker,
+        });
+        const { task: userTask } = yield* service.upsert(freshThreadTask("user"));
+        assert.isTrue(Option.isSome(yield* factory.scheduleOrigin(workerTask.id)));
+        assert.isTrue(Option.isNone(yield* factory.scheduleOrigin(userTask.id)));
+
+        // The worker may run its own schedule; another schedule would start unreserved work.
+        yield* service.runNow({ id: workerTask.id }, { callerThreadId: worker });
+        const fenced = yield* service
+          .runNow({ id: userTask.id }, { callerThreadId: worker })
+          .pipe(Effect.flip);
+        assert.isTrue(isScheduledTaskError(fenced));
+        yield* service.runNow({ id: userTask.id });
+        assert.deepStrictEqual(yield* Ref.get(launches), ["worker", "user"]);
+      }).pipe(Effect.provide(layer));
+    }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
 );

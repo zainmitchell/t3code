@@ -76,6 +76,23 @@ Webhook tasks only run when their URL is called, so they can't be run
 immediately.
 Leaving an edited form asks before discarding unsaved changes.
 
+## Factory decisions
+
+A factory works through a project's tracker issues on its own and stops only
+for decisions that are yours. Open **Settings → Factories** (on mobile, from
+the settings sheet) to see each factory's state, answer what is waiting for you,
+and revoke a grant you gave. **Approve** or **Decline** answers a decision;
+**Grant one start** lets a supervised ticket start once, for exactly the request
+shown. A changed request asks again. Answering here, from mobile, or from your
+own MCP client is the same answer, and an agent can never answer for you.
+
+When a factory's configuration names your thread (`ownerThreadId`), it also asks
+there, as a question in the chat: each waiting decision, and each result an item is
+stuck on, which you can **Reject** with a reason or **Keep**. The question works in
+any T3 app you are signed in to. Only your own answer counts; an agent that tries
+to answer it is refused, and a question you dismiss is asked again while the
+decision is still open.
+
 ## Webhook automations
 
 In **Settings → Scheduled tasks**, choose **On webhook**

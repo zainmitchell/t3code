@@ -1,4 +1,5 @@
 import * as WorktreeSetupTracker from "../project/WorktreeSetupTracker.ts";
+import { CurrentExecutionJoin, type JoinFor } from "@t3tools/shared/ExecutionJoin";
 import * as ProjectCloneTracker from "../project/ProjectCloneTracker.ts";
 import * as TerminalManager from "../terminal/Manager.ts";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
@@ -6,6 +7,7 @@ import {
   CommandId,
   type ChatAttachment,
   type MessageId,
+  type OrchestrationV2ThreadCreatedFrom,
   type ModelSelection,
   type OrchestrationV2Actor,
   type OrchestrationV2CreationSource,
@@ -22,6 +24,7 @@ import {
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -51,6 +54,7 @@ import type * as Orchestrator from "./Orchestrator.ts";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import { randomUuidV4 } from "@t3tools/provider-core/server/randomUuid";
 import { DispatchModeLimit } from "./DispatchModeLimit.ts";
+import { PreparationOwnerId } from "./preparationOwner.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
 
 export type ThreadLaunchWorkspaceStrategy =
@@ -88,6 +92,11 @@ export interface ThreadLaunchInput {
   readonly interactionMode: ProviderInteractionMode;
   readonly workspaceStrategy: ThreadLaunchWorkspaceStrategy;
   readonly initialMessage?: ThreadLaunchInitialMessage;
+  /**
+   * The thread or schedule this launch works for, when the server knows it. Defaults to the
+   * initial message's sender, then its schedule.
+   */
+  readonly createdFrom?: OrchestrationV2ThreadCreatedFrom;
   readonly importedNativeThread?: {
     readonly ref: {
       readonly driver: ProviderDriverKind;
@@ -111,6 +120,26 @@ export interface ThreadLaunchPreparationInput {
   readonly commandId: CommandId;
   readonly threadId: ThreadId;
   readonly runId: RunId;
+}
+
+/**
+ * What one ended preparation may have left running. `no_external_work` means no process
+ * boundary (Git, a setup script or terminal) was ever entered; anything else says which one
+ * may have been, never that it ended.
+ */
+export type PreparationEvidence =
+  | {
+      readonly type: "no_external_work";
+      readonly fiber: "succeeded" | "failed" | "interrupted";
+    }
+  | { readonly type: "external_work"; readonly boundary: "process" | "setup" };
+
+export { PreparationOwnerId };
+
+/** One owned preparation, captured when it was reserved, before it could end. */
+export interface PreparationHandle {
+  readonly ownerId: PreparationOwnerId;
+  readonly ended: Effect.Effect<PreparationEvidence>;
 }
 
 export interface ThreadLaunchResult {
@@ -184,8 +213,44 @@ export class ThreadLaunchService extends Context.Service<
       | ThreadManagement.ThreadManagementProviderInstanceDisabledError
     >;
     readonly prepareRun: (input: ThreadLaunchPreparationInput) => Effect.Effect<void>;
+    /**
+     * `prepareRun` for an owner that must account for exactly this preparation: the handle, made
+     * in the same step that reserves it, reports how it ended. None when another preparation
+     * under the command is already scheduled, or the run is not awaiting one.
+     */
+    readonly prepareRunOwned: (
+      input: ThreadLaunchPreparationInput & {
+        readonly ownerId: PreparationOwnerId;
+        /** The container this preparation's processes join, when its run is contained. */
+        readonly join?: JoinFor;
+      },
+    ) => Effect.Effect<Option.Option<PreparationHandle>>;
+    /**
+     * The owner of the preparation this process is running under `commandId` now. In-process
+     * only: none never proves that an earlier preparation, here or in a lost process, stopped.
+     */
+    readonly currentPreparationOwner: (
+      commandId: CommandId,
+    ) => Effect.Effect<Option.Option<PreparationOwnerId>>;
   }
 >()("t3/orchestration-v2/ThreadLaunchService") {}
+
+/** A scheduled preparation: its owner, the boundary it may have crossed, and how it ended. */
+interface PreparationEntry {
+  readonly ownerId: PreparationOwnerId | null;
+  readonly join: JoinFor | null;
+  /** Marked before the call that may cross it; only the runner's typed no-script clears setup. */
+  boundary: "none" | "process" | "setup";
+  readonly ended: Deferred.Deferred<PreparationEvidence>;
+}
+
+const evidenceOf = (
+  entry: PreparationEntry,
+  fiber: "succeeded" | "failed" | "interrupted",
+): PreparationEvidence =>
+  entry.boundary === "none"
+    ? { type: "no_external_work", fiber }
+    : { type: "external_work", boundary: entry.boundary };
 
 const isThreadLaunchError = Schema.is(ThreadLaunchError);
 
@@ -213,7 +278,8 @@ const make = Effect.gen(function* () {
   const threads = yield* ThreadManagement.ThreadManagementService;
   const managedFolders = yield* ManagedProjectFolders.ManagedProjectFolders;
   const preparationScope = yield* Scope.make("sequential");
-  const scheduledLaunches = yield* Ref.make<ReadonlySet<CommandId>>(new Set());
+  // Entries live only while their preparation is scheduled, so ordinary launches never pile up.
+  const scheduledLaunches = yield* Ref.make<ReadonlyMap<CommandId, PreparationEntry>>(new Map());
   yield* Effect.addFinalizer(() => Scope.close(preparationScope, Exit.void));
 
   const mapError =
@@ -324,6 +390,7 @@ const make = Effect.gen(function* () {
     input: PreparationInput,
     threadId: ThreadId,
     runId: RunId | null,
+    entry: PreparationEntry,
   ) {
     const project = yield* projects.getById(input.projectId).pipe(
       Effect.mapError(mapError(input, "resolve-project", threadId)),
@@ -339,6 +406,7 @@ const make = Effect.gen(function* () {
     const reused = input.reusedWorktree;
     const tracked = input.workspaceStrategy.type === "worktree" || reused !== undefined;
     let createdWorktreePath: string | null = null;
+    let createdBranch: { readonly name: string; readonly commit: string } | null = null;
     let setupTerminalId: string | null = null;
     let workspaceRecorded = false;
     let runReleased = false;
@@ -412,6 +480,8 @@ const make = Effect.gen(function* () {
           ? input.workspaceStrategy.worktreePath
           : null;
       if (input.workspaceStrategy.type === "worktree") {
+        // Git runs from here on, and an awaited root process says nothing of what it started.
+        entry.boundary = "process";
         if (runId !== null) {
           yield* threads
             .dispatch({
@@ -484,6 +554,13 @@ const make = Effect.gen(function* () {
         worktreePath = worktree.worktree.path;
         branch = worktree.worktree.refName;
         createdWorktreePath = worktreePath;
+        const madeBranch = branch;
+        createdBranch = yield* git
+          .resolveCommit({ cwd: project.workspaceRoot, revision: `refs/heads/${madeBranch}` })
+          .pipe(
+            Effect.map(({ commitSha }) => ({ name: madeBranch, commit: commitSha })),
+            Effect.orElseSucceed(() => null),
+          );
         yield* setupTracker.update(threadId, (snapshot) => ({ ...snapshot, worktreePath, branch }));
         yield* setupTracker.stageStatus(threadId, "checkout", "done");
       }
@@ -598,6 +675,9 @@ const make = Effect.gen(function* () {
           .pipe(Effect.mapError(mapError(input, "update-thread", threadId)));
       }
       yield* setupTracker.stageStatus(threadId, "setup-script", "running");
+      // The runner opens a terminal and writes the command before it returns, so a script may run
+      // from the moment it is called; only its typed no-script answer shows nothing started.
+      if (worktreePath !== null && entry.boundary === "none") entry.boundary = "setup";
       const setup =
         worktreePath === null
           ? ({ status: "no-script" } as const)
@@ -623,6 +703,7 @@ const make = Effect.gen(function* () {
               })
               .pipe(Effect.mapError(mapError(input, "run-setup-script", threadId)));
 
+      if (setup.status === "no-script" && entry.boundary === "setup") entry.boundary = "none";
       let awaitAsyncSetup = Effect.void;
       if (setup.status === "started") {
         setupTerminalId = setup.terminalId;
@@ -709,6 +790,36 @@ const make = Effect.gen(function* () {
           ) {
             if (branchRename !== null) yield* Fiber.interrupt(branchRename);
             const removedPath = createdWorktreePath;
+            const made = createdBranch;
+            // A branch left behind makes the next `git worktree add -b` of the same name fail. Only the
+            // branch this preparation made goes, and only while it is at the commit it was made at.
+            const deleteCreatedBranch =
+              made === null
+                ? Effect.void
+                : git
+                    .resolveCommit({
+                      cwd: project.workspaceRoot,
+                      revision: `refs/heads/${made.name}`,
+                    })
+                    .pipe(
+                      Effect.flatMap(({ commitSha }) =>
+                        commitSha === made.commit
+                          ? git.deleteLocalBranch({
+                              cwd: project.workspaceRoot,
+                              refName: made.name,
+                              force: true,
+                            })
+                          : Effect.void,
+                      ),
+                      Effect.catchCause((branchCause) =>
+                        Effect.logWarning("Failed to delete an abandoned thread branch", {
+                          commandId: input.commandId,
+                          threadId,
+                          branch: made.name,
+                          cause: branchCause,
+                        }),
+                      ),
+                    );
             // Forget worktrees only after removal succeeds; failed removals must not reuse partially written checkouts.
             yield* git
               .removeWorktree({ cwd: project.workspaceRoot, path: removedPath, force: true })
@@ -724,6 +835,7 @@ const make = Effect.gen(function* () {
                     })
                     .pipe(Effect.ignore),
                 ),
+                Effect.andThen(deleteCreatedBranch),
                 Effect.catchCause((removeCause) =>
                   Effect.logWarning("Failed to remove an abandoned thread worktree", {
                     commandId: input.commandId,
@@ -744,6 +856,7 @@ const make = Effect.gen(function* () {
     threadId: ThreadId,
     runId: RunId | null,
     cause: unknown,
+    ownerId: PreparationOwnerId | null,
   ) =>
     runId === null
       ? Effect.logWarning("Thread workspace preparation failed", {
@@ -754,7 +867,10 @@ const make = Effect.gen(function* () {
       : threads
           .dispatch({
             type: "prepared-run.fail",
-            commandId: CommandId.make(`${input.commandId}:fail`),
+            // An owned preparation is retried under its command, so each owner fails under its own id.
+            commandId: CommandId.make(
+              ownerId === null ? `${input.commandId}:fail` : `${input.commandId}:fail:${ownerId}`,
+            ),
             threadId,
             runId,
             failure: makeProviderFailure({
@@ -775,28 +891,54 @@ const make = Effect.gen(function* () {
             ),
           );
 
-  const reservePreparation = (commandId: CommandId) =>
-    Ref.modify(scheduledLaunches, (scheduled) => {
-      if (scheduled.has(commandId)) return [false, scheduled] as const;
-      const next = new Set(scheduled);
-      next.add(commandId);
-      return [true, next] as const;
-    });
+  // The entry, and the Deferred its owner awaits, are made in the step that reserves it, so an
+  // owner can never miss a preparation that ends before it looks.
+  const reservePreparation = (
+    commandId: CommandId,
+    ownerId: PreparationOwnerId | null,
+    join: JoinFor | null,
+  ) =>
+    Ref.modify(
+      scheduledLaunches,
+      (
+        scheduled,
+      ): readonly [Option.Option<PreparationEntry>, ReadonlyMap<CommandId, PreparationEntry>] => {
+        if (scheduled.has(commandId)) return [Option.none(), scheduled];
+        const entry: PreparationEntry = {
+          ownerId,
+          join,
+          boundary: "none",
+          ended: Deferred.makeUnsafe<PreparationEvidence>(),
+        };
+        return [Option.some(entry), new Map(scheduled).set(commandId, entry)];
+      },
+    );
 
-  const releasePreparation = (commandId: CommandId) =>
+  /** Ends exactly this entry: a later preparation under the same command keeps its own. */
+  const finishPreparation = (
+    commandId: CommandId,
+    entry: PreparationEntry,
+    fiber: "succeeded" | "failed" | "interrupted",
+  ) =>
     Ref.update(scheduledLaunches, (scheduled) => {
-      const next = new Set(scheduled);
+      if (scheduled.get(commandId) !== entry) return scheduled;
+      const next = new Map(scheduled);
       next.delete(commandId);
       return next;
-    });
+    }).pipe(Effect.andThen(Deferred.succeed(entry.ended, evidenceOf(entry, fiber))));
 
   const schedulePreparation = Effect.fn("ThreadLaunchService.schedulePreparation")(function* (
     input: PreparationInput,
     threadId: ThreadId,
     runId: RunId | null,
+    entry: PreparationEntry,
   ) {
+    let fiberOutcome: "succeeded" | "failed" | "interrupted" = "interrupted";
     const preparation = Effect.gen(function* () {
-      const prepare = prepareInBackground(input, threadId, runId);
+      // A contained run's Git, setup and every other process it starts join its container.
+      const prepare = prepareInBackground(input, threadId, runId, entry).pipe(
+        Effect.provideService(CurrentExecutionJoin, Option.fromNullishOr(entry.join)),
+      );
       if (
         runId === null ||
         (input.workspaceStrategy.type !== "worktree" && input.reusedWorktree === undefined)
@@ -822,16 +964,28 @@ const make = Effect.gen(function* () {
       yield* Effect.raceFirst(prepare, interruption);
     });
     yield* preparation.pipe(
+      Effect.onExit((exit) =>
+        Effect.sync(() => {
+          fiberOutcome = Exit.isSuccess(exit)
+            ? "succeeded"
+            : Cause.hasInterruptsOnly(exit.cause)
+              ? "interrupted"
+              : "failed";
+        }),
+      ),
       Effect.onError((cause) =>
         failPreparedRun(
           input,
           threadId,
           runId,
           Cause.hasInterruptsOnly(cause) ? "Worktree setup cancelled." : Cause.squash(cause),
+          entry.ownerId,
         ),
       ),
       Effect.ignoreCause,
-      Effect.ensuring(releasePreparation(input.commandId)),
+      Effect.ensuring(
+        Effect.suspend(() => finishPreparation(input.commandId, entry, fiberOutcome)),
+      ),
       Effect.forkIn(preparationScope),
     );
   });
@@ -924,6 +1078,15 @@ const make = Effect.gen(function* () {
               )
             : input.workspaceStrategy;
         const initialBranch = workspaceStrategy.branch ?? null;
+        // The first message's sender and schedule are server-set; recording them at creation
+        // keeps the thread's origin when that message is refused or never sent.
+        const createdFrom: OrchestrationV2ThreadCreatedFrom | undefined =
+          input.createdFrom ??
+          (input.initialMessage?.senderThreadId !== undefined
+            ? { type: "thread", threadId: input.initialMessage.senderThreadId }
+            : input.initialMessage?.scheduledTaskId !== undefined
+              ? { type: "scheduled_task", scheduledTaskId: input.initialMessage.scheduledTaskId }
+              : undefined);
         const initialWorktreePath =
           workspaceStrategy.type === "existing_worktree" ? workspaceStrategy.worktreePath : null;
         const claimDispatch =
@@ -948,6 +1111,7 @@ const make = Effect.gen(function* () {
                 ...(input.importedNativeThread === undefined
                   ? {}
                   : { importedNativeThread: input.importedNativeThread }),
+                ...(createdFrom === undefined ? {} : { createdFrom }),
                 createdBy: input.createdBy,
                 creationSource: input.creationSource,
               });
@@ -1044,8 +1208,9 @@ const make = Effect.gen(function* () {
               }
             : workspaceStrategy;
         if (shouldSchedule) {
-          const ownsPreparation = yield* reservePreparation(input.commandId);
-          if (ownsPreparation) {
+          const reserved = yield* reservePreparation(input.commandId, null, null);
+          if (Option.isSome(reserved)) {
+            const entry = reserved.value;
             yield* Effect.gen(function* () {
               const preparationStillRequired =
                 runId === null
@@ -1063,18 +1228,20 @@ const make = Effect.gen(function* () {
                     projection,
                     acceptedRun,
                     acceptedRun.workspacePreparation,
+                    entry,
                   );
                 } else {
                   yield* schedulePreparation(
                     { ...input, workspaceStrategy: preparationStrategy },
                     threadId,
                     runId,
+                    entry,
                   );
                 }
               } else {
-                yield* releasePreparation(input.commandId);
+                yield* finishPreparation(input.commandId, entry, "succeeded");
               }
-            }).pipe(Effect.onError(() => releasePreparation(input.commandId)));
+            }).pipe(Effect.onError(() => finishPreparation(input.commandId, entry, "failed")));
           }
         }
 
@@ -1092,22 +1259,58 @@ const make = Effect.gen(function* () {
     },
   );
 
-  const prepareRun: ThreadLaunchService["Service"]["prepareRun"] = Effect.fn(
-    "ThreadLaunchService.prepareRun",
-  )(function* (input) {
+  /** Schedules the run's recorded preparation, returning its entry when this call reserved it. */
+  const prepareRunAs = Effect.fnUntraced(function* (
+    input: ThreadLaunchPreparationInput,
+    ownerId: PreparationOwnerId | null,
+    join: JoinFor | null,
+  ) {
     const scheduled = yield* Effect.gen(function* () {
       const projection = yield* threads.getThreadProjection(input.threadId);
       const run = projection.runs.find((candidate) => candidate.id === input.runId);
       const workspacePreparation = run?.workspacePreparation;
-      if (run?.status !== "preparing" || workspacePreparation === undefined) return;
-      if (!(yield* reservePreparation(input.commandId))) return;
-      yield* scheduleRunPreparation(input, projection, run, workspacePreparation).pipe(
-        Effect.onError(() => releasePreparation(input.commandId)),
-      );
+      if (run?.status !== "preparing" || workspacePreparation === undefined) {
+        return Option.none<PreparationEntry>();
+      }
+      const reserved = yield* reservePreparation(input.commandId, ownerId, join);
+      if (Option.isNone(reserved)) return reserved;
+      // Nothing ran yet if scheduling fails, so its owner is told nothing external happened.
+      yield* scheduleRunPreparation(
+        input,
+        projection,
+        run,
+        workspacePreparation,
+        reserved.value,
+      ).pipe(Effect.onError(() => finishPreparation(input.commandId, reserved.value, "failed")));
+      return reserved;
     }).pipe(Effect.exit);
     if (Exit.isFailure(scheduled)) {
-      yield* failPreparedRun(input, input.threadId, input.runId, Cause.squash(scheduled.cause));
+      yield* failPreparedRun(
+        input,
+        input.threadId,
+        input.runId,
+        Cause.squash(scheduled.cause),
+        ownerId,
+      );
+      return Option.none<PreparationEntry>();
     }
+    return scheduled.value;
+  });
+
+  const prepareRun: ThreadLaunchService["Service"]["prepareRun"] = Effect.fn(
+    "ThreadLaunchService.prepareRun",
+  )(function* (input) {
+    yield* prepareRunAs(input, null, null);
+  });
+
+  const prepareRunOwned: ThreadLaunchService["Service"]["prepareRunOwned"] = Effect.fn(
+    "ThreadLaunchService.prepareRunOwned",
+  )(function* (input) {
+    const reserved = yield* prepareRunAs(input, input.ownerId, input.join ?? null);
+    return Option.map(reserved, (entry) => ({
+      ownerId: input.ownerId,
+      ended: Deferred.await(entry.ended),
+    }));
   });
 
   const retryPreparation: ThreadLaunchService["Service"]["retryPreparation"] = Effect.fn(
@@ -1128,6 +1331,7 @@ const make = Effect.gen(function* () {
     projection: OrchestrationV2ThreadProjection,
     run: OrchestrationV2ThreadProjection["runs"][number],
     workspacePreparation: ThreadLaunchWorkspaceStrategy,
+    entry: PreparationEntry,
   ) => {
     const message = projection.messages.find((candidate) => candidate.id === run.userMessageId);
     const reuse =
@@ -1161,6 +1365,7 @@ const make = Effect.gen(function* () {
       },
       input.threadId,
       run.id,
+      entry,
     );
   };
 
@@ -1170,6 +1375,14 @@ const make = Effect.gen(function* () {
     checkWorktreeBase,
     retryPreparation,
     prepareRun,
+    prepareRunOwned,
+    currentPreparationOwner: Effect.fn("ThreadLaunchService.currentPreparationOwner")(
+      function (commandId) {
+        return Effect.map(Ref.get(scheduledLaunches), (scheduled) =>
+          Option.fromNullishOr(scheduled.get(commandId)?.ownerId),
+        );
+      },
+    ),
   });
 });
 

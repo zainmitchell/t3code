@@ -18,6 +18,7 @@ export const SETTINGS_PAGE_TARGETS = [
   "SettingsMicrophone",
   "SettingsFollowUp",
   "SettingsScheduledTasks",
+  "SettingsFactories",
   "SettingsProjectGrouping",
   "SettingsClientStorage",
   "SettingsDiagnostics",

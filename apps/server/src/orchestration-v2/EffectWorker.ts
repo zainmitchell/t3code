@@ -18,6 +18,8 @@ import {
 } from "../observability/Metrics.ts";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
 import * as ResourceCleanupService from "./ResourceCleanupService.ts";
+import * as FactoryClaimService from "../factory/FactoryClaimService.ts";
+import * as FactoryEffects from "../factory/FactoryEffects.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as CheckpointRollbackService from "./CheckpointRollbackService.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
@@ -80,9 +82,12 @@ export const layerExecutor: Layer.Layer<
   | ThreadTitleRegenerationService.ThreadTitleRegenerationService
   | ThreadManagementService.ThreadManagementService
   | ServerSettings.ServerSettingsService
+  | FactoryClaimService.FactoryClaimService
 > = Layer.effect(
   OrchestrationEffectExecutorV2,
   Effect.gen(function* () {
+    const factoryClaims = yield* FactoryClaimService.FactoryClaimService;
+    const factoryEffects = yield* FactoryEffects.FactoryEffects;
     const runFinalization = yield* RunFinalizationService.RunFinalizationService;
     const resourceCleanup = yield* ResourceCleanupService.ResourceCleanupService;
     const checkpointRollback = yield* CheckpointRollbackService.CheckpointRollbackServiceV2;
@@ -539,6 +544,35 @@ export const layerExecutor: Layer.Layer<
                     }),
                 ),
               );
+          case "factory-claim.write":
+            return factoryClaims.process(effect.request.reservationId).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new OrchestrationEffectExecutionError({
+                    effectId: effect.id,
+                    effectType: effect.request.type,
+                    cause,
+                  }),
+              ),
+            );
+          case "factory-execution.prepare":
+            return factoryClaims
+              .prepareFirstUse({
+                reservationId: effect.request.reservationId,
+                runId: effect.request.runId,
+              })
+              .pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new OrchestrationEffectExecutionError({
+                      effectId: effect.id,
+                      effectType: effect.request.type,
+                      cause,
+                    }),
+                ),
+              );
+          case "factory-operation.apply":
+            return factoryEffects.apply(effect.request.operationId);
           case "delegated-tasks.stop":
             return threads
               .stopDelegatedTasks({

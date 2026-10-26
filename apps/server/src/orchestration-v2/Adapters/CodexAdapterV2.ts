@@ -124,6 +124,7 @@ import {
   MCP_APP_RESOURCE_SCHEME,
 } from "@t3tools/shared/mcpApp";
 import { snapshotMcpApp } from "../../mcpApps/McpAppSnapshot.ts";
+import { ExecutionJoin, spawnJoined } from "@t3tools/shared/ExecutionJoin";
 import {
   ProviderAdapterDriverCreateError,
   type ProviderAdapterDriver,
@@ -1300,6 +1301,11 @@ export interface CodexAppServerClientFactoryShape {
     readonly instanceId: ProviderInstanceId;
     readonly threadId: ThreadId;
     readonly providerSessionId: OrchestrationV2ProviderSession["id"];
+    /**
+     * The session serves only `threadId`. Only such a session can start inside that thread's
+     * execution container: a shared one would carry other threads' work in with it.
+     */
+    readonly exclusive: boolean;
     readonly runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
     readonly settings: CodexSettings;
     readonly environment: NodeJS.ProcessEnv;
@@ -1491,33 +1497,54 @@ export const layerAppServerClientFactory: Layer.Layer<
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const { native: nativeEventLogger } = yield* ProviderEventLoggers.ProviderEventLoggers;
     const agentScope = yield* AgentScope;
+    const executionJoin = yield* ExecutionJoin;
 
     return CodexAppServerClientFactory.of({
       open: Effect.fn("CodexAdapterV2.open")(function* (input) {
         const scope = yield* Scope.Scope;
+        const openError = (cause: unknown) =>
+          new ProviderAdapter.ProviderAdapterOpenSessionError({
+            driver: CODEX_PROVIDER,
+            providerSessionId: input.providerSessionId,
+            cause,
+          });
         const environment = {
           ...codexAppServerEnvironment(input.environment),
           ...(input.settings.homePath ? { CODEX_HOME: input.settings.homePath } : {}),
         };
-        const command = yield* makeCodexAppServerSpawnCommand({
-          command: input.settings.binaryPath || "codex",
-          args: codexAppServerArgs(
-            resolveCodexLaunchArgs(input.settings.launchArgs, input.environment),
-          ),
-          env: environment,
-          threadId: input.threadId,
-        }).pipe(Effect.provideService(AgentScope, agentScope));
-        const handle = yield* spawner.spawn(command).pipe(
-          Effect.provideService(Scope.Scope, scope),
-          Effect.mapError(
-            (cause) =>
-              new ProviderAdapter.ProviderAdapterOpenSessionError({
-                driver: CODEX_PROVIDER,
-                providerSessionId: input.providerSessionId,
-                cause,
-              }),
-          ),
+        const binaryPath = input.settings.binaryPath || "codex";
+        const args = codexAppServerArgs(
+          resolveCodexLaunchArgs(input.settings.launchArgs, input.environment),
         );
+        // A contained thread starts its app server inside its run's container or not at all.
+        const contained = input.exclusive
+          ? yield* executionJoin.forThread(input.threadId).pipe(Effect.mapError(openError))
+          : Option.none();
+        const handle = yield* (
+          Option.isSome(contained)
+            ? resolveSpawnCommand(binaryPath, args, { env: environment }).pipe(
+                Effect.flatMap((resolved) =>
+                  spawnJoined(
+                    spawner,
+                    contained.value,
+                    ChildProcess.make(resolved.command, resolved.args, {
+                      env: environment,
+                      shell: resolved.shell,
+                    }),
+                    "provider",
+                  ),
+                ),
+              )
+            : makeCodexAppServerSpawnCommand({
+                command: binaryPath,
+                args,
+                env: environment,
+                threadId: input.threadId,
+              }).pipe(
+                Effect.provideService(AgentScope, agentScope),
+                Effect.flatMap((command) => spawner.spawn(command)),
+              )
+        ).pipe(Effect.provideService(Scope.Scope, scope), Effect.mapError(openError));
         const protocolLogger = makeCodexAppServerProtocolLogger({
           nativeEventLogger,
           threadId: input.threadId,
@@ -1660,6 +1687,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           instanceId: adapterOptions.instanceId,
           threadId: input.threadId,
           providerSessionId: input.providerSessionId,
+          exclusive:
+            input.providerSessionId !==
+            idAllocator.derive.providerSession({ providerInstanceId: adapterOptions.instanceId }),
           runtimePolicy: input.runtimePolicy,
           settings: resolvedRuntime?.config ?? adapterOptions.settings,
           environment: resolvedRuntime?.environment ?? adapterOptions.environment,
@@ -6696,11 +6726,24 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 : null;
             if (goalCommand !== null) return runGoalCommand(turnInput, goalCommand);
             return Effect.gen(function* () {
-              yield* startNativeTurn(
-                turnInput,
-                turnInput.restartContinuationOfRunId === undefined
-                  ? yield* toCodexInput(turnInput)
-                  : [],
+              if (turnInput.restartContinuationOfRunId === undefined) {
+                return yield* startNativeTurn(turnInput, yield* toCodexInput(turnInput));
+              }
+              yield* startNativeTurn(turnInput, []).pipe(
+                // Some Codex releases refuse an empty resume while validating input,
+                // before any turn exists, so only that exact refusal resends the
+                // continuation message. Any other failure is ambiguous and is not retried.
+                Effect.catchTags({
+                  CodexAppServerRequestError: (error) =>
+                    error.method === "turn/start" &&
+                    error.operation === "receive-response" &&
+                    error.code === -32603 &&
+                    error.errorMessage === "failed to submit turn input: EmptyInput"
+                      ? Effect.flatMap(toCodexInput(turnInput), (input) =>
+                          startNativeTurn(turnInput, input),
+                        )
+                      : Effect.fail(error),
+                }),
               );
             }).pipe(
               Effect.mapError(

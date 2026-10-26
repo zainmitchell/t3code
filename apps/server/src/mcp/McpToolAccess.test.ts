@@ -1,21 +1,33 @@
 import { expect, it } from "@effect/vitest";
 import {
+  FactoryDecisionKey,
+  FactoryId,
+  FactoryItemKey,
+  FactoryPoolId,
+  CommandId,
   EnvironmentId,
+  NodeId,
   OrchestratorMcpEnvironmentTarget,
   OrchestratorMcpFailure,
+  ProjectId,
   ProviderInstanceId,
   ProviderInteractionMode,
+  RunId,
   RuntimeMode,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import * as SqlClient from "effect/sql/SqlClient";
 import { McpSchema, McpServer, Tool, Toolkit } from "effect/ai";
 
+import * as FactoryStore from "../factory/FactoryStore.ts";
 import { OrchestratorProjectionError } from "../orchestration-v2/Orchestrator.ts";
+import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as PeerForwarding from "../peer/PeerForwarding.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import * as McpHttpServer from "./McpHttpServer.ts";
@@ -391,6 +403,8 @@ const linkedProbeServer = McpHttpServer.toolkitRegistration(
         Effect.succeed({ ran: `${tool.name} in ${environmentId}` } as never),
     }),
   ),
+  // No thread here is factory work.
+  Layer.provide(FactoryStore.layer.pipe(Layer.provide(Layer.fresh(SqlitePersistence.layerMemory)))),
 );
 
 it.effect.each([
@@ -451,4 +465,147 @@ it.effect("refuses a linked environment to a tool that acts as its calling threa
     ).pipe(Effect.scoped, Effect.exit);
     expect(Exit.isFailure(built) && Cause.hasDies(built.cause)).toBe(true);
   }),
+);
+
+// G1-P01: a linked environment holds no reservation for this environment's factory items, so
+// factory work here may read there but not start executions there.
+const factoryWorkerThreadId = ThreadId.make("thread:factory-worker");
+const factoryWorker = threadCaller(factoryWorkerThreadId);
+const factoryShells = new Map([
+  ...shells,
+  [factoryWorkerThreadId, liveThreadShell(factoryWorkerThreadId)],
+]);
+
+const FactoryLinkedProbeToolkit = Toolkit.make(
+  Tool.make("reads", linkedProbe),
+  Tool.make("writes_threads", linkedProbe),
+  Tool.make("sends_to_threads", linkedProbe),
+  Tool.make("starts_threads", linkedProbe),
+);
+
+// The routed boundary reads FactoryStore when it is present, so any layer that holds it fits.
+const factoryLinkedProbeServer = <Provided, E>(factoryStore: Layer.Layer<Provided, E>) =>
+  McpHttpServer.toolkitRegistration(
+    FactoryLinkedProbeToolkit,
+    McpToolAccess.toLayer(FactoryLinkedProbeToolkit, {
+      reads: McpToolAccess.reads(ranHere),
+      writes_threads: McpToolAccess.writesThreads((input) => [input.threadId], ranHere),
+      sends_to_threads: McpToolAccess.writesThreads((input) => [input.threadId], ranHere, {
+        startsExecutions: true,
+      }),
+      starts_threads: McpToolAccess.startsThreads((input) => input, ranHere),
+    }),
+  ).pipe(
+    Layer.provideMerge(McpServer.McpServer.layer),
+    Layer.provideMerge(
+      Layer.mock(ThreadManagement.ThreadManagementService)({
+        getThreadShell: (threadId) => Effect.succeed(factoryShells.get(threadId) ?? null),
+      }),
+    ),
+    // Stands in for the linked environment's transport, answering with where the call went.
+    Layer.provide(
+      Layer.mock(PeerForwarding.PeerForwarding)({
+        call: (_scope, tool, environmentId) =>
+          Effect.succeed({ ran: `${tool.name} in ${environmentId}` } as never),
+      }),
+    ),
+    Layer.provideMerge(factoryStore),
+  );
+
+/** Binds the worker thread to a factory reservation through the store's own admission. */
+const bindFactoryWorker = Effect.gen(function* () {
+  const factory = yield* FactoryStore.FactoryStore;
+  const sql = yield* SqlClient.SqlClient;
+  const modelSelection = { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" };
+  const configuration = yield* factory.configure({
+    factoryId: FactoryId.make("beta"),
+    projectId: ProjectId.make("project:beta"),
+    policyRevision: "policy-r1",
+    enabled: true,
+    pools: [{ poolId: FactoryPoolId.make("builders"), capacityUnits: 4 }],
+    execution: { modelSelection, runtimeMode: "full-access", interactionMode: "default" },
+    packet: { briefSchemaVersion: "brief-v1", helper: null },
+    artifactRoot: "/artifacts",
+  });
+  const recorded = yield* factory.recordItemObservation({
+    factoryId: FactoryId.make("beta"),
+    itemKey: FactoryItemKey.make("github:beta#701"),
+    itemVersion: "v1",
+    generation: yield* factory.beginCollection(FactoryId.make("beta")),
+    complete: true,
+    evidence: [],
+    sources: [],
+    claims: [],
+  });
+  if (recorded.type !== "recorded") throw new Error("expected a recorded observation");
+  const observation = recorded.observation;
+  yield* sql.withTransaction(
+    factory.reserveExecution({
+      commandId: CommandId.make("factory:beta:decision:701"),
+      executionThreadId: factoryWorkerThreadId,
+      runId: RunId.make("run:factory-worker"),
+      taskNodeId: NodeId.make("node:factory-worker"),
+      modelSelection,
+      origin: {
+        type: "admission",
+        admission: {
+          factoryId: FactoryId.make("beta"),
+          configRevision: configuration.revision,
+          decisionKey: FactoryDecisionKey.make("701"),
+          itemKey: FactoryItemKey.make("github:beta#701"),
+          itemVersion: "v1",
+          taskKind: "implement",
+          policyRevision: "policy-r1",
+          poolId: FactoryPoolId.make("builders"),
+          units: 1,
+          packetDigest: "packet-701",
+          observationId: observation.observationId,
+          basisDigest: observation.basisDigest,
+          deadline: DateTime.add(yield* DateTime.now, { hours: 1 }),
+        },
+      },
+    }),
+  );
+});
+
+const layerFactoryStoreMemory = FactoryStore.layer.pipe(
+  Layer.provideMerge(Layer.fresh(SqlitePersistence.layerMemory)),
+);
+
+it.effect.each([
+  // Factory work here may not start executions a linked environment cannot reserve.
+  ["starts_threads", factoryWorker, { environmentId: box }, "capability_denied"],
+  ["sends_to_threads", factoryWorker, { environmentId: box }, "capability_denied"],
+  // Reads and non-starting writes still go; local starts use this environment's admission.
+  ["reads", factoryWorker, { environmentId: box }, "reads in environment-box"],
+  ["writes_threads", factoryWorker, { environmentId: box }, "writes_threads in environment-box"],
+  ["starts_threads", factoryWorker, { environmentId: here }, "here"],
+  // Unrelated callers keep using linked environments.
+  ["starts_threads", fullAccess, { environmentId: box }, "starts_threads in environment-box"],
+  ["sends_to_threads", fullAccess, { environmentId: box }, "sends_to_threads in environment-box"],
+  ["starts_threads", fullAccessClient, { environmentId: box }, "starts_threads in environment-box"],
+] as const)("G1-P01: a linked %s from %o with %o: %s", ([tool, scope, args, expected]) =>
+  Effect.gen(function* () {
+    yield* bindFactoryWorker;
+    expect(yield* call(tool, scope, args)).toBe(expected);
+  }).pipe(Effect.provide(factoryLinkedProbeServer(layerFactoryStoreMemory))),
+);
+
+it.effect("G1-P01: a linked start fails closed when factory ownership cannot be read", () =>
+  call("starts_threads", fullAccess, { environmentId: box }).pipe(
+    Effect.map((outcome) => expect(outcome).toBe("orchestration_error")),
+    Effect.provide(
+      factoryLinkedProbeServer(
+        Layer.succeed(FactoryStore.FactoryStore, {
+          bindingForThread: () =>
+            Effect.fail(
+              new FactoryStore.FactoryStoreError({
+                operation: "binding-for-thread",
+                cause: "down",
+              }),
+            ),
+        } as unknown as FactoryStore.FactoryStore["Service"]),
+      ),
+    ),
+  ),
 );

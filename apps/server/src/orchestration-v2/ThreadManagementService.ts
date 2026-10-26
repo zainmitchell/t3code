@@ -72,8 +72,12 @@ export function withCreationProvenance(
 ): OrchestrationV2Command {
   switch (command.type) {
     case "thread.create":
+    case "thread.fork": {
+      // Only a server tool knows which thread or schedule created a thread.
+      const { createdFrom: _createdFrom, ...created } = command;
+      return { ...created, ...provenance };
+    }
     case "message.dispatch":
-    case "thread.fork":
     case "thread.merge_back":
     case "delegated_task.request":
       return { ...command, ...provenance };
@@ -410,7 +414,9 @@ export interface ThreadManagementServiceShape {
     readonly instanceId: ProviderInstanceId;
   }) => Effect.Effect<boolean>;
   /** Receipt replays start no work; skip enablement checks with the same command id so settings cannot reject accepted retries. */
-  readonly hasReceipt: (commandId: CommandId) => Effect.Effect<boolean>;
+  readonly hasReceipt: (
+    commandId: CommandId,
+  ) => Effect.Effect<boolean, CommandReceiptStore.CommandReceiptStoreV2Error>;
   readonly waitForThread: (
     input: ThreadManagementWaitInput,
   ) => Effect.Effect<ThreadManagementWaitResult, ThreadManagementError>;
@@ -569,10 +575,7 @@ const make = Effect.gen(function* () {
       );
 
   const hasReceipt: ThreadManagementServiceShape["hasReceipt"] = (commandId) =>
-    receipts.getByCommandId(commandId).pipe(
-      Effect.orElseSucceed(() => Option.none()),
-      Effect.map(Option.isSome),
-    );
+    receipts.getByCommandId(commandId).pipe(Effect.map(Option.isSome));
 
   const ensureLegacyTranscript = Effect.fn(
     "orchestrationV2.threadManagement.ensureLegacyTranscript",

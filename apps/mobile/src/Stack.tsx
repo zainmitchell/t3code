@@ -97,6 +97,7 @@ import { SettingsAuthRouteScreen } from "./features/settings/SettingsAuthRouteSc
 import { SettingsEnvironmentDetailRouteScreen } from "./features/settings/SettingsEnvironmentDetailRouteScreen";
 import { SettingsEnvironmentsRouteScreen } from "./features/settings/SettingsEnvironmentsRouteScreen";
 import { SettingsFollowUpRouteScreen } from "./features/settings/SettingsFollowUpRouteScreen";
+import { SettingsFactoriesRouteScreen } from "./features/settings/SettingsFactoriesRouteScreen";
 import {
   SettingsEnvironmentAgentBehaviorRouteScreen,
   SettingsEnvironmentMaintenanceRouteScreen,
@@ -377,6 +378,11 @@ const SETTINGS_SCREENS = {
       ...SETTINGS_PAGE_OPTIONS,
       title: "Follow-ups",
     },
+  }),
+  SettingsFactories: createNativeStackScreen({
+    screen: SettingsFactoriesRouteScreen,
+    linking: "settings/factories",
+    options: { ...SETTINGS_PAGE_OPTIONS, title: "Factories" },
   }),
   SettingsScheduledTasks: createNativeStackScreen({
     screen: SettingsScheduledTasksRouteScreen,

@@ -1146,6 +1146,134 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       ),
   );
 
+  it.effect.each(["accepted", "refused", "failed", "transport"] as const)(
+    "resumes a restart continuation with empty input, resending its message only after EmptyInput (%s)",
+    (reply) =>
+      Effect.gen(function* () {
+        const nativeThreadId = `continue-${reply}`;
+        const nativeTurnId = "continue-turn";
+        const continueText = "Continue where you left off.";
+        const turnStart = (
+          id: number,
+          input: ReadonlyArray<unknown>,
+        ): CodexReplay.CodexAppServerReplayEntry => ({
+          type: "expect_outbound",
+          label: `turn/start ${id}`,
+          frame: {
+            id,
+            method: "turn/start",
+            params: {
+              threadId: nativeThreadId,
+              input,
+              cwd: "/workspace",
+              model: "gpt-5.4",
+              approvalPolicy: "never",
+              approvalsReviewer: "user",
+              sandboxPolicy: { type: "dangerFullAccess" },
+              summary: "detailed",
+              collaborationMode: { mode: "default", settings: { model: "gpt-5.4" } },
+            },
+          },
+        });
+        const started = (id: number): Array<CodexReplay.CodexAppServerReplayEntry> => [
+          {
+            type: "emit_inbound",
+            label: "turn/start result",
+            frame: {
+              id,
+              result: { turn: makeCodexReplayTurn({ id: nativeTurnId, status: "inProgress" }) },
+            },
+          },
+          {
+            type: "emit_inbound",
+            label: "turn/started",
+            frame: {
+              method: "turn/started",
+              params: {
+                threadId: nativeThreadId,
+                turn: makeCodexReplayTurn({ id: nativeTurnId, status: "inProgress" }),
+              },
+            },
+          },
+          {
+            type: "emit_inbound",
+            label: "turn/completed",
+            frame: {
+              method: "turn/completed",
+              params: {
+                threadId: nativeThreadId,
+                turn: makeCodexReplayTurn({ id: nativeTurnId, status: "completed" }),
+              },
+            },
+          },
+        ];
+        const refusal = (message: string): CodexReplay.CodexAppServerReplayEntry => ({
+          type: "emit_inbound",
+          label: "turn/start refused",
+          frame: { id: 3, error: { code: -32603, message } },
+        });
+        const transcript = makeCodexReplayTranscript({
+          scenario: `continue-${reply}`,
+          entries: [
+            ...codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt: continueText }).slice(
+              0,
+              5,
+            ),
+            turnStart(3, []),
+            ...{
+              accepted: started(3),
+              refused: [
+                refusal("failed to submit turn input: EmptyInput"),
+                turnStart(4, [{ type: "text", text: continueText }]),
+                ...started(4),
+              ],
+              failed: [refusal("failed to submit turn input: NoActiveTurn")],
+              // The app server dies with turn/start unanswered: it may have started a turn.
+              transport: [{ type: "runtime_exit" as const, status: "error" as const }],
+            }[reply],
+          ],
+        });
+        const turnStarts: Array<unknown> = [];
+        const harness = yield* makeCodexReplayHarness(
+          transcript,
+          () => Effect.void,
+          (method, params) =>
+            Effect.sync(() => {
+              if (method === "turn/start") turnStarts.push(params);
+            }),
+        );
+        const result = yield* harness.runtime
+          .startTurn({
+            ...makeCodexTestTurnInput({
+              threadId: harness.threadId,
+              providerThread: harness.providerThread,
+              now: yield* DateTime.now,
+              attemptId: RunAttemptId.make(`continue-${reply}`),
+              text: continueText,
+            }),
+            restartContinuationOfRunId: RunId.make("run-before-restart"),
+          })
+          .pipe(Effect.result);
+        if (reply === "failed" || reply === "transport") {
+          assert.equal(result._tag, "Failure");
+          assert.lengthOf(turnStarts, 1, "any other failure must not start a second turn");
+          return;
+        }
+        assert.equal(result._tag, "Success");
+        assert.lengthOf(turnStarts, reply === "refused" ? 2 : 1);
+        yield* harness.firstTerminal;
+        assert.deepEqual(
+          harness.terminalEvents().map((event) => event.status),
+          ["completed"],
+        );
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+
   it.effect("adds the session MCP server without replacing launch-argument servers", () =>
     Effect.gen(function* () {
       const scenario = "launch-mcp-servers";
@@ -4538,7 +4666,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
   const ORPHAN_WAIT_SCENARIO = "codex-orphaned-dynamic-tool";
   const ORPHAN_WAIT_NATIVE_THREAD = "native-codex-orphan-wait-thread";
   const ORPHAN_WAIT_NATIVE_TURN = "native-codex-orphan-wait-turn";
-  const ORPHAN_WAIT_ITEM = "exec-4669f3bb-78c9-4af1-b44e-daa340d2c538";
+  const ORPHAN_WAIT_ITEM = "exec-00000000-0000-4000-8000-000000000001";
   const PERSISTENT_MONITOR_ITEM = "exec-persistent-monitor";
   const COMPLETED_WAIT_ITEM = "exec-completed-wait";
   const ORPHAN_WAIT_PROMPT = "Wait on two nested tasks, then finish.";

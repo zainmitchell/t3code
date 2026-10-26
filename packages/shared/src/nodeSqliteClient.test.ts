@@ -17,17 +17,23 @@ import * as SqliteClient from "./nodeSqliteClient.ts";
 const startedWorkers = vi.hoisted((): Array<NodeWorkerThreads.Worker> => []);
 const silentWorkers = vi.hoisted(() => ({ on: false, readyOnTerminate: false }));
 const failingWorkers = vi.hoisted(() => ({ message: undefined as string | undefined }));
+const readerFilenames = vi.hoisted(() => new Map<string, string>());
 
 vi.mock("node:worker_threads", async (importOriginal) => {
   const actual = await importOriginal<typeof NodeWorkerThreads>();
   class RecordedWorker extends actual.Worker {
     constructor(...args: ConstructorParameters<typeof actual.Worker>) {
+      const filename = readerFilenames.get(args[1]?.workerData?.filename);
+      const readerArgs: ConstructorParameters<typeof actual.Worker> =
+        filename === undefined
+          ? args
+          : [args[0], { ...args[1], workerData: { ...args[1]?.workerData, filename } }];
       super(
         ...((silentWorkers.on
           ? ["setInterval(() => {}, 1 << 30);", { eval: true }]
           : failingWorkers.message !== undefined
             ? [`throw new Error(${JSON.stringify(failingWorkers.message)});`, { eval: true }]
-            : args) as ConstructorParameters<typeof actual.Worker>),
+            : readerArgs) as ConstructorParameters<typeof actual.Worker>),
       );
       startedWorkers.push(this);
     }
@@ -328,12 +334,15 @@ it.effect("uses the writer when the reader cannot open the database", () =>
       yield* sql`PRAGMA journal_mode = WAL`;
       yield* sql`CREATE TABLE entries(name TEXT NOT NULL)`;
       yield* sql`INSERT INTO entries VALUES ('kept')`;
-      yield* (yield* FileSystem.FileSystem).remove(filename);
       const startedBefore = startedWorkers.length;
-
-      assert.equal(yield* sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly), 1);
-      assert.equal(yield* sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly), 1);
-      assert.equal(startedWorkers.length, startedBefore + 1);
+      readerFilenames.set(filename, `${filename}.missing`);
+      try {
+        assert.equal(yield* sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly), 1);
+        assert.equal(yield* sql.withTransaction(countEntries(sql)).pipe(SqliteClient.readOnly), 1);
+        assert.equal(startedWorkers.length, startedBefore + 1);
+      } finally {
+        readerFilenames.delete(filename);
+      }
     }),
   ),
 );

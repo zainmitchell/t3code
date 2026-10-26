@@ -9,6 +9,7 @@ import {
   type WorktreeMcpSetupScriptStatus,
   type WorktreeMcpStatusResult,
 } from "@t3tools/contracts";
+import { CurrentExecutionJoin, ExecutionJoin } from "@t3tools/shared/ExecutionJoin";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
@@ -62,6 +63,7 @@ const make = Effect.gen(function* () {
   const gitWorkflow = yield* GitWorkflowService.GitWorkflowService;
   const setupScriptRunner = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner;
   const vcsStatusBroadcaster = yield* VcsStatusBroadcaster.VcsStatusBroadcaster;
+  const executionJoin = yield* ExecutionJoin;
 
   // Serialize handoffs per thread to avoid creating two worktrees and orphaning one.
   const handoffThreadsInFlight = new Set<string>();
@@ -384,6 +386,22 @@ const make = Effect.gen(function* () {
     function* (callerScope, input) {
       yield* requireCapability(callerScope);
       const scope = yield* requireThreadScope(callerScope);
+      // A thread whose work is contained runs this Git and setup work inside its run's
+      // container, or not at all.
+      const contained = yield* executionJoin
+        .forThread(scope.thread.threadId)
+        .pipe(
+          Effect.mapError((cause) =>
+            failure(
+              "operation_failed",
+              `This thread's processes must start inside its execution container: ${cause.reason}`,
+            ),
+          ),
+        );
+      const work = (handoffScope: typeof scope) =>
+        performHandoff(handoffScope, input).pipe(
+          Effect.provideService(CurrentExecutionJoin, contained),
+        );
       // Acquire and register cleanup atomically so cancellation cannot strand the guard until restart.
       return yield* Effect.uninterruptibleMask((restore) =>
         Effect.suspend(() => {
@@ -396,7 +414,7 @@ const make = Effect.gen(function* () {
             );
           }
           handoffThreadsInFlight.add(scope.thread.threadId);
-          return restore(performHandoff(scope, input)).pipe(
+          return restore(work(scope)).pipe(
             Effect.ensuring(
               Effect.sync(() => handoffThreadsInFlight.delete(scope.thread.threadId)),
             ),

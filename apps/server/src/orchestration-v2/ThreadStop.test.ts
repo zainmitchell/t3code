@@ -678,6 +678,102 @@ it.effect.each(["run.interrupt", "thread.stop"] as const)(
     }).pipe(Effect.provide(layerTest)),
 );
 
+it.effect("a Stop walk stops only the delegated work that existed when Stop committed", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const sink = yield* EventSink.EventSinkV2;
+    const threads = yield* ThreadManagementService.ThreadManagementService;
+    const sql = yield* SqlClient.SqlClient;
+    const parentThreadId = ThreadId.make("thread:stop-parent");
+    yield* createWatchingThread(parentThreadId, 1);
+    yield* send(parentThreadId, "first", "start_immediately");
+    const childThreadId = yield* delegate(parentThreadId, "child task");
+    assert.isTrue(Exit.isFailure(yield* Effect.exit(watch(childThreadId, 2))));
+    const grandchildThreadId = yield* delegate(childThreadId, "grandchild task");
+    yield* send(childThreadId, "child follow-up", "queue_after_active");
+    yield* send(childThreadId, "child queued after follow-up", "queue_after_active");
+
+    const now = yield* DateTime.now;
+    const firstRun = (yield* orchestrator.getThreadProjection(parentThreadId)).runs[0]!;
+    yield* sink.write({
+      events: [
+        {
+          id: EventId.make("event:stop-parent:first-run-completed"),
+          type: "run.updated",
+          threadId: parentThreadId,
+          runId: firstRun.id,
+          occurredAt: now,
+          payload: { ...firstRun, status: "completed", completedAt: now },
+        },
+      ],
+    });
+    yield* send(parentThreadId, "second", "start_immediately");
+    const secondRun = (yield* orchestrator.getThreadProjection(parentThreadId)).runs.at(-1)!;
+
+    const stopCommandId = CommandId.make("stop-parent");
+    yield* orchestrator.dispatch({
+      type: "run.interrupt",
+      commandId: stopCommandId,
+      threadId: parentThreadId,
+      runId: secondRun.id,
+      holdQueue: true,
+    });
+
+    assert.deepEqual(yield* threadState(parentThreadId), {
+      runs: ["completed", "interrupted"],
+      watched: [],
+    });
+    const parent = yield* orchestrator.getThreadProjection(parentThreadId);
+    assert.equal(parent.subagents[0]?.completionDelivery?.state, "disposed");
+    const effects = yield* sql<{ readonly effect_type: string }>`
+      SELECT effect_type FROM orchestration_v2_effect_outbox WHERE command_id = ${stopCommandId}
+    `;
+    assert.include(
+      effects.map((row) => row.effect_type),
+      "delegated-tasks.stop",
+    );
+
+    const childRun = (yield* orchestrator.getThreadProjection(childThreadId)).runs[0]!;
+    yield* sink.write({
+      events: [
+        {
+          id: EventId.make("event:stop-child:first-run-completed"),
+          type: "run.updated",
+          threadId: childThreadId,
+          runId: childRun.id,
+          occurredAt: now,
+          payload: { ...childRun, status: "completed", completedAt: now },
+        },
+      ],
+    });
+    yield* orchestrator.dispatch({
+      type: "queue.resume",
+      commandId: CommandId.make("resume-child-before-stop-walk"),
+      threadId: childThreadId,
+    });
+    assert.deepEqual((yield* threadState(childThreadId)).runs, ["completed", "starting", "queued"]);
+
+    yield* threads.stopDelegatedTasks({ threadId: parentThreadId, commandId: stopCommandId });
+    assert.deepEqual(yield* threadState(childThreadId), {
+      runs: ["completed", "interrupted", "queued:held"],
+      watched: [],
+    });
+    assert.deepEqual((yield* threadState(grandchildThreadId)).runs, ["interrupted"]);
+
+    yield* threads.stopDelegatedTasks({ threadId: parentThreadId, commandId: stopCommandId });
+    assert.deepEqual((yield* threadState(childThreadId)).runs, [
+      "completed",
+      "interrupted",
+      "queued:held",
+    ]);
+
+    yield* send(parentThreadId, "new work", "start_immediately");
+    const newChild = yield* delegate(parentThreadId, "new task after Stop");
+    yield* threads.stopDelegatedTasks({ threadId: parentThreadId, commandId: stopCommandId });
+    assert.deepEqual((yield* threadState(newChild)).runs, ["starting"]);
+  }).pipe(Effect.provide(layerTest)),
+);
+
 it.effect("a repeated Stop that changes nothing still stops the delegated tasks", () =>
   Effect.gen(function* () {
     const orchestrator = yield* Orchestrator.OrchestratorV2;
@@ -720,6 +816,59 @@ it.effect("a repeated Stop that changes nothing still stops the delegated tasks"
       ["stop-again:first", "stop-again:second"],
     );
   }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect(
+  "a Stop that writes nothing records the global cursor its delegated walk is bounded by",
+  () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const sql = yield* SqlClient.SqlClient;
+      const parentThreadId = ThreadId.make("thread:stop-late-cursor");
+      yield* createWatchingThread(parentThreadId, 1);
+      yield* send(parentThreadId, "first", "start_immediately");
+      yield* delegate(parentThreadId, "cursor child");
+      const now = yield* DateTime.now;
+      const run = (yield* orchestrator.getThreadProjection(parentThreadId)).runs[0]!;
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make("event:stop-late-cursor:parent-completed"),
+            type: "run.updated",
+            threadId: parentThreadId,
+            runId: run.id,
+            occurredAt: now,
+            payload: { ...run, status: "completed", completedAt: now },
+          },
+        ],
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.stop",
+        commandId: CommandId.make("stop-late-cursor:first"),
+        threadId: parentThreadId,
+      });
+      // Work elsewhere moves the global cursor past the parent's last event, as a child's own
+      // run would; the walk reads child threads through this Stop's receipt.
+      const elsewhere = ThreadId.make("thread:stop-late-cursor-elsewhere");
+      yield* createWatchingThread(elsewhere, 2);
+      yield* send(elsewhere, "unrelated work", "start_immediately");
+      const parentSequence = yield* sink.latestSequence({ threadId: parentThreadId });
+      const globalSequence = yield* sink.latestSequence();
+      assert.isAbove(globalSequence, parentSequence);
+
+      const again = yield* orchestrator.dispatch({
+        type: "thread.stop",
+        commandId: CommandId.make("stop-late-cursor:second"),
+        threadId: parentThreadId,
+      });
+      assert.lengthOf(again.storedEvents, 0);
+      const [receipt] = yield* sql<{ result_sequence: number }>`
+      SELECT result_sequence FROM orchestration_command_receipts
+      WHERE command_id = 'stop-late-cursor:second'
+    `;
+      assert.equal(receipt!.result_sequence, globalSequence);
+    }).pipe(Effect.provide(layerTest)),
 );
 
 it.effect.each(["thread.stop", "run.interrupt"] as const)(

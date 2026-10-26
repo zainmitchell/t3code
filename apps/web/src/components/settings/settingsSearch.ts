@@ -26,6 +26,7 @@ export type SettingsPath =
   | "/settings/providers"
   | "/settings/integrations"
   | "/settings/scheduled-tasks"
+  | "/settings/factories"
   | "/settings/source-control"
   | "/settings/storage"
   | "/settings/connections"
@@ -85,6 +86,7 @@ export const SETTINGS_SECTION_LABELS: Readonly<Record<SettingsPath, string>> = {
   "/settings/providers": "Providers",
   "/settings/integrations": "Integrations",
   "/settings/scheduled-tasks": "Scheduled tasks",
+  "/settings/factories": "Factories",
   "/settings/source-control": "Source control",
   "/settings/storage": "Storage",
   "/settings/connections": "Connections",
@@ -1060,6 +1062,7 @@ const SETTINGS_CATEGORY_SCOPES: Readonly<Record<SettingsPath, SettingsSearchScop
   "/settings/storage": "project-defaults",
   "/settings/connections": "connections",
   "/settings/scheduled-tasks": null,
+  "/settings/factories": null,
   "/settings/beta": null,
   "/settings/archived": "project-defaults",
 };

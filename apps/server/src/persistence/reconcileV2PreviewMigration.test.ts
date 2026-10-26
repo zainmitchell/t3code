@@ -50,6 +50,10 @@ describe("V2 preview upgrade", () => {
         [68, "ShellStopRequestIndex"],
         [69, "ThreadMessageSearch"],
         [70, "PeerLinks"],
+        [71, "FactoryLifecycle"],
+        [72, "FactoryExecutionGenerations"],
+        [73, "FactoryOutcomes"],
+        [74, "FactoryTransfers"],
       ]);
       assert.deepStrictEqual(yield* runMigrations(), []);
       assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_v2_legacy_imports`, imports);
@@ -143,6 +147,10 @@ describe("V2 preview upgrade", () => {
         [68, "ShellStopRequestIndex"],
         [69, "ThreadMessageSearch"],
         [70, "PeerLinks"],
+        [71, "FactoryLifecycle"],
+        [72, "FactoryExecutionGenerations"],
+        [73, "FactoryOutcomes"],
+        [74, "FactoryTransfers"],
       ]);
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
   );

@@ -40,7 +40,12 @@ import * as ContextHandoffService from "./ContextHandoffService.ts";
 import * as EventSink from "./EventSink.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
+import * as FactoryClaimService from "../factory/FactoryClaimService.ts";
+import * as FactoryStore from "../factory/FactoryStore.ts";
+import * as FactoryExecutionGenerations from "../factory/FactoryExecutionGenerations.ts";
+import * as EffectOutbox from "./EffectOutbox.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
+import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderTurnStart from "./ProviderTurnStartService.ts";
@@ -59,9 +64,19 @@ const normalize = (target: string) => {
   }
   return `/${parts.join("/")}`;
 };
-const layerWorktreeLocation = (worktreesDir = managedWorktreesDir) =>
+// None of these threads runs factory work, so the factory custody fence never reads further.
+const layerUnboundFactory = Layer.mergeAll(
+  Layer.mock(FactoryStore.FactoryStore)({ bindingForThread: () => Effect.succeedNone }),
+  Layer.mock(FactoryClaimService.FactoryClaimService)({}),
+  Layer.mock(EffectOutbox.EffectOutboxV2)({}),
+  Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({}),
+);
+
+// `Path.layer` is POSIX. A harness on the real filesystem passes the host's Path, so Windows
+// paths are resolved, compared and leased the way the running server does.
+const layerWorktreeLocation = (worktreesDir = managedWorktreesDir, path?: Path.Path) =>
   Layer.mergeAll(
-    Path.layer,
+    path === undefined ? Path.layer : Layer.succeed(Path.Path, path),
     Layer.mock(ServerConfig.ServerConfig)({ worktreesDir } as ServerConfig.ServerConfig["Service"]),
     ServerSettings.layerTest(),
   );
@@ -126,6 +141,10 @@ function startWithMissingWorktree(
       Layer.mergeAll(
         Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({}),
         Layer.mock(EventSink.EventSinkV2)({ writeIfRunCurrent }),
+        Layer.mock(FactoryExecutionGenerations.FactoryExecutionGenerations)({
+          available: false,
+          joinFor: () => () => Effect.die("no factory thread here"),
+        }),
         IdAllocator.layer,
         Layer.succeed(FileSystem.FileSystem, {
           exists: () => Effect.succeed(false),
@@ -179,6 +198,7 @@ function startWithMissingWorktree(
         }),
         Layer.mock(RunExecutionService.RunExecutionServiceV2)({ startRootRun }),
         Layer.mock(RuntimePolicy.RuntimePolicyV2)({}),
+        layerUnboundFactory,
       ),
     ),
   );
@@ -258,6 +278,8 @@ function makeLocalCommandHarness(input: {
   readonly worktreePath?: string;
   readonly worktreesDir?: string;
   readonly fileSystem?: FileSystem.FileSystem;
+  /** The host Path to use with `fileSystem`; defaults to the POSIX one. */
+  readonly path?: Path.Path;
   readonly previousNativeSession?: boolean;
   readonly previousMessages?: ReadonlyArray<string>;
   readonly logoutFailure?: string;
@@ -685,8 +707,12 @@ function makeLocalCommandHarness(input: {
           prepareProviderHandoff: () => Effect.die("history read must fail first"),
         }),
         Layer.mock(EventSink.EventSinkV2)({ writeIfRunCurrent }),
+        Layer.mock(FactoryExecutionGenerations.FactoryExecutionGenerations)({
+          available: false,
+          joinFor: () => () => Effect.die("no factory thread here"),
+        }),
         IdAllocator.layer,
-        layerWorktreeLocation(input.worktreesDir),
+        layerWorktreeLocation(input.worktreesDir, input.path),
         input.fileSystem === undefined
           ? FileSystem.layerNoop({ exists: () => Effect.succeed(true) })
           : Layer.succeed(FileSystem.FileSystem, input.fileSystem),
@@ -736,6 +762,7 @@ function makeLocalCommandHarness(input: {
         Layer.mock(RuntimePolicy.RuntimePolicyV2)({
           resolve: resolveRuntimePolicy,
         }),
+        layerUnboundFactory,
       ),
     ),
   );
@@ -886,6 +913,7 @@ effectIt.effect.each(["cleanup-first", "startup-first"])(
         worktreePath,
         worktreesDir: workspaceRoot,
         fileSystem,
+        path,
         failReadsAfterRunning: true,
       });
       harness.createWorktree.mockImplementation(() =>

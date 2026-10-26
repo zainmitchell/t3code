@@ -28,6 +28,8 @@ import type { UnsequencedProjectEvent } from "../persistence/OrchestrationEventS
 import { projectDomainEventForWire } from "./WireProjection.ts";
 import { makeRunOutcomeRecorder, type RunOutcome } from "./RunMetrics.ts";
 
+import * as FactoryClaimStore from "../factory/FactoryClaimStore.ts";
+import * as FactoryStore from "../factory/FactoryStore.ts";
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as EventStore from "./EventStore.ts";
@@ -63,7 +65,24 @@ export class EventSinkStreamError extends Schema.TaggedError<EventSinkStreamErro
   }
 }
 
-export const EventSinkV2Error = Schema.Union([EventSinkWriteError, EventSinkStreamError]);
+/** The command starts a factory-owned execution the factory cannot reserve; nothing was written. */
+export class EventSinkFactoryReservationRefusedError extends Schema.TaggedError<EventSinkFactoryReservationRefusedError>()(
+  "EventSinkFactoryReservationRefusedError",
+  {
+    commandId: CommandId,
+    refusal: FactoryStore.FactoryReservationRefusal,
+  },
+) {
+  override get message(): string {
+    return `The factory refused to reserve this execution (${this.refusal}).`;
+  }
+}
+
+export const EventSinkV2Error = Schema.Union([
+  EventSinkWriteError,
+  EventSinkStreamError,
+  EventSinkFactoryReservationRefusedError,
+]);
 export type EventSinkV2Error = typeof EventSinkV2Error.Type;
 
 export interface EventSinkV2Shape {
@@ -146,6 +165,27 @@ export interface EventSinkV2Shape {
       readonly effectTypes: ReadonlyArray<EffectOutbox.OrchestrationEffectRequestV2["type"]>;
       readonly reason: string;
     };
+    /**
+     * Executions this command starts. Each is reserved against factory capacity in the same
+     * transaction, before its receipt, so a refusal leaves the command retryable.
+     */
+    readonly factoryExecutions?: ReadonlyArray<FactoryStore.ReserveExecutionInput>;
+    /**
+     * Threads this command creates for another thread or a schedule. Each origin is recorded in
+     * the same transaction as the thread, so no later command can find the thread without it.
+     */
+    readonly factoryOrigins?: ReadonlyArray<
+      Parameters<FactoryStore.FactoryStore["Service"]["recordThreadOrigin"]>[0]
+    >;
+    /** The pending tracker claim of the admission this command reserves. */
+    readonly factoryClaimRegistration?: Omit<
+      Parameters<FactoryClaimStore.FactoryClaimStore["Service"]["registerAdmission"]>[0],
+      "commandId"
+    >;
+    /** The written claim attempt this command verifies before it starts the execution. */
+    readonly factoryClaimSettlement?: Parameters<
+      FactoryClaimStore.FactoryClaimStore["Service"]["settleVerified"]
+    >[0];
   }) => Effect.Effect<
     {
       readonly receipt: CommandReceiptStore.CommandReceiptV2;
@@ -203,12 +243,16 @@ export class EventSinkV2 extends Context.Service<EventSinkV2, EventSinkV2Shape>(
   "t3/orchestration-v2/EventSink/EventSinkV2",
 ) {}
 
+const isFactoryReservationRefused = Schema.is(EventSinkFactoryReservationRefusedError);
+
 const layerBase: Layer.Layer<
   EventSinkV2,
   never,
   | CommandReceiptStore.CommandReceiptStoreV2
   | EffectOutbox.EffectOutboxV2
   | EventStore.EventStoreV2
+  | FactoryClaimStore.FactoryClaimStore
+  | FactoryStore.FactoryStore
   | ProjectionStore.ProjectionStoreV2
   | ProjectStore.ProjectStoreV2
   | SqlClient.SqlClient
@@ -220,6 +264,8 @@ const layerBase: Layer.Layer<
     const commandReceipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
     const effectOutbox = yield* EffectOutbox.EffectOutboxV2;
     const eventStore = yield* EventStore.EventStoreV2;
+    const factoryStore = yield* FactoryStore.FactoryStore;
+    const factoryClaims = yield* FactoryClaimStore.FactoryClaimStore;
     const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
     const projectStore = yield* ProjectStore.ProjectStoreV2;
     const turnItemPositions = yield* TurnItemPositionStore.TurnItemPositionStoreV2;
@@ -637,6 +683,93 @@ const layerBase: Layer.Layer<
     ) {
       const result = yield* commitThenPublish(
         Effect.gen(function* () {
+          // A claimed factory run prepares only through its claim's first-use authorization and
+          // workspace obligation. Only factory recovery's retry, re-authorized in its own commit,
+          // may retry it: its id names the run and the obligation's new owner, and its reserved
+          // prefix refuses a client's retry under it on any thread.
+          if (input.commandType === "prepared-run.retry") {
+            const reserved = input.commandId.startsWith("factory-recovery:");
+            const binding = yield* factoryStore.bindingForThread(input.threadId);
+            const claim =
+              Option.isSome(binding) && binding.value.origin === "admitted"
+                ? yield* factoryClaims.get(binding.value.reservationId)
+                : Option.none();
+            if (Option.isNone(claim)) {
+              // A stage with no claim of its own recovers through the obligation it opened for
+              // the run and its new owner, which the recovery committed before this retry.
+              const recovering =
+                reserved &&
+                Option.isSome(binding) &&
+                binding.value.origin === "admitted" &&
+                FactoryStore.isNativeReservation(binding.value) &&
+                (yield* factoryStore.openWorkspaceObligations(binding.value.reservationId)).some(
+                  (obligation) =>
+                    input.commandId ===
+                    `factory-recovery:${obligation.runId}:${obligation.ownerId}`,
+                );
+              if (reserved && !recovering) {
+                return yield* new EventSinkFactoryReservationRefusedError({
+                  commandId: input.commandId,
+                  refusal: "claim_not_ready",
+                });
+              }
+            } else {
+              const current = claim.value.claim;
+              const obligation =
+                current.state === "workspace_authorized"
+                  ? yield* factoryStore.workspaceObligation(current.runId)
+                  : Option.none();
+              const recovering =
+                current.state === "workspace_authorized" &&
+                Option.isSome(obligation) &&
+                obligation.value.state === "open" &&
+                input.commandId === `factory-recovery:${current.runId}:${obligation.value.ownerId}`;
+              if (!recovering) {
+                return yield* new EventSinkFactoryReservationRefusedError({
+                  commandId: input.commandId,
+                  refusal: "claim_not_ready",
+                });
+              }
+            }
+          }
+          // Capacity is decided here, on the transaction's writer, not by receipt uniqueness:
+          // competing starts from different threads do not share a dispatch lock.
+          const factoryExecutions = input.factoryExecutions ?? [];
+          const factoryOrigins = input.factoryOrigins ?? [];
+          if (
+            (factoryExecutions.length > 0 ||
+              factoryOrigins.length > 0 ||
+              input.factoryClaimRegistration !== undefined ||
+              input.factoryClaimSettlement !== undefined) &&
+            Option.isNone(yield* commandReceipts.getByCommandId(input.commandId))
+          ) {
+            // A claim is verified before the run it starts is reserved against it.
+            if (
+              input.factoryClaimSettlement !== undefined &&
+              !(yield* factoryClaims.settleVerified(input.factoryClaimSettlement))
+            ) {
+              return yield* new EventSinkFactoryReservationRefusedError({
+                commandId: input.commandId,
+                refusal: "claim_not_ready",
+              });
+            }
+            for (const origin of factoryOrigins) yield* factoryStore.recordThreadOrigin(origin);
+            for (const execution of factoryExecutions) {
+              const reservation = yield* factoryStore.reserveExecution(execution);
+              if (reservation.type === "refused") {
+                return yield* new EventSinkFactoryReservationRefusedError({
+                  commandId: input.commandId,
+                  refusal: reservation.refusal,
+                });
+              }
+            }
+            if (input.factoryClaimRegistration !== undefined) {
+              yield* factoryClaims.registerAdmission({
+                ...input.factoryClaimRegistration,
+                commandId: input.commandId,
+              });
+            }
+          }
           const reserved = yield* commandReceipts.insertIfAbsent({
             commandId: input.commandId,
             threadId: input.threadId,
@@ -928,13 +1061,14 @@ const layerBase: Layer.Layer<
         ),
       commitCommand: (input) =>
         commitCommandEffect(input).pipe(
-          Effect.mapError(
-            (cause) =>
-              new EventSinkWriteError({
-                commandId: input.commandId,
-                eventCount: input.events.length,
-                cause,
-              }),
+          Effect.mapError((cause) =>
+            isFactoryReservationRefused(cause)
+              ? cause
+              : new EventSinkWriteError({
+                  commandId: input.commandId,
+                  eventCount: input.events.length,
+                  cause,
+                }),
           ),
         ),
       commitRejectedCommand: (input) =>
@@ -1006,14 +1140,20 @@ const layerBase: Layer.Layer<
   }),
 );
 
-/** Share the worker's outbox instance: enqueue wakeups are in-memory. */
-export const layerFromStores = layerBase;
+/**
+ * Keeping the outbox instance shared with the worker is important because enqueue notifications
+ * are in-memory wakeups backed by the durable SQL queue.
+ */
+// The factory stores keep no in-memory state, so private instances share the database rows.
+export const layerFromStores = layerBase.pipe(
+  Layer.provide(FactoryClaimStore.layer.pipe(Layer.provideMerge(FactoryStore.layer))),
+);
 
 export const layer: Layer.Layer<
   EventSinkV2,
   never,
   EventStore.EventStoreV2 | ProjectionStore.ProjectionStoreV2 | SqlClient.SqlClient
-> = layerBase.pipe(
+> = layerFromStores.pipe(
   Layer.provide(
     Layer.mergeAll(
       CommandReceiptStore.layer,

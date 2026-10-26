@@ -211,6 +211,7 @@ function makeHarness(options: HarnessOptions = {}) {
       remoteExists: options.remoteExists ?? (() => Effect.succeed(true)),
       remoteBranchExists: () => Effect.succeed(true),
       removeWorktree,
+      resolveCommit: () => Effect.succeed({ commitSha: "abc" }),
       ...options.git,
     }),
     Layer.succeed(ProjectSetupScriptRunner.ProjectSetupScriptRunner, {
@@ -1113,6 +1114,123 @@ it.effect.each(["stable", "upstream/release"])(
         ),
       ),
     ),
+);
+
+/**
+ * A tracked preparation cancelled during setup removed its worktree but left the branch it
+ * created, so the next preparation of that branch failed `git worktree add -b`.
+ */
+const cancelledBranchPreparation = (input: {
+  readonly name: string;
+  readonly commitDuringSetup: boolean;
+}) =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const git = yield* GitVcsDriver.GitVcsDriver;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: `launch-${input.name}-` });
+    const cwd = `${directory}/repo`;
+    yield* fs.makeDirectory(cwd);
+    const command = (at: string, args: string[]) =>
+      git.execute({ operation: "launch-test", cwd: at, args });
+    yield* command(cwd, ["init", "-b", "main"]);
+    yield* command(cwd, ["config", "user.name", "Test"]);
+    yield* command(cwd, ["config", "user.email", "test@example.test"]);
+    yield* command(cwd, ["commit", "--allow-empty", "-m", "initial"]);
+    let created = 0;
+    let setups = 0;
+    const setupEntered = yield* Deferred.make<string>();
+    const harness = makeHarness({
+      createWorktree: (worktree, options) =>
+        git.createWorktree(
+          { ...worktree, cwd, path: `${directory}/worktree-${++created}` },
+          options,
+        ),
+      git: {
+        removeWorktree: (worktree) => git.removeWorktree({ ...worktree, cwd }),
+        deleteLocalBranch: (branch) => git.deleteLocalBranch({ ...branch, cwd }),
+        resolveCommit: (revision) => git.resolveCommit({ ...revision, cwd }),
+      },
+      runSetup: (setup) =>
+        ++setups > 1
+          ? Effect.succeed({ status: "no-script" as const })
+          : (input.commitDuringSetup
+              ? command(setup.worktreePath, [
+                  "commit",
+                  "--allow-empty",
+                  "-m",
+                  "setup wrote this",
+                ]).pipe(Effect.orDie)
+              : Effect.void
+            ).pipe(
+              Effect.andThen(Deferred.succeed(setupEntered, setup.worktreePath)),
+              Effect.andThen(Effect.never),
+            ),
+    });
+    const branchTip = command(cwd, ["rev-parse", "--verify", "--quiet", "refs/heads/feature"]).pipe(
+      Effect.map((result) => result.stdout.trim()),
+      Effect.orElseSucceed(() => null),
+    );
+    return yield* Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const tracker = yield* WorktreeSetupTracker.WorktreeSetupTracker;
+      const workspace = { type: "worktree" as const, baseRef: "main", branch: "feature" };
+      const first = yield* launches.launch(
+        launchInput({
+          command: `command:launch:${input.name}`,
+          thread: `thread:launch:${input.name}`,
+          message: "Start",
+          workspace,
+        }),
+      );
+      const firstWorktree = yield* Deferred.await(setupEntered);
+      assert.isTrue(yield* tracker.cancel(first.threadId));
+      assert.isFalse(yield* fs.exists(firstWorktree));
+      const tipAfterCancel = yield* branchTip;
+      const second = yield* launches.launch(
+        launchInput({
+          command: `command:launch:${input.name}:again`,
+          thread: `thread:launch:${input.name}:again`,
+          message: "Start again",
+          workspace,
+        }),
+      );
+      const settled = yield* preparationSettled(second.threadId);
+      return { tipAfterCancel, settled, created };
+    }).pipe(Effect.provide(harness.layer));
+  }).pipe(
+    Effect.provide(
+      GitVcsDriver.layer.pipe(
+        Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "launch-cancel-branch-" })),
+        Layer.provideMerge(NodeServices.layer),
+      ),
+    ),
+  );
+
+it.effect(
+  "a preparation cancelled during setup deletes the branch it made, so the next one can make it",
+  () =>
+    Effect.gen(function* () {
+      const { tipAfterCancel, settled, created } = yield* cancelledBranchPreparation({
+        name: "cancel-branch",
+        commitDuringSetup: false,
+      });
+      assert.isNull(tipAfterCancel);
+      assert.equal(created, 2);
+      assert.equal(settled.runs[0]?.status, "starting");
+      assert.equal(settled.thread.branch, "feature");
+    }),
+);
+
+it.effect("a cancelled preparation keeps a branch that gained a commit after it was made", () =>
+  Effect.gen(function* () {
+    const { tipAfterCancel, settled } = yield* cancelledBranchPreparation({
+      name: "cancel-branch-kept",
+      commitDuringSetup: true,
+    });
+    // The branch carries work this preparation did not make: it stays, and the next one fails as before.
+    assert.isNotNull(tipAfterCancel);
+    assert.equal(settled.runs[0]?.status, "failed");
+  }),
 );
 
 it.effect("shows the fetch diagnosis when preparing a worktree from origin fails", () => {
@@ -2072,6 +2190,8 @@ it.effect("shared intake preserves durable attachment bytes after a lost launch 
         checkWorktreeBase: launches.checkWorktreeBase,
         retryPreparation: launches.retryPreparation,
         prepareRun: launches.prepareRun,
+        prepareRunOwned: launches.prepareRunOwned,
+        currentPreparationOwner: launches.currentPreparationOwner,
       }),
       Effect.flip,
     );

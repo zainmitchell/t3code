@@ -218,6 +218,8 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
           runtimeMode: startedRuntimeMode,
           interactionMode,
           workspaceStrategy: input.workspaceStrategy ?? { type: "root" },
+          // A launch with no message still works for the calling thread.
+          ...(caller === undefined ? {} : { createdFrom: { type: "thread", threadId: caller.id } }),
           ...(input.message === undefined && attachments.length === 0
             ? {}
             : {

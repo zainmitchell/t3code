@@ -78,7 +78,7 @@ it.layer(NodeServices.layer)("ServerEnvironmentLive", (it) => {
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const baseDir = yield* fs.makeTempDirectoryScoped();
-      const prefix = `${baseDir}/node`;
+      const prefix = `${baseDir.replaceAll("\\", "/")}/node`;
       const entry = `${prefix}/lib/node_modules/t3/dist/bin.mjs`;
       yield* fs.makeDirectory(`${prefix}/lib/node_modules/t3/dist`, { recursive: true });
       yield* fs.makeDirectory(`${prefix}/bin`, { recursive: true });
@@ -87,7 +87,16 @@ it.layer(NodeServices.layer)("ServerEnvironmentLive", (it) => {
         `${prefix}/lib/node_modules/t3/package.json`,
         '{"name":"t3","version":"0.0.45","bin":{"t3":"./dist/bin.mjs"}}',
       );
-      yield* fs.symlink(entry, `${prefix}/bin/t3`);
+      const launcher = `${prefix}/bin/t3`;
+      const resolvedEntry = (yield* fs.realPath(entry)).replaceAll("\\", "/");
+      const installationFs = FileSystem.FileSystem.of({
+        ...fs,
+        // Model a POSIX launcher symlink without requiring host symlink privileges.
+        realPath: (target) =>
+          target.replaceAll("\\", "/") === launcher.replaceAll("\\", "/")
+            ? Effect.succeed(resolvedEntry)
+            : fs.realPath(target).pipe(Effect.map((resolved) => resolved.replaceAll("\\", "/"))),
+      });
       const config = yield* makeServerConfig(baseDir);
       yield* fs.makeDirectory(config.stateDir, { recursive: true });
       for (const mode of ["web", "desktop"] as const) {
@@ -105,6 +114,7 @@ it.layer(NodeServices.layer)("ServerEnvironmentLive", (it) => {
           Effect.provideService(HostProcess.IsExecutable, false),
           Effect.provideService(HostProcess.Platform, "linux"),
           Effect.provideService(HostProcess.Environment, {}),
+          Effect.provideService(FileSystem.FileSystem, installationFs),
         );
         expect(descriptor.capabilities.serverInstallation).toEqual(
           mode === "web" ? { kind: "npm-global", prefix } : undefined,

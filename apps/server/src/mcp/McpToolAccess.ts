@@ -19,6 +19,7 @@ import {
   DispatchModeLimit,
   type DispatchModeRefusal,
 } from "../orchestration-v2/DispatchModeLimit.ts";
+import * as FactoryStore from "../factory/FactoryStore.ts";
 import * as PeerForwarding from "../peer/PeerForwarding.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import { resolveInteractionMode, resolveRuntimeMode } from "./OrchestratorMcpService.ts";
@@ -44,6 +45,7 @@ const refuseOutsideConstruction = (token: symbol) => {
 let declare: <P, A, E, R>(
   handle: (params: P) => Effect.Effect<A, E, R>,
   remote: RemoteCheck<P> | undefined,
+  startsExecutions?: boolean,
 ) => Declaration<(params: P) => Effect.Effect<A, E, R>>;
 
 /**
@@ -55,6 +57,7 @@ type RemoteCheck<P> = (
   params: P,
 ) => Effect.Effect<unknown, OrchestratorMcpFailure, Effect.Services<typeof writingCaller>>;
 let remoteCheckOf: <Handler>(declaration: Declaration<Handler>) => RemoteCheck<never> | undefined;
+let startsExecutionsOf: <Handler>(declaration: Declaration<Handler>) => boolean;
 
 type CheckedHandlerOf<D> = D extends Declaration<infer Handler> ? Handler : never;
 
@@ -72,19 +75,24 @@ let handlersLayer: <Tools extends Record<string, Tool.Any>, EX, RX>(
 export class Declaration<out Handler> {
   readonly #handle: Handler;
   readonly #remote: RemoteCheck<never> | undefined;
+  readonly #startsExecutions: boolean;
   private constructor(
     token: typeof builtHere,
     handle: Handler,
     remote: RemoteCheck<never> | undefined,
+    startsExecutions: boolean,
   ) {
     refuseOutsideConstruction(token);
     this.#handle = handle;
     this.#remote = remote;
+    this.#startsExecutions = startsExecutions;
   }
   static {
-    declare = (handle, remote) => new Declaration(builtHere, handle, remote);
+    declare = (handle, remote, startsExecutions = false) =>
+      new Declaration(builtHere, handle, remote, startsExecutions);
     checkedHandler = Struct.lambda<CheckedHandler>((declaration) => declaration.#handle);
     remoteCheckOf = (declaration) => declaration.#remote;
+    startsExecutionsOf = (declaration) => declaration.#startsExecutions;
   }
 }
 
@@ -148,9 +156,11 @@ export const writesWithCapability = <P, A, E, R>(handle: (params: P) => Effect.E
     () => writingCaller,
   );
 
+/** `startsExecutions` marks a write that can start or queue a run in the threads it names. */
 export const writesThreads = <P, A, E, R>(
   threads: (params: P) => ReadonlyArray<ThreadId | undefined>,
   handle: (params: P) => Effect.Effect<A, E, R>,
+  options?: { readonly startsExecutions?: boolean },
 ) =>
   declare(
     (params: P) =>
@@ -179,6 +189,7 @@ export const writesThreads = <P, A, E, R>(
         );
       }),
     () => writingCaller,
+    options?.startsExecutions === true,
   );
 
 const escalationDenied = (refusal: DispatchModeRefusal) =>
@@ -216,6 +227,7 @@ export const startsThreads = <P, A, E, R>(
   return declare(
     (params: P) => Effect.flatMap(started(params), (modes) => handle(params, modes)),
     started,
+    true,
   );
 };
 
@@ -291,6 +303,37 @@ const linksUnavailable = new OrchestratorMcpFailure({
   message: "This environment cannot reach linked environments.",
 });
 
+const factoryOwnershipUnreadable = new OrchestratorMcpFailure({
+  code: "orchestration_error",
+  message:
+    "Could not check whether this thread runs factory work, so it cannot start work in a linked environment.",
+});
+
+const factoryStartRefused = new OrchestratorMcpFailure({
+  code: "capability_denied",
+  message:
+    "This thread runs factory work, and a linked environment cannot reserve its capacity. Start factory work in this environment instead.",
+});
+
+/**
+ * Factory capacity and item ownership are reserved per environment, and a forwarded call carries
+ * no reservation, so factory work here may not start executions there. The caller thread comes
+ * from the trusted invocation scope, never from the call's arguments.
+ */
+const refuseFactoryStartElsewhere = Effect.fn("McpToolAccess.refuseFactoryStartElsewhere")(
+  function* (
+    factoryStore: Option.Option<FactoryStore.FactoryStore["Service"]>,
+    scope: McpInvocationContext.McpInvocationScope,
+  ) {
+    if (scope.thread === undefined) return;
+    if (Option.isNone(factoryStore)) return yield* factoryOwnershipUnreadable;
+    const binding = yield* factoryStore.value
+      .bindingForThread(scope.thread.threadId)
+      .pipe(Effect.mapError(() => factoryOwnershipUnreadable));
+    if (Option.isSome(binding)) return yield* factoryStartRefused;
+  },
+);
+
 /**
  * Every tool that takes a linked environment runs there the same way: its
  * declaration checks the caller here, and the same call goes to the other
@@ -304,11 +347,13 @@ const routed = Effect.fn("McpToolAccess.routed")(function* <Tools extends Record
 ) {
   // Optional so toolkits that never leave this environment build without it.
   const forwarding = yield* Effect.serviceOption(PeerForwarding.PeerForwarding);
+  const factoryStore = yield* Effect.serviceOption(FactoryStore.FactoryStore);
   const handlers: Record<string, unknown> = { ...checked };
   for (const [name, declaration] of Object.entries<Declaration<unknown>>(declarations)) {
     const tool = toolkit.tools[name];
     if (tool === undefined || !takesLinkedEnvironment(tool)) continue;
     const remote = remoteCheckOf(declaration);
+    const startsExecutions = startsExecutionsOf(declaration);
     if (remote === undefined)
       return yield* Effect.die(
         `${name} takes a linked environment, but it acts as its calling thread, which is here.`,
@@ -322,6 +367,7 @@ const routed = Effect.fn("McpToolAccess.routed")(function* <Tools extends Record
         const target = PeerForwarding.remoteTarget(scope, environmentId);
         if (target === undefined) return yield* here(params);
         yield* (remote as RemoteCheck<typeof params>)(params);
+        if (startsExecutions) yield* refuseFactoryStartElsewhere(factoryStore, scope);
         if (Option.isNone(forwarding)) return yield* linksUnavailable;
         return yield* forwarding.value.call(scope, tool, target, { ...params, environmentId });
       });

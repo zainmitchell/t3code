@@ -218,6 +218,63 @@ describe("pending v2 questions", () => {
     ]);
   });
 
+  it("shows a factory decision card exactly as the server raises it, reason question included", () => {
+    const cardId = RuntimeRequestId.make("factory-card:example-factory:result:example-result:1");
+    const rootNode = NodeId.make("owner-run-root");
+    const asked = projection.turnItems[0];
+    if (asked?.type !== "user_input_request") throw new Error("fixture asks no question");
+    const card: OrchestrationV2ThreadProjection = {
+      ...v2Projection,
+      runtimeRequests: [{ ...projection.runtimeRequests[0]!, id: cardId, nodeId: rootNode }],
+      turnItems: [
+        {
+          ...asked,
+          id: TurnItemId.make("turn-item:factory-card:example-factory:result:example-result:1"),
+          nodeId: rootNode,
+          status: "waiting",
+          title: "Factory decision",
+          completedAt: null,
+          type: "user_input_request",
+          requestId: cardId,
+          responseMode: "message",
+          questions: [
+            {
+              id: "action",
+              header: "Stalled result",
+              question: "Synthetic item41 is stalled on rework result example-result.",
+              options: [
+                { label: "Reject result", description: "Send it back.", value: "reject" },
+                { label: "Keep it", description: "Stop asking.", value: "keep" },
+              ],
+            },
+            {
+              id: "reason",
+              header: "Reason",
+              question: "Why is this result not acceptable?",
+              options: [],
+              allowCustomAnswer: true,
+              required: false,
+            },
+          ],
+        },
+      ],
+    };
+    const [pending, ...others] = derivePendingThreadRequests(card).userInputs;
+    expect(others).toEqual([]);
+    expect(pending?.requestId).toBe(cardId);
+    expect(pending?.dismissible).toBe(true);
+    expect(
+      pending?.questions.map((question) => [
+        question.id,
+        question.options.map((option) => option.value),
+      ]),
+    ).toEqual([
+      ["action", ["reject", "keep"]],
+      ["reason", []],
+    ]);
+    expect(pending?.questions[1]?.allowCustomAnswer).toBe(true);
+  });
+
   it("only marks asynchronous questions as dismissible", () => {
     const live = {
       ...projection,
