@@ -736,8 +736,8 @@
     },
     {
       "path": "docs/community/native-factory-preview/pr-catalog.json",
-      "bytes": 20225,
-      "sha256": "0e52648b4e0a6a9f7d497e93f1830d8afc3a1ed9030d014da248c6e13e1f30fd"
+      "bytes": 19700,
+      "sha256": "55b4cd92a76ec3c5c77fefe205259f1a1197a297527913457552d81fd8c9f2b0"
     },
     {
       "path": "docs/internals/factory-lifecycle.md",
