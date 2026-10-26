@@ -296,6 +296,11 @@ export const OrchestrationV2SubagentCapabilities = Schema.Struct({
   canWaitForSubagents: Schema.Boolean,
   canCloseSubagents: Schema.Boolean,
   canForkSubagentThread: Schema.Boolean,
+  /**
+   * Set only when the provider thread's pending background roster is verified to list every
+   * background task the turn leaves running. Without it an empty roster proves nothing.
+   */
+  reportsBackgroundRoster: Schema.optional(Schema.Literal(true)),
 });
 export type OrchestrationV2SubagentCapabilities = typeof OrchestrationV2SubagentCapabilities.Type;
 
@@ -2718,6 +2723,16 @@ export const OrchestrationV2StoredEventJson = Schema.Struct({
 });
 export type OrchestrationV2StoredEventJson = typeof OrchestrationV2StoredEventJson.Type;
 
+/**
+ * The thread or schedule whose work created a thread, set by the server tool that created it.
+ * Clients cannot send it: client dispatches drop it before the orchestrator sees them.
+ */
+export const OrchestrationV2ThreadCreatedFrom = Schema.Union([
+  Schema.Struct({ type: Schema.Literal("thread"), threadId: ThreadId }),
+  Schema.Struct({ type: Schema.Literal("scheduled_task"), scheduledTaskId: ScheduledTaskId }),
+]);
+export type OrchestrationV2ThreadCreatedFrom = typeof OrchestrationV2ThreadCreatedFrom.Type;
+
 export const OrchestrationV2Command = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("thread.stop"),
@@ -2733,6 +2748,7 @@ export const OrchestrationV2Command = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("thread.create"),
     ...OrchestrationV2CreationFields,
+    createdFrom: Schema.optional(OrchestrationV2ThreadCreatedFrom),
     commandId: CommandId,
     threadId: ThreadId,
     projectId: ProjectId,
@@ -3112,6 +3128,8 @@ export const OrchestrationV2Command = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("thread.fork"),
     ...OrchestrationV2CreationFields,
+    /** The agent's thread when a server tool forks; the source is only the fork's context. */
+    createdFrom: Schema.optional(OrchestrationV2ThreadCreatedFrom),
     commandId: CommandId,
     sourceThreadId: ThreadId,
     targetThreadId: ThreadId,
@@ -3184,8 +3202,115 @@ export const OrchestrationV2Command = Schema.Union([
 ]);
 export type OrchestrationV2Command = typeof OrchestrationV2Command.Type;
 
-// Excluded from dispatchCommand so only the server can send these.
+const FactoryKey = TrimmedNonEmptyString.check(Schema.isMaxLength(256));
+
+// Factory identities share a bounded string shape but never substitute for each other.
+export const FactoryId = FactoryKey.pipe(Schema.brand("FactoryId"));
+export type FactoryId = typeof FactoryId.Type;
+export const FactoryPoolId = FactoryKey.pipe(Schema.brand("FactoryPoolId"));
+export type FactoryPoolId = typeof FactoryPoolId.Type;
+export const FactoryItemKey = FactoryKey.pipe(Schema.brand("FactoryItemKey"));
+export type FactoryItemKey = typeof FactoryItemKey.Type;
+export const FactoryDecisionKey = FactoryKey.pipe(Schema.brand("FactoryDecisionKey"));
+export type FactoryDecisionKey = typeof FactoryDecisionKey.Type;
+export const FactoryReservationId = FactoryKey.pipe(Schema.brand("FactoryReservationId"));
+export type FactoryReservationId = typeof FactoryReservationId.Type;
+export const FactoryClaimCarrierKey = FactoryKey.pipe(Schema.brand("FactoryClaimCarrierKey"));
+export type FactoryClaimCarrierKey = typeof FactoryClaimCarrierKey.Type;
+/** Allocated by the factory before a collection reads; later collections get larger values. */
+export const FactoryReadGeneration = PositiveInt.pipe(Schema.brand("FactoryReadGeneration"));
+export type FactoryReadGeneration = typeof FactoryReadGeneration.Type;
+export const FactoryObservationId = PositiveInt.pipe(Schema.brand("FactoryObservationId"));
+export type FactoryObservationId = typeof FactoryObservationId.Type;
+
+/** The admitted decision a runtime-owned factory execution reserves in its start commit. */
+export const OrchestrationV2FactoryAdmission = Schema.Struct({
+  factoryId: FactoryId,
+  configRevision: PositiveInt,
+  decisionKey: FactoryDecisionKey,
+  itemKey: FactoryItemKey,
+  itemVersion: FactoryKey,
+  taskKind: FactoryKey,
+  policyRevision: FactoryKey,
+  poolId: FactoryPoolId,
+  units: PositiveInt,
+  packetDigest: FactoryKey,
+  /** The native item observation the decision was validated against, rechecked at commit. */
+  observationId: FactoryObservationId,
+  basisDigest: FactoryKey,
+  deadline: Schema.DateTimeUtc,
+  /**
+   * The tracker issue this decision claims before it starts. When present, the admission commit
+   * starts nothing: the first message follows only a verified claim.
+   */
+  claim: Schema.optional(
+    Schema.Struct({
+      host: FactoryKey,
+      repository: FactoryKey,
+      issueNumber: PositiveInt,
+    }),
+  ),
+  /**
+   * A later lifecycle stage of an item: the reservation whose claim owns the item. Such a
+   * decision makes no claim of its own; it starts only while that claim is held.
+   */
+  continues: Schema.optional(FactoryReservationId),
+  /** The exact basis of a lifecycle stage decision (the reviewed head, the corrected failure). */
+  stageBasis: Schema.optional(FactoryKey),
+  /**
+   * The finite owner grant this supervised decision spends: revalidated against its exact
+   * subject and spent in the admission commit, or the decision is refused.
+   */
+  grant: Schema.optional(
+    Schema.Struct({ grantId: FactoryKey, stage: FactoryKey, evidenceDigest: FactoryKey }),
+  ),
+});
+export type OrchestrationV2FactoryAdmission = typeof OrchestrationV2FactoryAdmission.Type;
+
+/**
+ * Commands only the server dispatches. They stay out of
+ * `OrchestrationV2Command`, the `dispatchCommand` payload, so no client can
+ * send them.
+ */
 const OrchestrationV2InternalCommand = Schema.Union([
+  /**
+   * Starts a factory execution with no parent run, so admission never needs a live
+   * coordinator turn. Internal so only the factory service can reserve capacity.
+   */
+  Schema.Struct({
+    type: Schema.Literal("factory.execution.start"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    projectId: ProjectId,
+    title: TrimmedNonEmptyString,
+    modelSelection: ModelSelection,
+    runtimeMode: RuntimeMode,
+    interactionMode: ProviderInteractionMode,
+    prompt: TrimmedNonEmptyString,
+    workspaceStrategy: Schema.optional(OrchestrationV2ThreadLaunchWorkspaceStrategy),
+    admission: OrchestrationV2FactoryAdmission,
+  }),
+  /**
+   * Records a factory claim read back from the tracker and, in the same commit, sends the
+   * execution's first message. Internal so only the claim service can attest a claim.
+   */
+  Schema.Struct({
+    type: Schema.Literal("factory.claim.settle"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    reservationId: FactoryReservationId,
+    attempt: PositiveInt,
+    commentId: PositiveInt,
+    /** Digest of the comment body read back by id: an edited comment is another carrier. */
+    commentDigest: TrimmedNonEmptyString,
+    /** The first message the claim record holds; the commit checks it against the record. */
+    launch: Schema.Struct({
+      messageCommandId: CommandId,
+      prompt: TrimmedNonEmptyString,
+      modelSelection: ModelSelection,
+      workspaceStrategy: Schema.optional(OrchestrationV2ThreadLaunchWorkspaceStrategy),
+    }),
+  }),
   // Guest share commands the server issues after checking T3 Connect and the guest token.
   Schema.Struct({
     type: Schema.Literal("thread.guest-share.open"),
@@ -3259,6 +3384,18 @@ const OrchestrationV2InternalCommand = Schema.Union([
         }),
       }),
     ),
+  }),
+  /**
+   * Internal so no client can bound a Stop retry to earlier history; client
+   * Stops use the public `OrchestrationV2Command` variant.
+   */
+  Schema.Struct({
+    type: Schema.Literal("thread.stop"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    reason: Schema.optional(Schema.String),
+    stopDelegatedTasks: Schema.optional(Schema.Boolean),
+    throughSequence: Schema.optional(NonNegativeInt),
   }),
   /**
    * Internal so no client can mark a request saved without the value being

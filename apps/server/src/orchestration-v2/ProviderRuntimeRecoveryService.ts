@@ -15,6 +15,7 @@ import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import * as EffectOutbox from "./EffectOutbox.ts";
@@ -201,6 +202,31 @@ export const make = Effect.gen(function* () {
       const now = yield* DateTime.now;
       const runs = [] as Array<OrchestrationV2ThreadProjection["runs"][number]>;
       for (const run of nonterminalRuns(projection)) {
+        // A claimed factory run's preparation is owned by its own effect, which replays after a
+        // restart and decides from durable state whether preparing again is safe: the effect its
+        // claim's settlement created, or a lifecycle pass's recovery of the same run.
+        if (run.status === "preparing") {
+          const owning = yield* Effect.all([
+            outbox.get(`effect:factory-execution.prepare:${run.id}`),
+            outbox.listByCommandId(CommandId.make(`factory-recovery-check:${run.id}`)),
+          ]).pipe(
+            Effect.map(([settled, recovery]) => [
+              ...(Option.isSome(settled) ? [settled.value] : []),
+              ...recovery,
+            ]),
+            Effect.mapError(
+              (cause) =>
+                new ProviderRuntimeRecoveryError({
+                  operation: "reconcile",
+                  threadId: projection.thread.id,
+                  cause,
+                }),
+            ),
+          );
+          if (owning.some((effect) => effect.status === "pending" || effect.status === "running")) {
+            continue;
+          }
+        }
         if (run.status === "waiting") {
           const checkpointEffects = yield* outbox
             .listByCommandId(CommandId.make(`command:effect:checkpoint.capture:${run.id}`))

@@ -70,8 +70,13 @@ import Migration0064 from "./Migrations/064_CanonicalizeThreadPullRequestLinks.t
 import Migration0065 from "./Migrations/065_CodexUsageNativeTurnIndex.ts";
 import Migration0066 from "./Migrations/066_RepairClientSettlementTimestamps.ts";
 import Migration0067 from "./Migrations/067_WebhookDedupe.ts";
-import Migration0068 from "./Migrations/068_ShellStopRequestIndex.ts";
-import Migration0069 from "./Migrations/069_ThreadMessageSearch.ts";
+import Migration0068 from "./Migrations/068_PeerLinks.ts";
+import Migration0069 from "./Migrations/068_ShellStopRequestIndex.ts";
+import Migration0070 from "./Migrations/070_FactoryLifecycle.ts";
+import Migration0071 from "./Migrations/071_FactoryExecutionGenerations.ts";
+import Migration0072 from "./Migrations/072_FactoryOutcomes.ts";
+import Migration0073 from "./Migrations/073_FactoryTransfers.ts";
+import Migration0074 from "./Migrations/069_ThreadMessageSearch.ts";
 
 const migrationEntries = [
   [1, "OrchestrationEvents", Migration0001],
@@ -142,8 +147,17 @@ const migrationEntries = [
   [65, "CodexUsageNativeTurnIndex", Migration0065],
   [66, "RepairClientSettlementTimestamps", Migration0066],
   [67, "WebhookDedupe", Migration0067],
-  [68, "ShellStopRequestIndex", Migration0068],
-  [69, "ThreadMessageSearch", Migration0069],
+  [68, "PeerLinks", Migration0068],
+  // Patched databases recorded 68 as PeerLinks before upstream used 68, and
+  // assertV2MigrationsCanRun refuses a renamed id, so upstream's 68 runs as 69.
+  [69, "ShellStopRequestIndex", Migration0069],
+  [70, "FactoryLifecycle", Migration0070],
+  [71, "FactoryExecutionGenerations", Migration0071],
+  [72, "FactoryOutcomes", Migration0072],
+  [73, "FactoryTransfers", Migration0073],
+  // Upstream's 69 ThreadMessageSearch runs as 74 for the same reason: patched
+  // databases already recorded 69 through 73.
+  [74, "ThreadMessageSearch", Migration0074],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);

@@ -50,6 +50,8 @@ export interface MuseSdkHostOptions {
   readonly signal?: AbortSignal;
   readonly startupTimeoutMs?: number;
   readonly onProcessExit?: (exit: ProcessExit) => void;
+  /** The started process, before anything is written to it. */
+  readonly onProcessSpawn?: (pid: number | undefined) => void;
 }
 
 export function makeMuseEnvironment(
@@ -155,6 +157,7 @@ export async function createMuseSdkHost(
     env: options.environment ?? makeMuseEnvironment(),
     shutdownTimeoutMs: 10_000,
     ...(options.onProcessExit ? { onProcessExit: options.onProcessExit } : {}),
+    ...(options.onProcessSpawn ? { onProcessSpawn: options.onProcessSpawn } : {}),
   });
   let closePromise: Promise<void> | undefined;
   const close = () => {

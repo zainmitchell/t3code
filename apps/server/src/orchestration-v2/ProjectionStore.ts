@@ -616,6 +616,14 @@ export interface ProjectionStoreV2Shape {
   readonly getRecoveryThreadIds: (
     kind: ProjectionRecoveryKind,
   ) => Effect.Effect<ReadonlyArray<ThreadId>, ProjectionStoreV2Error>;
+  /**
+   * The thread's cancelled runs that never left `queued`, proved by their own retained history:
+   * created queued, moved only to cancelled. Such a run was never dequeued, so no launch, provider
+   * turn or process was ever its own. A run whose history is incomplete is never named.
+   */
+  readonly getNeverDequeuedRunIds: (
+    threadId: ThreadId,
+  ) => Effect.Effect<ReadonlySet<RunId>, ProjectionStoreV2Error>;
   readonly getUnreadableThreadIds: () => Effect.Effect<
     ReadonlyArray<ThreadId>,
     ProjectionStoreV2Error
@@ -3966,6 +3974,33 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })),
     );
 
+    const getNeverDequeuedRunIds = Effect.fn("ProjectionStore.getNeverDequeuedRunIds")(
+      function* (threadId: ThreadId) {
+        // Run events are never compacted, so the history is whole or absent; absent proves nothing.
+        const rows = yield* sql<{ readonly run_id: string }>`
+          SELECT run.run_id FROM orchestration_v2_projection_runs AS run
+          WHERE run.thread_id = ${threadId}
+            AND run.status = 'cancelled'
+            AND EXISTS (
+              SELECT 1 FROM orchestration_events AS created
+              WHERE created.aggregate_kind = 'thread' AND created.stream_id = ${threadId}
+                AND created.event_type = 'run.created'
+                AND json_extract(created.payload_json, '$.id') = run.run_id
+                AND json_extract(created.payload_json, '$.status') = 'queued'
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM orchestration_events AS moved
+              WHERE moved.aggregate_kind = 'thread' AND moved.stream_id = ${threadId}
+                AND moved.event_type IN ('run.created', 'run.updated')
+                AND json_extract(moved.payload_json, '$.id') = run.run_id
+                AND json_extract(moved.payload_json, '$.status') NOT IN ('queued', 'cancelled')
+            )
+        `;
+        return new Set(rows.map((row) => RunId.make(row.run_id)));
+      },
+      Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })),
+    );
+
     const getRecoveryThreadIds = Effect.fn("ProjectionStore.getRecoveryThreadIds")(
       function* (kind: ProjectionRecoveryKind) {
         const candidates = (() => {
@@ -6772,6 +6807,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getProviderControlContext: readOnReader(getProviderControlContext),
       getLimitRecoveryCandidates: readOnReader(getLimitRecoveryCandidates),
       getRecoveryThreadIds: readOnReader(getRecoveryThreadIds),
+      getNeverDequeuedRunIds: readOnReader(getNeverDequeuedRunIds),
       getUnreadableThreadIds: readOnReader(getUnreadableThreadIds),
       getThreadSnapshot: readOnReader(getThreadSnapshot),
       getThreadSnapshotWindow: readOnReader(getThreadSnapshotWindow),
@@ -7068,6 +7104,8 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
               .toSorted((left, right) => left.id.localeCompare(right.id)),
           ),
         ),
+      // The memory store keeps no history, so it proves of no run that it never left the queue.
+      getNeverDequeuedRunIds: () => Effect.succeed(new Set<RunId>()),
       getRecoveryThreadIds: Effect.fn("ProjectionStore.getRecoveryThreadIds")(function* (kind) {
         const projections = (yield* Ref.get(replayState)).projections;
         return [...projections.values()]

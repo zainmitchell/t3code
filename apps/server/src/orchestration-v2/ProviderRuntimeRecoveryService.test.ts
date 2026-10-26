@@ -16,6 +16,7 @@ import {
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 
 import * as EffectWorker from "./EffectWorker.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
@@ -64,6 +65,7 @@ it.effect("expires orphaned runtime requests before command readiness", () => {
           runRecoveryOnce: Effect.succeed(false),
         }),
         Layer.mock(EffectOutbox.EffectOutboxV2)({
+          get: () => Effect.succeed(Option.none()),
           reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
         }),
       ),
@@ -116,6 +118,7 @@ it.effect("preserves async questions across startup and shutdown", () => {
           runRecoveryOnce: Effect.succeed(false),
         }),
         Layer.mock(EffectOutbox.EffectOutboxV2)({
+          get: () => Effect.succeed(Option.none()),
           reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
           cancelUnsettled: () => Effect.succeed([]),
           signalCancellations: () => Effect.void,
@@ -201,6 +204,7 @@ it.effect(
                   status: "running",
                 },
               ] as never),
+            get: () => Effect.succeed(Option.none()),
             reconcileAfterProcessLoss: Effect.succeed({ requeued: 1, cancelled: 0 }),
           }),
         ),
@@ -336,6 +340,7 @@ it.effect(
             runRecoveryOnce: Effect.succeed(false),
           }),
           Layer.mock(EffectOutbox.EffectOutboxV2)({
+            get: () => Effect.succeed(Option.none()),
             reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
           }),
         ),
@@ -403,6 +408,7 @@ it.effect("cancels a stale waiting run when no checkpoint capture can finish it"
         }),
         Layer.mock(EffectOutbox.EffectOutboxV2)({
           listByCommandId: () => Effect.succeed([]),
+          get: () => Effect.succeed(Option.none()),
           reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
         }),
       ),
@@ -487,6 +493,8 @@ it.effect.each(["queued", "preparing"] as const)("recovers $0 work after restart
           runRecoveryOnce: Effect.succeed(false),
         }),
         Layer.mock(EffectOutbox.EffectOutboxV2)({
+          get: () => Effect.succeed(Option.none()),
+          listByCommandId: () => Effect.succeed([]),
           reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
         }),
       ),
@@ -612,6 +620,7 @@ it.effect(
             runRecoveryOnce: Effect.succeed(false),
           }),
           Layer.mock(EffectOutbox.EffectOutboxV2)({
+            get: () => Effect.succeed(Option.none()),
             reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
           }),
         ),
@@ -720,6 +729,7 @@ it.effect("cancels workflow members and child roots without run ids after restar
           runRecoveryOnce: Effect.succeed(false),
         }),
         Layer.mock(EffectOutbox.EffectOutboxV2)({
+          get: () => Effect.succeed(Option.none()),
           reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
         }),
       ),
@@ -885,6 +895,7 @@ it.effect(
           }),
           Layer.mock(EffectOutbox.EffectOutboxV2)({
             listByCommandId: () => Effect.succeed([]),
+            get: () => Effect.succeed(Option.none()),
             reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
           }),
         ),
@@ -958,7 +969,7 @@ it.effect(
     const settledRunId = RunId.make("run_recovery_orphan_wait_settled");
     const providerThreadId = ProviderThreadId.make("provider_thread_recovery_orphan_wait");
     const orphanWaitItemId = TurnItemId.make(
-      "turn-item:provider:codex:native-item:exec-4669f3bb-78c9-4af1-b44e-daa340d2c538",
+      "turn-item:provider:codex:native-item:exec-00000000-0000-4000-8000-000000000001",
     );
     const persistentMonitorItemId = TurnItemId.make(
       "turn-item:provider:codex:native-item:exec-persistent-monitor",
@@ -1042,6 +1053,7 @@ it.effect(
           }),
           Layer.mock(EffectOutbox.EffectOutboxV2)({
             listByCommandId: () => Effect.succeed([]),
+            get: () => Effect.succeed(Option.none()),
             reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
           }),
         ),
@@ -1172,6 +1184,7 @@ it.effect(
           }),
           Layer.mock(EffectOutbox.EffectOutboxV2)({
             listByCommandId: () => Effect.succeed([]),
+            get: () => Effect.succeed(Option.none()),
             reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
           }),
         ),
@@ -1329,6 +1342,7 @@ it.effect("leaves delegated tasks to their own child threads after process loss"
         }),
         Layer.mock(EffectOutbox.EffectOutboxV2)({
           listByCommandId: () => Effect.succeed([]),
+          get: () => Effect.succeed(Option.none()),
           reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
         }),
       ),

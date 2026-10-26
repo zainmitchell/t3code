@@ -48,6 +48,12 @@
         "scripts/update-test-shard-weights.ts",
         "scripts/verify-background-live.ts",
         "src/provider/testFixtures/*.mjs",
+        // The cross-process claim race spawns this writer by path.
+        "src/factory/claimRace.fixture.ts",
+        // Custody and policy tests spawn these processes by path.
+        "src/factory/custodyHost.fixture.ts",
+        "src/factory/factoryPolicy.fixture.ts",
+        "src/process/custody/member.fixture.ts",
         // graphqlgen reads its config.
         "graphql.config.ts",
       ],

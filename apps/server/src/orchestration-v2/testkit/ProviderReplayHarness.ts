@@ -28,6 +28,7 @@ import * as CommandPolicy from "../CommandPolicy.ts";
 import * as CommandReceiptStore from "../CommandReceiptStore.ts";
 import * as ContextHandoffService from "../ContextHandoffService.ts";
 import * as EffectOutbox from "../EffectOutbox.ts";
+import * as FactoryClaimService from "../../factory/FactoryClaimService.ts";
 import * as EffectWorker from "../EffectWorker.ts";
 import * as EventSink from "../EventSink.ts";
 import * as EventStore from "../EventStore.ts";
@@ -35,6 +36,8 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as Orchestrator from "../Orchestrator.ts";
 import * as ProjectionStore from "../ProjectionStore.ts";
 import * as ProjectStore from "../ProjectStore.ts";
+import * as FactoryStore from "../../factory/FactoryStore.ts";
+import * as FactoryExecutionGenerations from "../../factory/FactoryExecutionGenerations.ts";
 import * as ProviderAdapterRegistry from "../ProviderAdapterRegistry.ts";
 import * as ProviderAuthService from "../../provider/ProviderAuthService.ts";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
@@ -402,6 +405,10 @@ export function layerWithRegistry<Error>(
         layerRuntime,
         layerServerConfig,
         layerServerSettings,
+        layerProvidedRegistry,
+        FactoryStore.layer.pipe(Layer.provide(layerDatabase)),
+        FactoryExecutionGenerations.layer.pipe(Layer.provide(layerDatabase)),
+        Layer.mock(FactoryClaimService.FactoryClaimService)({}),
       ),
     ),
   );
@@ -452,6 +459,7 @@ export function layerWithRegistry<Error>(
         CommandPolicy.layer,
         layerContextHandoffServiceProvided,
         layerPersistence,
+        layerDatabase,
         layerProvidedRegistry,
         layerContinuationRequests,
         layerRuntime,
@@ -499,6 +507,8 @@ export function layerWithRegistry<Error>(
         layerThreadTitleRegenerationTest,
         layerServerSettings,
         layerThreadManagementProvided,
+        // Replays run no factory, so no tracker claim is ever written.
+        Layer.mock(FactoryClaimService.FactoryClaimService)({}),
       ),
     ),
   );

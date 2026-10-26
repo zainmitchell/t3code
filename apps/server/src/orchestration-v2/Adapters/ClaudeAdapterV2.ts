@@ -55,6 +55,7 @@ import * as NodeUtil from "node:util";
 import { parseCliArgs } from "@t3tools/shared/cliArgs";
 import { fromLenientJson } from "@t3tools/shared/schemaJson";
 import { AgentScope } from "@t3tools/shared/AgentScope";
+import { ExecutionJoin, type JoinTicket } from "@t3tools/shared/ExecutionJoin";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { applyClaudePromptEffortPrefix } from "@t3tools/shared/model";
 import {
@@ -348,6 +349,43 @@ export function spawnClaudeProcessGroup(
   return child as ClaudeSpawnedProcess;
 }
 
+/**
+ * Starts the CLI through its container's join command and admits the process it started. Until
+ * the holder admits it, the join runs nothing; if admission fails, the join is stopped.
+ */
+function spawnContainedClaude(
+  options: ClaudeSpawnOptions,
+  ticket: JoinTicket,
+  runFork: <A, E>(effect: Effect.Effect<A, E>) => unknown,
+): ClaudeSpawnedProcess {
+  const child = NodeChildProcess.spawn(options.command, options.args, {
+    cwd: options.cwd,
+    env: options.env,
+    signal: options.signal,
+    stdio: ["pipe", "pipe", "ignore"],
+    windowsHide: true,
+  });
+  const pid = child.pid;
+  const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+  runFork(
+    pid === undefined
+      ? ticket.cancel
+      : ticket
+          .admit(
+            pid,
+            Effect.promise(() => exited),
+          )
+          .pipe(
+            Effect.catch(() =>
+              Effect.sync(() => {
+                child.kill();
+              }),
+            ),
+          ),
+  );
+  return child as ClaudeSpawnedProcess;
+}
+
 export const ClaudeProviderCapabilitiesV2 = {
   sessions: {
     supportsMultipleProviderThreadsPerSession: false,
@@ -495,6 +533,8 @@ export interface ClaudeAgentSdkQueryOpenInput {
   readonly options: ClaudeAgentSdkQueryOptions;
   readonly threadId: ThreadId;
   readonly providerSessionId: OrchestrationV2ProviderSession["id"];
+  /** The run whose turn opens the query: the execution whose container its process joins. */
+  readonly runId?: RunId;
 }
 
 export interface ClaudeAgentSdkQuerySession {
@@ -885,6 +925,7 @@ export const layerQueryRunner: Layer.Layer<
     const path = yield* Path.Path;
     const { native: nativeEventLogger } = yield* ProviderEventLoggers.ProviderEventLoggers;
     const agentScope = yield* AgentScope;
+    const executionJoin = yield* ExecutionJoin;
     const platform = yield* HostProcess.Platform;
     const runFork = Effect.runForkWith(yield* Effect.context<never>());
 
@@ -913,6 +954,31 @@ export const layerQueryRunner: Layer.Layer<
         const { mcpServers, ...queryOptions } = input.options;
         // The SDK can prepend a scope wrapper to native binaries; script entries run through node.
         const binaryPath = queryOptions.pathToClaudeCodeExecutable;
+        const isScriptEntry =
+          binaryPath === undefined ||
+          CLAUDE_SCRIPT_EXTENSIONS.some((ext) => binaryPath.endsWith(ext));
+        // A thread whose work is contained starts its CLI inside its run's container or not at
+        // all; the SDK's own spawn of a script entry could not be placed there. The run that
+        // opens the query names the container; the session is recorded so a later turn of it is
+        // attributable to this process.
+        const contained = yield* executionJoin
+          .forThread(input.threadId, {
+            ...(input.runId === undefined ? {} : { runId: input.runId }),
+            providerSessionId: input.providerSessionId,
+          })
+          .pipe(Effect.mapError((cause) => queryRunnerError(cause, "contain")));
+        let ticket: JoinTicket | undefined;
+        if (Option.isSome(contained)) {
+          if (isScriptEntry || binaryPath === undefined) {
+            return yield* queryRunnerError(
+              "Claude Code is installed as a script entry, which cannot start inside this execution's container.",
+              "contain",
+            );
+          }
+          ticket = yield* contained
+            .value(binaryPath, [], "provider")
+            .pipe(Effect.mapError((cause) => queryRunnerError(cause, "contain")));
+        }
         const launch =
           binaryPath === undefined ||
           CLAUDE_SCRIPT_EXTENSIONS.some((ext) => binaryPath.endsWith(ext))
@@ -924,24 +990,30 @@ export const layerQueryRunner: Layer.Layer<
                 threadId: input.threadId,
                 env: queryOptions.env,
               });
+        const wrapped = ticket ?? launch;
         const options =
-          launch === undefined || launch.args.length === 0
+          wrapped === undefined || wrapped.args.length === 0
             ? queryOptions
             : {
                 ...queryOptions,
-                pathToClaudeCodeExecutable: launch.command,
-                executableArgs: [...launch.args, ...(queryOptions.executableArgs ?? [])],
+                pathToClaudeCodeExecutable: wrapped.command,
+                executableArgs: [...wrapped.args, ...(queryOptions.executableArgs ?? [])],
               };
         const unit = launch?.unit;
         const stopScope =
           unit === undefined ? undefined : () => void runFork(agentScope.stop(unit));
-        // Windows has no process groups, so there the SDK spawns the CLI itself.
+        // Windows has no process groups, so there the SDK spawns the CLI itself, unless it joins a
+        // container: then this spawns it, so the started process can be admitted.
+        const containedTicket = ticket;
         const spawnClaudeCodeProcess =
           options.spawnClaudeCodeProcess ??
-          (platform === "win32"
-            ? undefined
-            : (spawnOptions: ClaudeSpawnOptions) =>
-                spawnClaudeProcessGroup(spawnOptions, stopScope));
+          (containedTicket !== undefined
+            ? (spawnOptions: ClaudeSpawnOptions) =>
+                spawnContainedClaude(spawnOptions, containedTicket, runFork)
+            : platform === "win32"
+              ? undefined
+              : (spawnOptions: ClaudeSpawnOptions) =>
+                  spawnClaudeProcessGroup(spawnOptions, stopScope));
         const queryRuntime = yield* Effect.uninterruptibleMask((restore) =>
           Effect.try({
             try: () =>
@@ -1507,6 +1579,7 @@ export const CLAUDE_READ_ONLY_T3_MCP_ALLOWED_TOOLS: ReadonlyArray<string> = [
   "mcp__t3-code__t3_thread_search",
   "mcp__t3-code__t3_preview_list",
   "mcp__t3-code__t3_environment_read",
+  "mcp__t3-code__t3_environment_links",
   "mcp__t3-code__t3_queue_list",
   "mcp__t3-code__t3_queue_read",
   "mcp__t3-code__html_preview",
@@ -9373,6 +9446,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             .open({
               threadId: turnInput.threadId,
               providerSessionId: input.providerSessionId,
+              runId: turnInput.runId,
               options: queryOptions,
             })
             .pipe(

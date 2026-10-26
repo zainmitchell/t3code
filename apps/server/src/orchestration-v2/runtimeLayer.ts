@@ -1,6 +1,7 @@
 import * as GuestShareService from "../guest/GuestShareService.ts";
 import * as UsageLimitRecoveryWorker from "./UsageLimitRecoveryWorker.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
+import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as OrchestrationCommandReceipts from "../persistence/OrchestrationCommandReceipts.ts";
@@ -23,6 +24,17 @@ import * as CommandReceiptStore from "./CommandReceiptStore.ts";
 import * as ContextHandoffService from "./ContextHandoffService.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as EffectWorker from "./EffectWorker.ts";
+import * as FactoryClaimService from "../factory/FactoryClaimService.ts";
+import * as FactoryRunPreparation from "../factory/FactoryRunPreparation.ts";
+import * as FactoryClaimStore from "../factory/FactoryClaimStore.ts";
+import * as FactoryCommandPolicy from "../factory/FactoryCommandPolicy.ts";
+import * as FactoryEffects from "../factory/FactoryEffects.ts";
+import * as FactoryOperationStore from "../factory/FactoryOperationStore.ts";
+import * as FactoryLifecycle from "../factory/FactoryLifecycle.ts";
+import * as FactoryStore from "../factory/FactoryStore.ts";
+import * as FactoryTransferStore from "../factory/FactoryTransferStore.ts";
+import * as FactoryGitReadback from "../factory/FactoryGitReadback.ts";
+import * as FactoryExecutionGenerations from "../factory/FactoryExecutionGenerations.ts";
 import * as EventSink from "./EventSink.ts";
 import * as EventStore from "./EventStore.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -54,6 +66,9 @@ import * as ThreadLifecycleService from "./ThreadLifecycleService.ts";
 import * as ThreadForkService from "./ThreadForkService.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
+import * as CommandJobFence from "../commandJobs/CommandJobFence.ts";
+import * as CommandJobs from "../commandJobs/CommandJobs.ts";
+import * as ProcessRunner from "../processRunner.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 
 export const layerEventInfrastructure = Layer.mergeAll(
@@ -162,21 +177,6 @@ const layerRunExecutionServiceProvided = RunExecutionService.layer.pipe(
   ),
 );
 
-const layerProviderTurnStartServiceProvided = ProviderTurnStartService.layer.pipe(
-  Layer.provide(
-    Layer.mergeAll(
-      layerContextHandoffServiceProvided,
-      layerEventSinkProvided,
-      IdAllocator.layer,
-      ProjectionStore.layer,
-      layerProviderSessionManagerProvided,
-      layerProviderAuthServiceProvided,
-      layerRunExecutionServiceProvided,
-      layerRuntimePolicyProvided,
-    ),
-  ),
-);
-
 const layerProviderTurnControlServiceProvided = ProviderTurnControlService.layer.pipe(
   Layer.provide(Layer.merge(ProjectionStore.layer, layerProviderSessionManagerProvided)),
 );
@@ -248,7 +248,11 @@ const layerAgentSessionImporterProvided = AgentSessionImporter.layer.pipe(
   ),
 );
 
-const layerThreadManagementProvided = ThreadManagementService.layerWithLegacyImporter.pipe(
+/**
+ * Exported so a harness can build services over the same instance the runtime uses; layers are
+ * memoized by reference within one build.
+ */
+export const layerThreadManagementProvided = ThreadManagementService.layerWithLegacyImporter.pipe(
   Layer.provide(
     Layer.mergeAll(
       layerOrchestratorProvided,
@@ -282,6 +286,19 @@ const layerThreadLifecycleProvided = ThreadLifecycleService.layer.pipe(
 const layerSecretRequestsProvided = SecretRequests.layer.pipe(
   Layer.provide(layerThreadManagementProvided),
 );
+// One instance for the scheduler that runs the jobs and the factory that takes their work over,
+// so a transfer sees the passes actually running. Both read the same durable writer fence.
+const layerCommandJobsProvided = CommandJobs.layer.pipe(
+  Layer.provide(
+    Layer.mergeAll(
+      layerThreadLaunchProvided,
+      layerThreadManagementProvided,
+      layerProjectService,
+      ProcessRunner.layer,
+      CommandJobFence.layer,
+    ),
+  ),
+);
 const layerScheduledTaskProvided = ScheduledTaskService.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
@@ -289,6 +306,7 @@ const layerScheduledTaskProvided = ScheduledTaskService.layer.pipe(
       layerThreadManagementProvided,
       layerManagedProjectFoldersProvided,
       layerSecretRequestsProvided,
+      layerCommandJobsProvided,
     ),
   ),
 );
@@ -306,9 +324,59 @@ const layerThreadTitleRegenerationProvided = ThreadTitleRegenerationService.laye
     Layer.mergeAll(layerThreadManagementProvided, ProjectStore.layer, TextGeneration.layer),
   ),
 );
+// The claim service writes and reads back tracker claims through the tracker the server gives the
+// runtime (`FactoryTracker`); without one, a factory that must claim starts nothing.
+const layerFactoryClaimServiceProvided = FactoryClaimService.layer.pipe(
+  Layer.provide(
+    Layer.mergeAll(
+      layerOrchestratorProvided,
+      FactoryClaimStore.layer.pipe(Layer.provideMerge(FactoryStore.layer)),
+      FactoryExecutionGenerations.layer,
+      FactoryOperationStore.layer,
+      layerCommandReceiptStoreProvided,
+    ),
+  ),
+);
+const layerProviderTurnStartServiceProvided = ProviderTurnStartService.layer.pipe(
+  Layer.provide(
+    Layer.mergeAll(
+      layerContextHandoffServiceProvided,
+      layerEventSinkProvided,
+      IdAllocator.layer,
+      ProjectionStore.layer,
+      layerProviderSessionManagerProvided,
+      layerProviderAuthServiceProvided,
+      layerRunExecutionServiceProvided,
+      layerRuntimePolicyProvided,
+      layerStores,
+      layerProviderAdapterRegistryProvided,
+      FactoryStore.layer,
+      layerFactoryClaimServiceProvided,
+      // The same value the server provides, so both resolve to its one set of containers.
+      FactoryExecutionGenerations.layer,
+    ),
+  ),
+);
+// Factory operations are applied by the same worker as every other effect, after their intent
+// committed. The integrator and the wake queue come from the server, shared with the lifecycle.
+// One wake queue for the effect worker and the lifecycle's driver, so a finished factory write
+// reaches the driver: both layers below provide this same value.
+const layerFactoryWakes = FactoryEffects.layerWakes;
+const layerFactoryEffectsProvided = FactoryEffects.layer.pipe(
+  Layer.provide(
+    Layer.mergeAll(
+      FactoryOperationStore.layer,
+      FactoryStore.layer,
+      EffectOutbox.layer,
+      layerFactoryWakes,
+    ),
+  ),
+);
 const layerEffectExecutorProvided = EffectWorker.layerExecutor.pipe(
   Layer.provide(
     Layer.mergeAll(
+      layerFactoryClaimServiceProvided,
+      layerFactoryEffectsProvided,
       layerRunFinalizationServiceProvided,
       layerCheckpointRollbackServiceProvided,
       layerProviderSessionManagerProvided,
@@ -346,6 +414,24 @@ const layerMcpAppRequestsProvided = McpAppRequests.layer.pipe(
   ),
 );
 
+const layerFactoryLifecycleProvided = FactoryLifecycle.layer.pipe(
+  Layer.provide(
+    Layer.mergeAll(
+      layerOrchestratorProvided,
+      layerStores,
+      layerProviderAdapterRegistryProvided,
+      layerProviderSessionManagerProvided,
+      FactoryGitReadback.layer.pipe(Layer.provide(layerProjectService)),
+      FactoryCommandPolicy.layer.pipe(Layer.provide(ProcessRunner.layer)),
+      layerProjectService,
+      layerCommandJobsProvided,
+      CommandJobFence.layer,
+      FactoryTransferStore.layer,
+      layerFactoryWakes,
+    ),
+  ),
+);
+
 export const layer = Layer.mergeAll(
   layerCommandOutputHubProvided,
   layerOrchestratorProvided,
@@ -357,15 +443,30 @@ export const layer = Layer.mergeAll(
   layerProviderRuntimeRecoveryProvided,
   layerProjectionMaintenanceProvided,
   layerLegacyV1ThreadImporterProvided,
+  layerFactoryClaimServiceProvided,
 );
 
+// Claimed factory runs prepare their workspace through the same launch service as every other
+// thread, provided before the claim service is built so its handoff can use it. The minimal
+// `layer` above has none, and prepares nothing.
+const layerFactoryRunPreparationProvided = Layer.effect(
+  FactoryRunPreparation.FactoryRunPreparation,
+  Effect.map(ThreadLaunchService.ThreadLaunchService, (launches) => ({
+    available: true,
+    startOwned: launches.prepareRunOwned,
+    currentOwner: launches.currentPreparationOwner,
+  })),
+).pipe(Layer.provide(layerThreadLaunchProvided));
+
 export const layerProduction = Layer.mergeAll(
-  layer.pipe(Layer.provide(layerProjectService)),
+  layer.pipe(Layer.provide(layerProjectService), Layer.provide(layerFactoryRunPreparationProvided)),
   layerProjectService,
   layerManagedProjectFoldersProvided,
   layerThreadLaunchProvided,
   layerThreadLifecycleProvided,
   layerScheduledTaskProvided,
+  // Read-state custody attributes live preparation only through the same adapter.
+  layerFactoryLifecycleProvided.pipe(Layer.provide(layerFactoryRunPreparationProvided)),
   layerSecretRequestsProvided,
   GuestShareService.layer.pipe(
     Layer.provide(Layer.merge(layerOrchestratorProvided, layerCommandOutputHubProvided)),

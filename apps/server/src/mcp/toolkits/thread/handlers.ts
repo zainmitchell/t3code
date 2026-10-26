@@ -11,6 +11,7 @@ import * as Effect from "effect/Effect";
 import { modelSelectionCommandType } from "@t3tools/shared/model";
 import { formatThreadLink } from "@t3tools/shared/threadLinks";
 
+import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import {
   dispatchFailure,
@@ -90,8 +91,12 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
           code: "invalid_request",
           message: "The scheduled task was not found.",
         });
+      const scope = yield* McpInvocationContext.McpInvocationContext;
       const { task, threadId } = yield* scheduler
-        .runNow({ id: input.taskId })
+        .runNow(
+          { id: input.taskId },
+          scope.thread === undefined ? undefined : { callerThreadId: scope.thread.threadId },
+        )
         .pipe(Effect.mapError(unavailable));
       return {
         taskId: task.id,
@@ -120,6 +125,7 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
   t3_thread_fork: writesThread((input) =>
     Effect.gen(function* () {
       const { threads, projection } = yield* readThread(input.threadId);
+      const scope = yield* McpInvocationContext.McpInvocationContext;
       const commandId = yield* newCommandId();
       const targetThreadId = ThreadId.make(`${commandId}:fork`);
       const result = yield* threads
@@ -130,6 +136,10 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
           targetThreadId,
           sourcePoint: input.sourcePoint,
           ...(input.title === undefined ? {} : { title: input.title }),
+          // The fork is the calling agent's work, whichever thread it selected as context.
+          ...(scope.thread === undefined
+            ? {}
+            : { createdFrom: { type: "thread", threadId: scope.thread.threadId } }),
           createdBy: "agent",
           creationSource: "mcp",
         })

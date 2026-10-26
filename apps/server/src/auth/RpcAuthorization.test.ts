@@ -12,6 +12,8 @@ import {
   AuthSourceControlWriteScope,
   AuthTerminalReadScope,
   AuthTerminalOperateScope,
+  FactoryId,
+  FactoryReservationId,
   WS_METHODS,
   WsRpcGroup,
 } from "@t3tools/contracts";
@@ -369,5 +371,60 @@ it.effect("denies manual cleanup before the handler without settings permission"
       requiredPermission: AuthSettingsWriteScope,
     });
     expect(handled).toBe(false);
+  }).pipe(Effect.scoped),
+);
+
+it.effect("denies factory installation and takeover before the handler without their grants", () =>
+  Effect.gen(function* () {
+    const takeover = [WS_METHODS.factoryConfigure, WS_METHODS.factoryDisposeClaim] as const;
+    const group = WsRpcGroup.omit(
+      ...[...WsRpcGroup.requests.keys()].filter(
+        (tag): tag is Exclude<keyof typeof RPC_REQUIRED_SCOPES, (typeof takeover)[number]> =>
+          !(takeover as ReadonlyArray<string>).includes(tag),
+      ),
+    );
+    let handled = 0;
+    const handlers = Layer.mergeAll(
+      group.toLayerHandler(WS_METHODS.factoryConfigure, () =>
+        Effect.sync(() => {
+          handled++;
+          return {
+            factoryId: FactoryId.make("factory:alpha"),
+            enabled: false,
+            configurationRevision: 1,
+            policyRevision: "policy-r1",
+          };
+        }),
+      ),
+      group.toLayerHandler(WS_METHODS.factoryDisposeClaim, () =>
+        Effect.sync(() => {
+          handled++;
+          return { disposed: true };
+        }),
+      ),
+    );
+    // Operating threads is not enough to name the command a factory's policy runs.
+    const operator = yield* RpcTest.makeClient(group).pipe(
+      Effect.provide(
+        Layer.mergeAll(handlers, RpcAuthorization.layer([AuthOrchestrationOperateScope])),
+      ),
+    );
+    expect(
+      yield* operator[WS_METHODS.factoryConfigure]({ configuration: "{}" }).pipe(Effect.flip),
+    ).toMatchObject({ requiredPermission: AuthSettingsWriteScope });
+    // Reading factories is not enough to dispose of another writer's claim.
+    const reader = yield* RpcTest.makeClient(group).pipe(
+      Effect.provide(
+        Layer.mergeAll(handlers, RpcAuthorization.layer([AuthOrchestrationReadScope])),
+      ),
+    );
+    expect(
+      yield* reader[WS_METHODS.factoryDisposeClaim]({
+        factoryId: FactoryId.make("factory:alpha"),
+        reservationId: FactoryReservationId.make("reservation:observed:1"),
+        reason: "authorized",
+      }).pipe(Effect.flip),
+    ).toMatchObject({ requiredPermission: AuthOrchestrationOperateScope });
+    expect(handled).toBe(0);
   }).pipe(Effect.scoped),
 );

@@ -1,4 +1,10 @@
-import { MessageId, ThreadId, OrchestratorMcpFailure, ProjectId } from "@t3tools/contracts";
+import {
+  CommandId,
+  MessageId,
+  ThreadId,
+  OrchestratorMcpFailure,
+  ProjectId,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
@@ -13,6 +19,7 @@ import * as ServerSettings from "../../../serverSettings.ts";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import { formatThreadLink } from "@t3tools/shared/threadLinks";
 import { resolveRuntimeMode } from "../../OrchestratorMcpService.ts";
+import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import { newCommandId, readCaller, resolveProjectId, unavailable } from "../../threadAccess.ts";
 import { ProjectToolkit } from "./tools.ts";
@@ -57,9 +64,18 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
     (input) => input,
     (input, { runtimeMode, interactionMode }) =>
       Effect.gen(function* () {
+        const scope = yield* McpInvocationContext.McpInvocationContext;
         const context = yield* readCaller();
         const { caller } = context;
-        const commandId = yield* newCommandId();
+        // A retry with the same key replays the first launch: the ids derive
+        // from the caller and the key, and the launch service replays a
+        // command it already accepted.
+        const commandId =
+          input.clientRequestId === undefined
+            ? yield* newCommandId()
+            : CommandId.make(
+                `mcp:launch:${encodeURIComponent(scope.requestNamespace)}:${encodeURIComponent(input.clientRequestId)}`,
+              );
         const threadId = ThreadId.make(commandId);
         const messageId = MessageId.make(commandId);
         const attachments = input.attachments ?? [];
@@ -90,6 +106,19 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
                 ),
               )).projectId
             : yield* resolveProjectId(context, input.projectId);
+        // Accepted creates skip mutable base/default-model preflights.
+        // Message intake still handles their replay and preparation.
+        const acceptedLaunch =
+          input.clientRequestId === undefined
+            ? undefined
+            : Option.getOrUndefined(
+                yield* ThreadLaunch.ThreadLaunchService.pipe(
+                  Effect.flatMap((launches) =>
+                    launches.getAcceptedLaunch({ commandId, threadId, projectId }),
+                  ),
+                  Effect.mapError(unavailable),
+                ),
+              );
         const readProject = Project.ProjectService.pipe(
           Effect.flatMap((projects) => projects.getById(projectId)),
           Effect.mapError(unavailable),
@@ -106,7 +135,7 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
         }
         // Reject unresolved base refs before accepting a launch; worktree provisioning happens later.
         const strategy = input.workspaceStrategy;
-        if (strategy?.type === "worktree")
+        if (acceptedLaunch === undefined && strategy?.type === "worktree")
           yield* ThreadLaunch.ThreadLaunchService.pipe(
             Effect.flatMap((launches) =>
               launches.checkWorktreeBase({ projectId, workspaceStrategy: strategy }),
@@ -140,6 +169,7 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
               )
             : undefined;
         const modelSelection =
+          acceptedLaunch?.modelSelection ??
           input.modelSelection ??
           caller?.modelSelection ??
           projectDefaults?.defaultModelSelection ??
@@ -165,6 +195,8 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
           runtimeMode: startedRuntimeMode,
           interactionMode,
           workspaceStrategy: input.workspaceStrategy ?? { type: "root" },
+          // A launch with no message still works for the calling thread.
+          ...(caller === undefined ? {} : { createdFrom: { type: "thread", threadId: caller.id } }),
           ...(input.message === undefined && attachments.length === 0
             ? {}
             : {

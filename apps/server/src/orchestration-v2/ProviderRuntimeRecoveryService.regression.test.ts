@@ -7,6 +7,7 @@ import {
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import { expect, it } from "vite-plus/test";
 
 import * as EffectWorker from "./EffectWorker.ts";
@@ -65,6 +66,7 @@ it("uses the thread provider for stale background work without provider threads"
           runRecoveryOnce: Effect.succeed(false),
         }),
         Layer.mock(EffectOutbox.EffectOutboxV2)({
+          get: () => Effect.succeed(Option.none()),
           reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
         }),
       ),

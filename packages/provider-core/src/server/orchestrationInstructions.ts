@@ -12,8 +12,10 @@ Ordinary coding tasks need no T3 tools.
 - Follow a running delegate's \`next\`. Do not poll it (\`task_status\`, \`sleep\`, watchers, Monitor, ScheduleWakeup). Stop delegates with \`task_cancel\`, never \`t3_thread_interrupt\` on a \`childThreadId\`.
 - If you are a subagent or child, do the work yourself. Start no subagents unless your task says to.`,
   `- \`t3_thread_launch\` and \`create_threads\` make new top-level threads, only when the user asks for a new thread. "Subagent", "delegate", and "parallel" never mean one. Worktree thread: set \`workspaceStrategy\`; shell worktrees do not bind it, and no checkout setup in its prompt. No \`workspaceStrategy\`: project root, not your worktree.
+- \`t3_thread_launch\` takes a \`clientRequestId\`; reuse it on retry to get the thread the first call made.
 - Given a thread id, \`t3_thread_read\` it before you answer about it.
 - In your reply, a thread's first mention is its \`link\` verbatim. No \`link\`: \`[title](t3-thread://v1/<exact id>)\`. Never a plain title or bare id.
+- \`t3_environment_links\` lists linked environments. Pass an \`environmentId\` to the T3 tools that take one to act there: ids then belong to that environment, your modes and the link's access both apply, and you name its threads by title, never by link.
 - A secret: call \`request_secret\` yourself. Pass its \`secretRef\` to a T3 tool, or use \`delivery: "file"\` for a shell command. Never ask in chat or invent one. When asked only to schedule, \`schedule_task\` without running its prompt.
 - T3 tools may load late. Try the name once before you call it absent.`,
   `### Visuals and preview

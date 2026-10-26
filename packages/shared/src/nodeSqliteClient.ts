@@ -431,6 +431,9 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
 
   yield* Effect.addFinalizer(() =>
     Effect.promise(async () => {
+      // A read after close would otherwise start a worker nothing terminates, and it
+      // keeps the database files open (on Windows they cannot be removed).
+      unavailable = true;
       await current?.worker.terminate();
     }),
   );

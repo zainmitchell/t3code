@@ -2,6 +2,7 @@ import {
   CheckpointId,
   CheckpointScopeId,
   CommandId,
+  FactoryReservationId,
   MessageId,
   NodeId,
   ProviderSessionId,
@@ -119,6 +120,19 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
     type: Schema.Literal("delegated-tasks.stop"),
     reason: Schema.optional(Schema.String),
   }),
+  Schema.Struct({
+    type: Schema.Literal("factory-claim.write"),
+    reservationId: FactoryReservationId,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("factory-execution.prepare"),
+    reservationId: FactoryReservationId,
+    runId: RunId,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("factory-operation.apply"),
+    operationId: Schema.String,
+  }),
 ]);
 export type OrchestrationEffectRequestV2 = typeof OrchestrationEffectRequestV2.Type;
 
@@ -133,6 +147,13 @@ export const REPLAY_SAFE_EFFECT_TYPES_AFTER_PROCESS_LOSS = [
   "attachment.cleanup",
   "thread-title.generate",
   "delegated-tasks.stop",
+  // Reads durable claim state before any request, so a replay never repeats a send.
+  "factory-claim.write",
+  // Its workspace intent is durable before any workspace work, so a replay after that intent
+  // holds the claim instead of preparing again.
+  "factory-execution.prepare",
+  // Reads its write back by stable identity before writing, so a replay never repeats it.
+  "factory-operation.apply",
 ] as const satisfies ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
 
 export const PROCESS_BOUND_EFFECT_TYPES = [
@@ -207,6 +228,10 @@ export interface EffectOutboxV2Shape {
   ) => Effect.Effect<Option.Option<OrchestrationEffectV2>, EffectOutboxError>;
   readonly listByCommandId: (
     commandId: CommandId,
+  ) => Effect.Effect<ReadonlyArray<OrchestrationEffectV2>, EffectOutboxError>;
+  /** Every provider start and restart effect still held for the thread, whatever its command. */
+  readonly listLaunchesForThread: (
+    threadId: ThreadId,
   ) => Effect.Effect<ReadonlyArray<OrchestrationEffectV2>, EffectOutboxError>;
   readonly cancelUnsettled: (input: {
     readonly threadId: ThreadId;
@@ -440,6 +465,22 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
             isEffectOutboxError(cause)
               ? cause
               : new EffectOutboxError({ operation: "list", cause }),
+          ),
+        ),
+      listLaunchesForThread: (threadId) =>
+        sql<EffectRow>`
+          SELECT *
+          FROM orchestration_v2_effect_outbox
+          WHERE thread_id = ${threadId}
+            AND effect_type IN ('provider-turn.start', 'provider-turn.restart')
+          ORDER BY created_at ASC, effect_id ASC
+        `.pipe(
+          NodeSqliteClient.readOnly,
+          Effect.flatMap((rows) => decodeRows("list-launches", rows)),
+          Effect.mapError((cause) =>
+            isEffectOutboxError(cause)
+              ? cause
+              : new EffectOutboxError({ operation: "list-launches", cause }),
           ),
         ),
       cancelUnsettled: Effect.fn("EffectOutbox.cancelUnsettled")(

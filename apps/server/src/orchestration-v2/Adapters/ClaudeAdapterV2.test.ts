@@ -2945,6 +2945,12 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         assert.equal(yield* openedToolSearch("{}", worktree), "true");
         yield* rootLocal("false");
         assert.isUndefined(yield* openedToolSearch(userAuto, worktree));
+        assert.equal(
+          yield* openedToolSearch(userAuto, worktree).pipe(
+            Effect.provideService(HostProcess.Platform, "win32"),
+          ),
+          "true",
+        );
         assert.isUndefined(yield* openedToolSearch(userAuto, path.join(repo, "packages", "app")));
 
         // Project settings beat user settings, and the process env applies only when no file sets it.
@@ -2965,6 +2971,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           "true",
         );
       }).pipe(
+        Effect.provideService(HostProcess.Platform, "linux"),
         Effect.provide(
           Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
         ),

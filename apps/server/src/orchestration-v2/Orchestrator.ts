@@ -22,6 +22,7 @@ import {
   ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE,
   type ChatAttachment,
   CommandId,
+  FactoryReservationId,
   type GuestMessageId,
   isOrchestrationV2WorkActive,
   isProviderNativeSubagentThread,
@@ -73,6 +74,7 @@ import {
   pendingBackgroundTurnItems,
 } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 import * as Context from "effect/Context";
+import * as SqlClient from "effect/sql/SqlClient";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -108,7 +110,8 @@ import {
   isBufferedProviderNotification,
   isUndeliveredMailboxSteer,
 } from "./NotificationMailbox.ts";
-import { EventSinkV2 } from "./EventSink.ts";
+import * as FactoryStore from "../factory/FactoryStore.ts";
+import { EventSinkFactoryReservationRefusedError, EventSinkV2 } from "./EventSink.ts";
 import {
   decideGuestMessageSend,
   guestShareAfterCancelledSend,
@@ -255,6 +258,20 @@ export class OrchestratorThreadAboveModeLimitError extends Schema.TaggedError<Or
   }
 }
 
+export class OrchestratorFactoryReservationRefusedError extends Schema.TaggedError<OrchestratorFactoryReservationRefusedError>()(
+  "OrchestratorFactoryReservationRefusedError",
+  {
+    commandId: CommandId,
+    commandType: Schema.String,
+    refusal: EventSinkFactoryReservationRefusedError.fields.refusal,
+    cause: EventSinkFactoryReservationRefusedError,
+  },
+) {
+  override get message(): string {
+    return `The factory refused to reserve the execution this command starts (${this.refusal}).`;
+  }
+}
+
 export class OrchestratorCommandPreviouslyRejectedError extends Schema.TaggedError<OrchestratorCommandPreviouslyRejectedError>()(
   "OrchestratorCommandPreviouslyRejectedError",
   {
@@ -303,6 +320,7 @@ export const OrchestratorV2Error = Schema.Union([
   OrchestratorCommandIdConflictError,
   OrchestratorSubagentThreadReadOnlyError,
   OrchestratorThreadAboveModeLimitError,
+  OrchestratorFactoryReservationRefusedError,
 ]);
 export type OrchestratorV2Error = typeof OrchestratorV2Error.Type;
 
@@ -408,6 +426,12 @@ export interface OrchestratorV2Shape {
   readonly getThreadEventSequence: (
     threadId: ThreadId,
   ) => Effect.Effect<number, OrchestratorV2Error>;
+  /** Committed history at a fixed sequence, without subscribing to live events. */
+  readonly readStoredEvents: (input: {
+    readonly threadId: ThreadId;
+    readonly throughSequence: number;
+    readonly eventType: OrchestrationV2DomainEvent["type"];
+  }) => Stream.Stream<OrchestrationV2StoredEvent, OrchestratorV2Error>;
   readonly streamStoredEvents: Stream.Stream<OrchestrationV2StoredEvent, OrchestratorV2Error>;
   readonly streamStoredEventsFrom: (input?: {
     readonly threadId?: ThreadId;
@@ -420,6 +444,12 @@ export interface OrchestratorV2Shape {
 export class OrchestratorV2 extends Context.Service<OrchestratorV2, OrchestratorV2Shape>()(
   "t3/orchestration-v2/Orchestrator/OrchestratorV2",
 ) {}
+
+/** Set while a factory execution's own start is planned, before its binding is committed. */
+const PlanningFactoryExecution = Context.Reference<boolean>(
+  "t3/orchestration-v2/Orchestrator/PlanningFactoryExecution",
+  { defaultValue: () => false },
+);
 
 /** Run ordinals can skip values: a queued run moves past newer runs when it starts. */
 function nextRunOrdinal(projection: Pick<OrchestrationV2ThreadProjection, "runs">): number {
@@ -525,6 +555,8 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "thread.created.record":
       return command.parentThreadId;
     case "secret_request.record":
+    case "factory.execution.start":
+    case "factory.claim.settle":
       return command.threadId;
     case "thread.fork":
     case "thread.merge_back":
@@ -613,6 +645,15 @@ function isBlockingRun(run: OrchestrationV2Run): boolean {
 function hasLiveRun(projection: Pick<OrchestrationV2ThreadProjection, "runs">): boolean {
   return projection.runs.some(
     (run) => run.status === "preparing" || run.status === "starting" || run.status === "running",
+  );
+}
+
+/** A queued run cancelled before it started owns no work, so Stop never reaches it. */
+function latestDequeuedRun(
+  runs: ReadonlyArray<OrchestrationV2Run>,
+): OrchestrationV2Run | undefined {
+  return runs.findLast(
+    (run) => run.status !== "queued" && !(run.status === "cancelled" && run.startedAt === null),
   );
 }
 
@@ -948,6 +989,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const projects = yield* ProjectStore.ProjectStoreV2;
   const projectionStore = yield* ProjectionStoreV2;
   const effectOutbox = yield* EffectOutbox.EffectOutboxV2;
+  const factoryStore = yield* FactoryStore.FactoryStore;
   const nextTurnItemOrdinal = (
     projection: Pick<OrchestrationV2ThreadProjection, "thread"> &
       Partial<Pick<OrchestrationV2ThreadProjection, "turnItems">>,
@@ -1001,25 +1043,33 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       ),
     );
 
-  const providerSessionIdFor = (input: {
+  /**
+   * A factory execution's provider process starts inside its own run's container, so the
+   * execution never shares a session that other threads' work runs in.
+   */
+  const isFactoryExecution = Effect.fnUntraced(function* (threadId: ThreadId) {
+    if (yield* PlanningFactoryExecution) return true;
+    const binding = yield* factoryStore.bindingForThread(threadId);
+    return Option.isSome(binding) && FactoryStore.isNativeReservation(binding.value);
+  });
+
+  const providerSessionIdFor = Effect.fnUntraced(function* (input: {
     readonly adapter: ProviderAdapter.ProviderAdapterV2["Service"];
     readonly providerInstanceId: ProviderInstanceId;
     readonly threadId: ThreadId;
-  }) =>
-    input.adapter.getCapabilities().pipe(
-      Effect.flatMap((capabilities) =>
-        capabilities.sessions.supportsMultipleProviderThreadsPerSession
-          ? Effect.succeed(
-              idAllocator.derive.providerSession({
-                providerInstanceId: input.providerInstanceId,
-              }),
-            )
-          : idAllocator.allocate.providerSession({
-              providerInstanceId: input.providerInstanceId,
-              threadId: input.threadId,
-            }),
-      ),
-    );
+  }) {
+    const capabilities = yield* input.adapter.getCapabilities();
+    if (
+      capabilities.sessions.supportsMultipleProviderThreadsPerSession &&
+      !(yield* isFactoryExecution(input.threadId))
+    ) {
+      return idAllocator.derive.providerSession({ providerInstanceId: input.providerInstanceId });
+    }
+    return yield* idAllocator.allocate.providerSession({
+      providerInstanceId: input.providerInstanceId,
+      threadId: input.threadId,
+    });
+  });
 
   const enforceCommandPolicy =
     (command: OrchestrationV2Command) =>
@@ -7309,6 +7359,202 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     },
   );
 
+  // A factory execution has no parent run: admission must not need a live coordinator turn.
+  const dispatchFactoryExecutionStart = Effect.fn("orchestrationV2.dispatch.factoryExecutionStart")(
+    function* (
+      command: Extract<OrchestrationV2ServerCommand, { readonly type: "factory.execution.start" }>,
+      events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+      effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
+    ) {
+      const creation = { createdBy: "agent", creationSource: "server" } as const;
+      yield* dispatchThreadCreate(
+        {
+          type: "thread.create",
+          ...creation,
+          commandId: command.commandId,
+          threadId: command.threadId,
+          projectId: command.projectId,
+          title: command.title,
+          modelSelection: command.modelSelection,
+          runtimeMode: command.runtimeMode,
+          interactionMode: command.interactionMode,
+          branch: null,
+          worktreePath: null,
+        },
+        events,
+      );
+      // A decision that claims its tracker item starts nothing here: the claim is written and
+      // read back first, and its verifying commit sends the first message.
+      if (command.admission.claim !== undefined) {
+        const reservationId = FactoryReservationId.make(`reservation:${command.commandId}`);
+        yield* Ref.update(effects, (existing) => [
+          ...existing,
+          {
+            id: `effect:factory-claim.write:${reservationId}`,
+            commandId: command.commandId,
+            threadId: command.threadId,
+            request: { type: "factory-claim.write" as const, reservationId },
+          },
+        ]);
+        return;
+      }
+      yield* dispatchMessage(
+        {
+          type: "message.dispatch",
+          ...creation,
+          commandId: command.commandId,
+          threadId: command.threadId,
+          messageId: idAllocator.derive.delegatedTaskMessage({ commandId: command.commandId }),
+          text: command.prompt,
+          attachments: [],
+          modelSelection: command.modelSelection,
+          dispatchMode:
+            command.workspaceStrategy === undefined
+              ? { type: "start_immediately" }
+              : { type: "defer_start", workspaceStrategy: command.workspaceStrategy },
+        },
+        events,
+        effects,
+      ).pipe(Effect.provideService(PlanningFactoryExecution, true));
+    },
+  );
+
+  /** Sends a claimed execution's first message, in the commit that verifies its claim. */
+  const dispatchFactoryClaimSettle = Effect.fn("orchestrationV2.dispatch.factoryClaimSettle")(
+    function* (
+      command: Extract<OrchestrationV2ServerCommand, { readonly type: "factory.claim.settle" }>,
+      events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+      effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
+    ) {
+      yield* dispatchMessage(
+        {
+          type: "message.dispatch",
+          createdBy: "agent",
+          creationSource: "server",
+          commandId: command.commandId,
+          threadId: command.threadId,
+          messageId: idAllocator.derive.delegatedTaskMessage({
+            commandId: command.launch.messageCommandId,
+          }),
+          text: command.launch.prompt,
+          attachments: [],
+          modelSelection: command.launch.modelSelection,
+          dispatchMode:
+            command.launch.workspaceStrategy === undefined
+              ? { type: "start_immediately" }
+              : { type: "defer_start", workspaceStrategy: command.launch.workspaceStrategy },
+        },
+        events,
+        effects,
+      );
+      if (command.launch.workspaceStrategy === undefined) return;
+      // The run waits in `preparing`; this commit also hands it to the claim's workspace step,
+      // which authorizes first use before any workspace work.
+      const created = (yield* Ref.get(events)).find((event) => event.type === "run.created");
+      if (created?.type !== "run.created") {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "The claimed execution's first message created no run.",
+        });
+      }
+      yield* Ref.update(effects, (existing) => [
+        ...existing,
+        {
+          id: `effect:factory-execution.prepare:${created.payload.id}`,
+          commandId: command.commandId,
+          threadId: command.threadId,
+          request: {
+            type: "factory-execution.prepare",
+            reservationId: command.reservationId,
+            runId: created.payload.id,
+          },
+        } satisfies PendingOrchestrationEffectV2,
+      ]);
+    },
+  );
+
+  /**
+   * Factory executions come only from trusted native identities: the thread's recorded factory
+   * origin, lineage parent, server-set sender or scheduled task origin. Callers cannot opt out; a
+   * plain conversation finds no origin, and a bound thread continues its execution. Untraced: it
+   * runs inside dispatch.withReceipt's span.
+   */
+  const factoryExecutionsForPlan = Effect.fnUntraced(function* (
+    command: OrchestrationV2ServerCommand,
+    planned: ReadonlyArray<OrchestrationV2DomainEvent>,
+  ) {
+    const executions: Array<FactoryStore.ReserveExecutionInput> = [];
+    // A claiming admission reserves its execution before any run exists: the run it will start
+    // has a derived id, and the claim must hold the unit before anything is written or started.
+    if (command.type === "factory.execution.start" && command.admission.claim !== undefined) {
+      const runId = idAllocator.derive.run({ threadId: command.threadId, ordinal: 1 });
+      executions.push({
+        commandId: command.commandId,
+        executionThreadId: command.threadId,
+        runId,
+        taskNodeId: idAllocator.derive.rootNode({ runId }),
+        modelSelection: command.modelSelection,
+        origin: { type: "admission", admission: command.admission },
+      });
+    }
+    for (const event of planned) {
+      if (event.type !== "run.created") continue;
+      const run = event.payload;
+      const binding = {
+        commandId: command.commandId,
+        executionThreadId: run.threadId,
+        runId: run.id,
+        taskNodeId:
+          planned.flatMap((candidate) =>
+            candidate.type === "subagent.updated" &&
+            candidate.payload.childThreadId === run.threadId
+              ? [candidate.payload.id]
+              : [],
+          )[0] ??
+          run.rootNodeId ??
+          idAllocator.derive.rootNode({ runId: run.id }),
+        modelSelection: run.modelSelection,
+      };
+      if (
+        command.type === "factory.execution.start" &&
+        command.admission.claim === undefined &&
+        run.threadId === command.threadId &&
+        run.ordinal === 1
+      ) {
+        executions.push({
+          ...binding,
+          origin: { type: "admission", admission: command.admission },
+        });
+        continue;
+      }
+      const created = planned.find(
+        (candidate) => candidate.type === "thread.created" && candidate.threadId === run.threadId,
+      );
+      const lineageParent =
+        created?.type === "thread.created"
+          ? created.payload.lineage.parentThreadId
+          : (yield* projectionStore.getThread(run.threadId)).lineage.parentThreadId;
+      const sender = command.type === "message.dispatch" ? command.senderThreadId : undefined;
+      const scheduledTaskId =
+        command.type === "message.dispatch" ? (command.scheduledTaskId ?? null) : null;
+      const ownerThreadIds = [
+        ...(lineageParent === null ? [] : [lineageParent]),
+        ...(sender === undefined || sender === run.threadId ? [] : [sender]),
+      ];
+      executions.push({
+        ...binding,
+        origin: {
+          type: "descendant",
+          ownerThreadIds,
+          scheduledTaskId,
+          firstRun: run.ordinal === 1,
+        },
+      });
+    }
+    return executions;
+  });
+
   const recordSubagentFollowup = Effect.fnUntraced(function* (
     command: Extract<OrchestrationV2Command, { readonly type: "message.dispatch" }>,
     events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
@@ -8657,8 +8903,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         candidate.type === "command_execution" &&
         candidate.input === WORKSPACE_PREPARATION_INPUT,
     );
+    // A run a runtime's own stop cancelled while it was preparing is retried only by factory
+    // recovery. The event sink reserves this command id prefix for it: on a claimed thread the id
+    // must name the claim's run and its obligation's owner, and on any other thread it is refused.
+    const current =
+      command.type !== "prepared-run.retry"
+        ? run?.status === "preparing"
+        : run?.status === "failed" ||
+          ((run?.status === "cancelled" || run?.status === "interrupted") &&
+            command.commandId.startsWith("factory-recovery:"));
     if (
-      run?.status !== (command.type === "prepared-run.retry" ? "failed" : "preparing") ||
+      !current ||
+      run === undefined ||
       attempt === undefined ||
       rootNode === undefined ||
       providerThread === undefined ||
@@ -8910,10 +9166,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         candidate.status === "failed" &&
         candidate.failure.code === ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE,
     );
+    // A failed preparation left its failure item; one a runtime's stop cancelled left none.
     if (
       state === null ||
       state.run.workspacePreparation === undefined ||
-      failureItem === undefined ||
+      (failureItem === undefined &&
+        state.run.status !== "cancelled" &&
+        state.run.status !== "interrupted") ||
       projection.thread.archivedAt !== null ||
       projection.thread.deletedAt !== null
     ) {
@@ -8939,11 +9198,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       providerInstanceId: state.run.providerInstanceId,
       occurredAt: now,
     };
-    yield* emitEvent({
-      ...scope,
-      type: "turn-item.updated",
-      payload: { ...failureItem, status: "cancelled", updatedAt: now },
-    });
+    if (failureItem !== undefined) {
+      yield* emitEvent({
+        ...scope,
+        type: "turn-item.updated",
+        payload: { ...failureItem, status: "cancelled", updatedAt: now },
+      });
+    }
     yield* emitEvent({
       ...scope,
       type: "turn-item.updated",
@@ -9895,7 +10156,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ? undefined
         : projection.providerThreads.find((candidate) => candidate.id === run?.providerThreadId);
     const hasBackgroundWork =
-      run?.id === projection.runs.findLast((candidate) => candidate.status !== "queued")?.id &&
+      run?.id === latestDequeuedRun(projection.runs)?.id &&
       derivePendingBackgroundWork({
         latestRun: run,
         providerThreads: projection.providerThreads,
@@ -10364,7 +10625,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   );
 
   const dispatchThreadStop = Effect.fn("Orchestrator.dispatchThreadStop")(function* (
-    command: Extract<OrchestrationV2ServerCommand, { readonly type: "thread.stop" }>,
+    // Client Stops fit this internal shape without its retry bound.
+    command: Extract<OrchestrationV2InternalCommand, { readonly type: "thread.stop" }>,
     events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
     effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
   ) {
@@ -10387,7 +10649,27 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       )
         ? Effect.void
         : Ref.update(effects, (existing) => [...existing, delegatedTasksStopEffect(command)]);
-    const latestRun = projection.runs.findLast((run) => run.status !== "queued");
+    const latestRun = latestDequeuedRun(projection.runs);
+    if (command.throughSequence !== undefined && latestRun !== undefined) {
+      // A queued run already belonged to Stop even if it started before the delegated walk.
+      const existed = yield* eventSink
+        .read({
+          threadId: command.threadId,
+          throughSequence: command.throughSequence,
+          eventType: "run.created",
+        })
+        .pipe(
+          Stream.runFold(
+            () => false,
+            (found, stored) => found || stored.event.runId === latestRun.id,
+          ),
+          Effect.mapError(
+            (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
+          ),
+        );
+      if (!existed) return undefined;
+      // Partial retries keep queue/watch changes thread-wide while the original run is current.
+    }
     const target =
       projection.runs.findLast(
         (run) =>
@@ -11873,6 +12155,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       case "delegated_task.request":
         yield* dispatchDelegatedTaskRequest(command, events, effects);
         break;
+      case "factory.execution.start":
+        yield* dispatchFactoryExecutionStart(command, events, effects);
+        break;
+      case "factory.claim.settle":
+        yield* dispatchFactoryClaimSettle(command, events, effects);
+        break;
       case "delegated_task.wake-policy":
         yield* dispatchDelegatedTaskWakePolicy(command, events);
         break;
@@ -11946,6 +12234,33 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             }),
         ),
       );
+      if (
+        command.type === "message.dispatch" &&
+        command.dispatchMode?.type === "defer_start" &&
+        (yield* DispatchModeLimit) !== undefined
+      ) {
+        const runCreated = storedEvents.find(
+          (stored) => stored.event.type === "run.created",
+        )?.event;
+        if (runCreated?.type === "run.created") {
+          const current = yield* projectionStore
+            .getThreadRecords(command.threadId, ["runs"])
+            .pipe(
+              Effect.mapError(
+                (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
+              ),
+            );
+          // Replaying this receipt can resume workspace preparation, so it must
+          // respect the caller's current ceiling just like a fresh dispatch.
+          if (
+            current.runs.some(
+              (run) => run.id === runCreated.payload.id && run.status === "preparing",
+            )
+          ) {
+            yield* refuseAboveDispatchModeLimit(command, command.threadId, current.thread);
+          }
+        }
+      }
       if (command.type === "queue.resume" || command.type === "queued-run.start") {
         yield* mapDispatchError(command)(
           startNextQueuedRun(
@@ -12031,7 +12346,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       // A settle that ended nothing still records its receipt: a replayed Stop
       // effect then finds it instead of settling work that appeared since.
       const { resultSequence, inserted } = yield* Effect.gen(function* () {
-        const sequence = yield* eventSink.latestSequence({ threadId: commandThreadId(command) });
+        // Stop receipts also bound other threads; other commands keep their thread cursor.
+        const sequence = yield* eventSink.latestSequence(
+          command.type === "thread.stop" ? undefined : { threadId: commandThreadId(command) },
+        );
         const inserted = yield* commandReceipts.insertIfAbsent({
           commandId: command.commandId,
           threadId: commandThreadId(command),
@@ -12059,6 +12377,17 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       } satisfies OrchestratorV2DispatchResult;
     }
     const acceptedAt = plan.events.at(-1)?.occurredAt ?? (yield* DateTime.now);
+    const factoryExecutions = yield* factoryExecutionsForPlan(command, plan.events).pipe(
+      Effect.mapError(
+        (cause) => new OrchestratorProjectionError({ threadId: commandThreadId(command), cause }),
+      ),
+    );
+    const factoryOrigins =
+      command.type === "thread.create" && command.createdFrom !== undefined
+        ? [{ threadId: command.threadId, createdFrom: command.createdFrom }]
+        : command.type === "thread.fork" && command.createdFrom !== undefined
+          ? [{ threadId: command.targetThreadId, createdFrom: command.createdFrom }]
+          : [];
     const committed = yield* eventSink
       .commitCommand({
         commandId: command.commandId,
@@ -12070,15 +12399,51 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ...(plan.cancelUnsettledEffects === undefined
           ? {}
           : { cancelUnsettledEffects: plan.cancelUnsettledEffects }),
+        ...(factoryExecutions.length === 0 ? {} : { factoryExecutions }),
+        ...(factoryOrigins.length === 0 ? {} : { factoryOrigins }),
+        ...(command.type === "factory.execution.start" && command.admission.claim !== undefined
+          ? {
+              factoryClaimRegistration: {
+                threadId: command.threadId,
+                admission: command.admission,
+                claim: command.admission.claim,
+                launch: {
+                  messageCommandId: command.commandId,
+                  prompt: command.prompt,
+                  modelSelection: command.modelSelection,
+                  ...(command.workspaceStrategy === undefined
+                    ? {}
+                    : { workspaceStrategy: command.workspaceStrategy }),
+                },
+              },
+            }
+          : {}),
+        ...(command.type === "factory.claim.settle"
+          ? {
+              factoryClaimSettlement: {
+                reservationId: command.reservationId,
+                attempt: command.attempt,
+                commentId: command.commentId,
+                commentDigest: command.commentDigest,
+                messageCommandId: command.launch.messageCommandId,
+              },
+            }
+          : {}),
       })
       .pipe(
-        Effect.mapError(
-          (cause) =>
-            new OrchestratorDispatchError({
-              commandId: command.commandId,
-              commandType: command.type,
-              cause,
-            }),
+        Effect.mapError((cause) =>
+          cause._tag === "EventSinkFactoryReservationRefusedError"
+            ? new OrchestratorFactoryReservationRefusedError({
+                commandId: command.commandId,
+                commandType: command.type,
+                refusal: cause.refusal,
+                cause,
+              })
+            : new OrchestratorDispatchError({
+                commandId: command.commandId,
+                commandType: command.type,
+                cause,
+              }),
         ),
       );
 
@@ -12498,6 +12863,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       eventSink
         .latestSequence({ threadId })
         .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause }))),
+    readStoredEvents: (input) =>
+      eventSink
+        .read(input)
+        .pipe(Stream.mapError((cause) => new OrchestratorDomainEventStreamError({ cause }))),
     streamStoredEvents: eventSink.stream().pipe(
       Stream.mapError(
         (cause) =>
@@ -12552,8 +12921,11 @@ export const layer: Layer.Layer<
   | RuntimePolicyV2
   | ServerSettings.ServerSettingsService
   | ThreadForkServiceV2
+  | SqlClient.SqlClient
 > = Layer.effect(OrchestratorV2, makeOrchestrator()).pipe(
   Layer.provide(ThreadCommandExecutor.layer),
+  // The factory store keeps no in-memory state, so a private instance shares the database rows.
+  Layer.provide(FactoryStore.layer),
 );
 
 const layerUnavailable: Layer.Layer<OrchestratorV2> = Layer.succeed(
@@ -12672,6 +13044,12 @@ const layerUnavailable: Layer.Layer<OrchestratorV2> = Layer.succeed(
         cause: "Orchestration V2 live runtime is not configured.",
       }),
     ),
+    readStoredEvents: () =>
+      Stream.fail(
+        new OrchestratorDomainEventStreamError({
+          cause: "Orchestration V2 live runtime is not configured.",
+        }),
+      ),
     streamStoredEventsFrom: () =>
       Stream.fail(
         new OrchestratorDomainEventStreamError({

@@ -2,6 +2,7 @@ import { OrchestrationDispatchCommandError } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as Orchestrator from "./orchestration-v2/Orchestrator.ts";
+import * as PeerLinks from "./peer/PeerLinks.ts";
 
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
@@ -37,6 +38,7 @@ import {
   ClientSurface,
   ClientWebDeployment,
   type DiscoveredLocalServerList,
+  FactoryOwnerError,
   type EditorId,
   type FileManagerRevealKind,
   type OrchestrationClientOrigin,
@@ -122,6 +124,9 @@ import * as ThreadMessageIntake from "./orchestration-v2/ThreadMessageIntake.ts"
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ScheduledTasks from "./scheduledTasks/ScheduledTaskService.ts";
 import * as SecretRequests from "./secrets/SecretRequests.ts";
+import * as FactoryClaimService from "./factory/FactoryClaimService.ts";
+import * as FactoryLifecycle from "./factory/FactoryLifecycle.ts";
+import { factoryStateView, transferView } from "./factory/factoryStateView.ts";
 import * as GuestShareService from "./guest/GuestShareService.ts";
 import {
   archivedShellStreamItemFromThreadShell,
@@ -1275,6 +1280,23 @@ export const layerWsRpc = (
       const providerSessionManager = yield* ProviderSessionManager.ProviderSessionManagerV2;
       const scheduledTasks = yield* ScheduledTasks.ScheduledTaskService;
       const secretRequests = yield* SecretRequests.SecretRequests;
+      const factoryLifecycle = yield* FactoryLifecycle.FactoryLifecycle;
+      const factoryClaims = yield* FactoryClaimService.FactoryClaimService;
+      // Who answered, as the server authenticated them: an owner's client or a host administrator.
+      const factoryActor = `session:${currentSession.subject}:${currentSession.sessionId}`;
+      // The owner needs the reason, which a lifecycle error carries as its cause.
+      const isFactoryLifecycleError = Schema.is(FactoryLifecycle.FactoryLifecycleError);
+      const isFactoryConfigurationInvalid = Schema.is(FactoryLifecycle.FactoryConfigurationInvalid);
+      const factoryOwnerFailure = (cause: unknown) =>
+        new FactoryOwnerError({
+          message: `The factory could not complete that: ${
+            isFactoryLifecycleError(cause)
+              ? `${cause.message} ${String(cause.cause)}`
+              : isFactoryConfigurationInvalid(cause)
+                ? cause.message
+                : String(cause)
+          }`.slice(0, 2_000),
+        });
       const guestShares = yield* GuestShareService.GuestShareService;
       const pullRequests = yield* PullRequestService.PullRequestService;
       const reviewGuides = yield* PullRequestReviewGuideService.PullRequestReviewGuideService;
@@ -1337,6 +1359,7 @@ export const layerWsRpc = (
       const storageCleanup = yield* StorageCleanup.StorageCleanup;
       const databaseStorage = yield* DatabaseStorage.DatabaseStorage;
       const serverSettings = yield* ServerSettings.ServerSettingsService;
+      const peerLinks = yield* PeerLinks.PeerLinks;
       const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
       const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
       const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
@@ -2190,6 +2213,86 @@ export const layerWsRpc = (
           Effect.annotateCurrentSpan({ "scheduled_task.id": input.id }).pipe(
             Effect.andThen(scheduledTasks.rotateWebhookToken(input)),
           ),
+        [WS_METHODS.factoryOverview]: (_input) =>
+          factoryLifecycle.overview().pipe(
+            Effect.map((factories) => ({
+              factories: factories.map(({ factoryId, state }) => ({
+                factoryId,
+                state: factoryStateView(state),
+              })),
+            })),
+            Effect.mapError(factoryOwnerFailure),
+          ),
+        // Every client on this transport is a person's own session or this host's administrator:
+        // agents reach the factory through MCP, where only the owner's own client may answer.
+        [WS_METHODS.factoryDecide]: (input) =>
+          factoryLifecycle.resolveReservedDecision({ ...input, by: factoryActor }).pipe(
+            Effect.map((resolved) => ({ resolved })),
+            Effect.mapError(factoryOwnerFailure),
+          ),
+        [WS_METHODS.factoryRejectOutcome]: (input) =>
+          factoryLifecycle.rejectOutcome({ ...input, by: factoryActor }).pipe(
+            Effect.map((rejected) => ({ rejected })),
+            Effect.mapError(factoryOwnerFailure),
+          ),
+        [WS_METHODS.factoryRevokeGrant]: (input) =>
+          factoryLifecycle.revokeGrant({ ...input, by: factoryActor }).pipe(
+            Effect.map((revoked) => ({ revoked })),
+            Effect.mapError(factoryOwnerFailure),
+          ),
+        [WS_METHODS.factoryRecoverRun]: (input) =>
+          factoryClaims.recoverInterruptedRun(input).pipe(
+            Effect.tap((result) =>
+              Effect.logInfo("Factory owner recovery of an interrupted run", {
+                ...input,
+                by: factoryActor,
+                ...result,
+              }),
+            ),
+            Effect.mapError(factoryOwnerFailure),
+          ),
+        [WS_METHODS.factoryConfigure]: (input) =>
+          factoryLifecycle.installConfiguration(input.configuration).pipe(
+            Effect.map((configuration) => ({
+              factoryId: configuration.factoryId,
+              enabled: configuration.enabled,
+              configurationRevision: configuration.revision,
+              policyRevision: configuration.policyRevision,
+            })),
+            Effect.mapError(factoryOwnerFailure),
+          ),
+        [WS_METHODS.factoryObserveClaims]: (input) =>
+          factoryLifecycle.observeClaims(input).pipe(
+            Effect.map((held) => ({
+              claims: held.flatMap((reservation) =>
+                reservation.origin === "observed"
+                  ? [
+                      {
+                        reservationId: reservation.reservationId,
+                        itemKey: reservation.itemKey,
+                        carrierKey: reservation.carrierKey,
+                      },
+                    ]
+                  : [],
+              ),
+            })),
+            Effect.mapError(factoryOwnerFailure),
+          ),
+        [WS_METHODS.factoryTransfer]: (input) =>
+          factoryLifecycle.transferLegacy({ ...input, by: factoryActor }).pipe(
+            Effect.map((result) => transferView(input.transferId, result)),
+            Effect.mapError(factoryOwnerFailure),
+          ),
+        [WS_METHODS.factoryRollbackTransfer]: (input) =>
+          factoryLifecycle.rollbackTransfer({ ...input, by: factoryActor }).pipe(
+            Effect.map((result) => transferView(input.transferId, result)),
+            Effect.mapError(factoryOwnerFailure),
+          ),
+        [WS_METHODS.factoryDisposeClaim]: (input) =>
+          factoryLifecycle.disposeObservedClaim({ ...input, by: factoryActor }).pipe(
+            Effect.map((disposed) => ({ disposed })),
+            Effect.mapError(factoryOwnerFailure),
+          ),
         [WS_METHODS.guestShareCreate]: (input) =>
           Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": input.threadId }).pipe(
             Effect.andThen(guestShares.create(input)),
@@ -2510,6 +2613,11 @@ export const layerWsRpc = (
         [WS_METHODS.serverRunStorageCleanup]: () => storageCleanup.runNow,
         [WS_METHODS.serverGetStorageCleanupReport]: () => storageCleanup.reports,
         [WS_METHODS.serverGetDatabaseStorage]: () => databaseStorage.status,
+        [WS_METHODS.peerLinksList]: (_input) =>
+          peerLinks.list.pipe(Effect.map((links) => ({ links }))),
+        [WS_METHODS.peerLinksLink]: (input) => peerLinks.link(input),
+        [WS_METHODS.peerLinksUnlink]: ({ environmentId }) =>
+          peerLinks.unlink(environmentId).pipe(Effect.map((removed) => ({ removed }))),
         [WS_METHODS.serverGetSettings]: (_input) =>
           serverSettings.getSettings.pipe(Effect.map(ServerSettings.redactServerSettingsForClient)),
         [WS_METHODS.serverUpdateSettings]:
@@ -3268,6 +3376,7 @@ export const layer = Layer.unwrap(
     const serverSelfUpdate = yield* ServerSelfUpdate.ServerSelfUpdate;
     const pullRequests = yield* PullRequestService.PullRequestService;
     const reviewGuides = yield* PullRequestReviewGuideService.PullRequestReviewGuideService;
+    const peerLinks = yield* PeerLinks.PeerLinks;
     const sql = yield* SqlClient.SqlClient;
     return HttpRouter.add(
       "GET",
@@ -3356,6 +3465,7 @@ export const layer = Layer.unwrap(
                   reviewGuides,
                 ),
               ),
+              Layer.provide(Layer.succeed(PeerLinks.PeerLinks, peerLinks)),
               Layer.provide(
                 SourceControlDiscovery.layer.pipe(
                   Layer.provide(

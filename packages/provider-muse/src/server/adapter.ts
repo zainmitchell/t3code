@@ -25,6 +25,7 @@ import {
 } from "@t3tools/contracts";
 import type { MuseSettings } from "../settings.ts";
 import { AgentScope } from "@t3tools/shared/AgentScope";
+import { ExecutionJoin } from "@t3tools/shared/ExecutionJoin";
 import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
@@ -66,6 +67,7 @@ import { isMuseUsageLimitFailure, museUsageLimitResetAt } from "./usageLimits.ts
 import {
   createMuseSdkHostEffect,
   museApprovalMode,
+  museLaunch,
   musePermissionProfile,
   museWorkspaceRoot,
   type createMuseSdkHost,
@@ -267,6 +269,8 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
   const fileSystem = yield* FileSystem.FileSystem;
   const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
   const agentScope = yield* AgentScope;
+  const executionJoin = yield* ExecutionJoin;
+  const runFork = Effect.runForkWith(yield* Effect.context<never>());
 
   const protocolError = (detail: string, payload?: unknown) =>
     new ProviderAdapter.ProviderAdapterProtocolError({
@@ -1664,15 +1668,36 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
           options.environment,
           mcpSession,
         );
-        const launch = yield* agentScope.wrap({
-          command: options.settings.binaryPath || "muse",
-          args: [],
-          name: "muse",
-          threadId: input.threadId,
-          env: environment,
-        });
+        const openError = (cause: unknown) =>
+          new ProviderAdapter.ProviderAdapterOpenSessionError({
+            driver: MUSE_PROVIDER,
+            providerSessionId: input.providerSessionId,
+            cause,
+          });
+        const binaryPath = options.settings.binaryPath || "muse";
+        // A contained thread starts Muse inside its run's container or not at all. The join
+        // runs nothing until it is admitted; a join never admitted fails the SDK's startup.
+        const contained = yield* executionJoin
+          .forThread(input.threadId)
+          .pipe(Effect.mapError(openError));
+        const ticket = Option.isNone(contained)
+          ? undefined
+          : yield* museLaunch(binaryPath, environment).pipe(
+              Effect.flatMap((native) => contained.value(native.command, native.args, "provider")),
+              Effect.mapError(openError),
+            );
+        const launch =
+          ticket === undefined
+            ? yield* agentScope.wrap({
+                command: binaryPath,
+                args: [],
+                name: "muse",
+                threadId: input.threadId,
+                env: environment,
+              })
+            : undefined;
         // Finalizers run in reverse order: reap detached work after closing the host.
-        const scopeUnit = launch.unit;
+        const scopeUnit = launch?.unit;
         const stopScope =
           scopeUnit === undefined ? Effect.void : yield* Effect.cached(agentScope.stop(scopeUnit));
         yield* Scope.addFinalizer(scope, stopScope);
@@ -1682,8 +1707,21 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
         const created = yield* Effect.acquireRelease(
           createMuseSdkHostEffect(
             {
-              binaryPath: launch.command,
-              launchArgs: launch.args,
+              binaryPath: launch?.command ?? binaryPath,
+              launchArgs: launch?.args ?? [],
+              ...(ticket === undefined
+                ? {}
+                : {
+                    launch: { command: ticket.command, args: ticket.args },
+                    onProcessSpawn: (pid: number | undefined) =>
+                      runFork(
+                        pid === undefined
+                          ? ticket.cancel
+                          : ticket
+                              .admit(pid, Effect.asVoid(Deferred.await(processExited)))
+                              .pipe(Effect.ignore),
+                      ),
+                  }),
               cwd,
               environment,
               runtimeMode: input.runtimePolicy.runtimeMode,

@@ -247,7 +247,10 @@ function useSettingsIndexSections(): SettingsListSection[] {
     },
     {
       title: "Automations",
-      rows: [page("SettingsScheduledTasks", "clock", "Scheduled tasks")],
+      rows: [
+        page("SettingsScheduledTasks", "clock", "Scheduled tasks"),
+        page("SettingsFactories", "hammer", "Factories"),
+      ],
     },
     {
       title: "Projects & threads",

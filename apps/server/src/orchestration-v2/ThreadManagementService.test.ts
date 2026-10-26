@@ -36,6 +36,31 @@ const layerReceiptsTest = CommandReceiptStore.layer.pipe(
   Layer.provide(SqlitePersistence.layerMemory),
 );
 
+// A receipt read that fails is not a missing receipt: callers would redo work the orchestrator
+// may already have accepted.
+it.effect("preserves receipt-read failures instead of reporting receipt absence", () => {
+  const commandId = CommandId.make("command:receipt-read-failure");
+  const failure = new CommandReceiptStore.CommandReceiptStoreReadError({
+    commandId,
+    cause: new Error("Receipt storage unavailable."),
+  });
+  const layerTest = ThreadManagementService.layer.pipe(
+    Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+    Layer.provide(Layer.mock(Orchestrator.OrchestratorV2)({})),
+    Layer.provide(ServerSettings.layerTest()),
+    Layer.provide(
+      Layer.mock(CommandReceiptStore.CommandReceiptStoreV2)({
+        getByCommandId: () => Effect.fail(failure),
+      }),
+    ),
+  );
+  return Effect.gen(function* () {
+    const threads = yield* ThreadManagementService.ThreadManagementService;
+    const result = yield* Effect.result(threads.hasReceipt(commandId));
+    expect(result).toMatchObject({ _tag: "Failure", failure });
+  }).pipe(Effect.provide(layerTest));
+});
+
 const layerDispatchChokepointTest =
   (settingsLayer: ReturnType<typeof ServerSettings.layerTest>) => (dispatched: Array<string>) =>
     ThreadManagementService.layer.pipe(

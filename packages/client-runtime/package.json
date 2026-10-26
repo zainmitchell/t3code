@@ -51,6 +51,10 @@
       "types": "./src/promptLinks.ts",
       "default": "./src/promptLinks.ts"
     },
+    "./factory-decisions": {
+      "types": "./src/factoryDecisions.ts",
+      "default": "./src/factoryDecisions.ts"
+    },
     "./secret-request": {
       "types": "./src/secretRequest.ts",
       "default": "./src/secretRequest.ts"

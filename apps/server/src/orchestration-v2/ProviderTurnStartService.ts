@@ -31,6 +31,17 @@ import * as ProjectService from "../project/ProjectService.ts";
 import * as ProviderAuthService from "../provider/ProviderAuthService.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { makeIsManagedWorktreePath } from "../worktreesDirectory.ts";
+import {
+  executionAttempts,
+  FactoryExecutionCustodyUnknownError,
+  FactoryExecutionSelectionPinnedError,
+  readExecutionCustody,
+  START_REFUSAL_SIGNALS,
+} from "../factory/factoryCustody.ts";
+import * as FactoryClaimService from "../factory/FactoryClaimService.ts";
+import * as FactoryStore from "../factory/FactoryStore.ts";
+import * as FactoryExecutionGenerations from "../factory/FactoryExecutionGenerations.ts";
+import * as EffectOutbox from "./EffectOutbox.ts";
 import * as EventSink from "./EventSink.ts";
 import * as ContextHandoffService from "./ContextHandoffService.ts";
 import {
@@ -46,6 +57,7 @@ import { deliverContextHandoffs } from "./ContextHandoffDelivery.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProjectionStore from "./ProjectionStore.ts";
+import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import {
   knownProviderFailureMessage,
@@ -113,6 +125,11 @@ export const layer: Layer.Layer<
   | ProviderSessionManager.ProviderSessionManagerV2
   | RunExecutionService.RunExecutionServiceV2
   | RuntimePolicy.RuntimePolicyV2
+  | EffectOutbox.EffectOutboxV2
+  | ProviderAdapterRegistry.ProviderAdapterRegistryV2
+  | FactoryStore.FactoryStore
+  | FactoryClaimService.FactoryClaimService
+  | FactoryExecutionGenerations.FactoryExecutionGenerations
 > = Layer.effect(
   ProviderTurnStartServiceV2,
   Effect.gen(function* () {
@@ -126,6 +143,11 @@ export const layer: Layer.Layer<
     const gitWorkflow = yield* GitWorkflowService.GitWorkflowService;
     const projects = yield* ProjectService.ProjectService;
     const providerAuth = yield* ProviderAuthService.ProviderAuthService;
+    const factoryStore = yield* FactoryStore.FactoryStore;
+    const factoryClaims = yield* FactoryClaimService.FactoryClaimService;
+    const generations = yield* FactoryExecutionGenerations.FactoryExecutionGenerations;
+    const custodyContext =
+      yield* Effect.context<Effect.Services<ReturnType<typeof readExecutionCustody>>>();
     const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
     const providerSessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
     const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
@@ -478,6 +500,261 @@ export const layer: Layer.Layer<
               ...providerThread,
               status: providerThread.nativeThreadRef === null ? "not_loaded" : "idle",
               updatedAt: now,
+            },
+          });
+          return;
+        }
+      }
+      // Every path that would run a provider turn on a factory execution passes here, including
+      // a restart's new attempt on the same run, a queued follow-up and a retried or recovered
+      // start. These run before any workspace repair or session work, so a refused start changes
+      // nothing outside the run.
+      const binding = yield* factoryStore
+        .bindingForThread(projection.thread.id)
+        .pipe(Effect.mapError((cause) => new ProviderTurnStartError({ runId, cause })));
+      // A transferred legacy worker's thread starts no new turn: its custody is not T3's to
+      // extend, and the factory admits any further work on the item itself.
+      if (Option.isSome(binding) && binding.value.origin === "transferred") {
+        yield* settleRunBeforeStart({
+          signal: START_REFUSAL_SIGNALS.legacyCustody,
+          status: "failed",
+          now: yield* DateTime.now,
+          providerInstanceId: run.providerInstanceId,
+          itemProviderThreadId: providerThread.id,
+          item: {
+            type: "error",
+            title: "Transferred legacy work starts nothing",
+            failure: makeProviderFailure({
+              cause:
+                "This thread's legacy work was transferred to a factory, which admits new work.",
+              message:
+                "This thread's legacy work was transferred to a factory, which admits new work.",
+              class: "provider_error",
+            }),
+          },
+        });
+        return;
+      }
+      // A factory execution whose tracker claim is not verified starts nothing, however the run
+      // got here.
+      if (
+        Option.isSome(binding) &&
+        FactoryStore.isNativeReservation(binding.value) &&
+        !(yield* factoryStore
+          .isClaimReady(binding.value)
+          .pipe(Effect.mapError((cause) => new ProviderTurnStartError({ runId, cause }))))
+      ) {
+        yield* settleRunBeforeStart({
+          signal: START_REFUSAL_SIGNALS.claimNotReady,
+          status: "failed",
+          now: yield* DateTime.now,
+          providerInstanceId: run.providerInstanceId,
+          itemProviderThreadId: providerThread.id,
+          item: {
+            type: "error",
+            title: "Factory claim is not verified",
+            failure: makeProviderFailure({
+              cause: "The tracker claim for this factory execution is not verified.",
+              message: "The tracker claim for this factory execution is not verified.",
+              class: "provider_error",
+            }),
+          },
+        });
+        return;
+      }
+      // A claimed decision's first provider turn may run long after its verifying commit, so the
+      // claim, fences and tracker are read again. Only a worker that started (or may have) keeps
+      // its admitted pins: attempts with no start and no provider turn prove nothing about a
+      // process, so the custody fence below still applies to them.
+      const usedBefore = (candidate: { readonly id: string; readonly startedAt: unknown }) =>
+        candidate.startedAt !== null ||
+        projection.providerTurns.some((turn) => turn.runAttemptId === candidate.id);
+      // A message the user took back before it left the queue is no execution of this thread.
+      const neverDequeued = Option.isSome(binding)
+        ? yield* projectionStore.getNeverDequeuedRunIds(input.threadId)
+        : new Set<RunId>();
+      const requiresFirstUse = !executionAttempts(projection, neverDequeued).some(usedBefore);
+      if (Option.isSome(binding) && binding.value.origin === "admitted" && requiresFirstUse) {
+        const decision = yield* factoryClaims
+          .authorizeFirstUse(binding.value, {
+            type: "provider_start",
+            runId: run.id,
+            attemptId: attempt.id,
+          })
+          .pipe(Effect.mapError((cause) => new ProviderTurnStartError({ runId, cause })));
+        if (decision.type === "refused") {
+          const refused = decision.reason;
+          yield* settleRunBeforeStart({
+            signal: START_REFUSAL_SIGNALS.firstStartPrecondition,
+            status: "failed",
+            now: yield* DateTime.now,
+            providerInstanceId: run.providerInstanceId,
+            itemProviderThreadId: providerThread.id,
+            item: {
+              type: "error",
+              title: "Factory execution can no longer start",
+              failure: makeProviderFailure({
+                cause: refused,
+                message: `This factory execution may not start: ${refused}.`,
+                class: "provider_error",
+              }),
+            },
+          });
+          return;
+        }
+      }
+      // A run can reach here with a selection no admission saw (queued promotion re-applies a
+      // stored one), so the execution's pin is checked on every start, not only the first.
+      if (
+        Option.isSome(binding) &&
+        FactoryStore.isNativeReservation(binding.value) &&
+        !FactoryStore.samePinnedSelection(binding.value.modelSelection, run.modelSelection)
+      ) {
+        const refused = new FactoryExecutionSelectionPinnedError({
+          threadId: projection.thread.id,
+          runId,
+        });
+        yield* settleRunBeforeStart({
+          signal: START_REFUSAL_SIGNALS.selectionPinned,
+          status: "failed",
+          now: yield* DateTime.now,
+          providerInstanceId: run.providerInstanceId,
+          itemProviderThreadId: providerThread.id,
+          item: {
+            type: "error",
+            title: "Factory execution selection is pinned",
+            failure: makeProviderFailure({
+              cause: refused,
+              message: refused.message,
+              class: "provider_error",
+            }),
+          },
+        });
+        return;
+      }
+      // A cached session does not prove the turn joins the same native process (an adapter may
+      // open a new query inside it), so every other execution must be proven quiet first, unless
+      // this turn is proved to be that process's own continuation. Each run is created with its
+      // first attempt, so attempts cover every run.
+      let continuation = false;
+      if (executionAttempts(projection, neverDequeued).some((other) => other.id !== attempt.id)) {
+        if (Option.isSome(binding)) {
+          const judgedRunIds = new Set(
+            executionAttempts(projection, neverDequeued).map((other) => other.runId),
+          );
+          const judge = Effect.gen(function* () {
+            // Another run's container that this host holds and finds empty is ended first, so no
+            // join can reach it after it is judged.
+            for (const otherRunId of judgedRunIds) {
+              if (otherRunId !== run.id) yield* generations.closeIfQuiet(otherRunId);
+            }
+            return yield* readExecutionCustody(binding.value, {
+              excludingAttemptId: attempt.id,
+            }).pipe(Effect.provide(custodyContext));
+          });
+          let custody = yield* judge;
+          const sessionId = providerThread.providerSessionId;
+          // A provider-native wake (the CLI re-invoked the model in the live process for a finished
+          // background task) is this execution's own work only when the records prove it: the
+          // session is live here, the only live custody is background work and contained processes,
+          // and every live container of this reservation and thread was joined by this very session.
+          if (
+            message.createdBy === "agent" &&
+            message.creationSource === "provider" &&
+            FactoryStore.isNativeReservation(binding.value) &&
+            custody.state === "live" &&
+            custody.reasons.every(
+              (reason) => reason === "background_work" || reason === "contained_processes",
+            ) &&
+            sessionId !== null &&
+            (yield* providerSessions.isLive(sessionId))
+          ) {
+            const containers = yield* generations.observeExecution({
+              reservationId: binding.value.reservationId,
+              threadId: projection.thread.id,
+            });
+            const joinedBySession = (entry: (typeof containers)[number]) =>
+              (entry.generation.providerSessions ?? []).includes(sessionId);
+            continuation =
+              containers.every((entry) => entry.facts.type !== "unknown") &&
+              containers.some((entry) => entry.facts.type === "live" && joinedBySession(entry)) &&
+              containers.every((entry) => entry.facts.type !== "live" || joinedBySession(entry));
+          }
+          // The only thing still running may be this host's idle cached session: no turn, request,
+          // queue or roster is live. Closing it ends its provider process; once that has actually
+          // exited, everything left in the containers is judged again. Nothing live is closed.
+          if (
+            !continuation &&
+            custody.state === "live" &&
+            custody.reasons.every((reason) => reason === "contained_processes") &&
+            sessionId !== null &&
+            (yield* providerSessions.isLive(sessionId))
+          ) {
+            yield* providerSessions.close(sessionId).pipe(Effect.ignore);
+            for (const judgedRunId of judgedRunIds) {
+              yield* generations.awaitProviderExits(judgedRunId);
+            }
+            custody = yield* judge;
+          }
+          if (!continuation && custody.state !== "quiescent") {
+            const refused = new FactoryExecutionCustodyUnknownError({
+              threadId: projection.thread.id,
+              runId,
+              custody: custody.state,
+            });
+            yield* settleRunBeforeStart({
+              signal: START_REFUSAL_SIGNALS.custodyUnknown,
+              status: "failed",
+              now: yield* DateTime.now,
+              providerInstanceId: run.providerInstanceId,
+              itemProviderThreadId: providerThread.id,
+              item: {
+                type: "error",
+                title: "Factory execution custody is unknown",
+                failure: makeProviderFailure({
+                  cause: refused,
+                  message: refused.message,
+                  class: "provider_error",
+                }),
+              },
+            });
+            return;
+          }
+        }
+      }
+      // A factory run whose driver starts its processes through a container starts only inside one
+      // this host holds, so every process it starts is a member of it. A continuation runs in the
+      // live process, inside the container that process already joined.
+      if (
+        !continuation &&
+        Option.isSome(binding) &&
+        FactoryStore.isNativeReservation(binding.value) &&
+        FactoryExecutionGenerations.CONTAINED_DRIVERS.has(providerThread.driver)
+      ) {
+        const held = yield* Effect.exit(
+          generations.ensureHeld({
+            runId: run.id,
+            reservationId: binding.value.reservationId,
+            threadId: projection.thread.id,
+          }),
+        );
+        if (held._tag === "Failure") {
+          const cause = Cause.squash(held.cause);
+          yield* settleRunBeforeStart({
+            signal: START_REFUSAL_SIGNALS.containmentUnavailable,
+            status: "failed",
+            now: yield* DateTime.now,
+            providerInstanceId: run.providerInstanceId,
+            itemProviderThreadId: providerThread.id,
+            item: {
+              type: "error",
+              title: "Factory execution cannot be contained",
+              failure: makeProviderFailure({
+                cause,
+                message:
+                  "T3 could not create this factory execution's process container, so it will not start the provider outside one.",
+                class: "provider_error",
+              }),
             },
           });
           return;

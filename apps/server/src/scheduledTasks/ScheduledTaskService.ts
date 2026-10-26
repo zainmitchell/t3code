@@ -2,6 +2,7 @@ import {
   CommandId,
   MessageId,
   PROVIDER_SEND_TURN_MAX_INPUT_CHARS,
+  type ProjectId,
   ScheduledTask,
   ScheduledTaskError,
   ScheduledTaskId,
@@ -38,11 +39,14 @@ import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Result from "effect/Result";
+import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/sql/SqlClient";
 
+import * as CommandJobs from "../commandJobs/CommandJobs.ts";
+import * as FactoryStore from "../factory/FactoryStore.ts";
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
 import * as Metrics from "../observability/Metrics.ts";
@@ -229,8 +233,13 @@ export class ScheduledTaskService extends Context.Service<
   {
     readonly list: () => Effect.Effect<ScheduledTaskListResult, ScheduledTaskError>;
     readonly subscribeList: () => Stream.Stream<ScheduledTaskListResult, ScheduledTaskError>;
+    /**
+     * `callerThreadId` is the trusted thread an agent saves from. When that thread runs factory
+     * work, the schedule's fresh-thread runs are counted against the same factory execution.
+     */
     readonly upsert: (
       input: ScheduledTaskUpsertInput,
+      options?: { readonly callerThreadId?: ThreadId },
     ) => Effect.Effect<ScheduledTaskMutationResult, ScheduledTaskError>;
     readonly setEnabled: (
       input: ScheduledTaskSetEnabledInput,
@@ -243,6 +252,7 @@ export class ScheduledTaskService extends Context.Service<
     /** The dispatched thread, or null if dispatch failed; leaves the task's binding unchanged. */
     readonly runNow: (
       input: ScheduledTaskRunNowInput,
+      options?: { readonly callerThreadId?: ThreadId },
     ) => Effect.Effect<
       ScheduledTaskRunNowResult & { readonly threadId: ThreadId | null },
       ScheduledTaskError
@@ -394,6 +404,7 @@ export const layer = Layer.effect(
   ScheduledTaskService,
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+    const factoryStore = yield* FactoryStore.FactoryStore;
     const crypto = yield* Crypto.Crypto;
     const threadLaunch = yield* ThreadLaunchService.ThreadLaunchService;
     const threadManagement = yield* ThreadManagementService.ThreadManagementService;
@@ -401,6 +412,8 @@ export const layer = Layer.effect(
     const secretRequests = yield* SecretRequests.SecretRequests;
     const scheduler = yield* Scheduler.Scheduler;
     const readWebhookOrigin = yield* ScheduledTaskWebhookOrigin;
+    const commandJobs = yield* Effect.serviceOption(CommandJobs.CommandJobs);
+    const commandJobScope = yield* Effect.scope;
     const webhookPermits = yield* Ref.make<ReadonlyMap<ScheduledTaskId, Semaphore.Semaphore>>(
       new Map(),
     );
@@ -808,48 +821,60 @@ export const layer = Layer.effect(
         // A webhook prompt was rendered from the row when the request arrived.
         const prompt = webhook?.prompt ?? active.prompt;
 
-        // Capture defects and interrupts too so dispatch failures still reach markCompleted.
+        // Effect.exit (not Effect.result) so defects and interruptions in the
+        // dispatch are also captured and recorded as a failed run instead of
+        // aborting before markCompleted.
+        const jobName = CommandJobs.commandJobName(active.prompt);
+        const runJob = (
+          name: string,
+        ): Effect.Effect<null, ScheduledTaskError | CommandJobs.CommandJobError> =>
+          Option.isSome(commandJobs)
+            ? commandJobs.value.run({ task: active, jobName: name }).pipe(Effect.as(null))
+            : Effect.fail(taskError("Command jobs are not available on this server."));
         const result =
-          active.threadId === null
-            ? yield* Effect.exit(
-                threadLaunch
-                  .launch({
-                    commandId,
-                    projectId: active.projectId,
-                    title: active.title,
-                    modelSelection: active.modelSelection,
-                    runtimeMode: active.runtimeMode,
-                    interactionMode: active.interactionMode,
-                    workspaceStrategy: active.workspaceStrategy,
-                    initialMessage: {
+          // A command-job reference never falls through to a provider turn.
+          jobName !== null
+            ? yield* Effect.exit(runJob(jobName))
+            : active.threadId === null
+              ? yield* Effect.exit(
+                  threadLaunch
+                    .launch({
+                      commandId,
+                      projectId: active.projectId,
+                      title: active.title,
+                      modelSelection: active.modelSelection,
+                      runtimeMode: active.runtimeMode,
+                      interactionMode: active.interactionMode,
+                      workspaceStrategy: active.workspaceStrategy,
+                      initialMessage: {
+                        messageId,
+                        scheduledTaskId: active.id,
+                        text: prompt,
+                        attachments: [],
+                      },
+                      createdBy: active.createdBy,
+                      creationSource: active.creationSource,
+                    })
+                    .pipe(Effect.map((launched) => launched.threadId)),
+                )
+              : yield* Effect.exit(
+                  // The stored selection only seeds fresh threads. A bound run
+                  // follows the thread's current provider, so it passes none.
+                  threadManagement
+                    .sendToThread({
+                      projectId: active.projectId,
+                      commandId,
+                      threadId: ThreadId.make(active.threadId),
                       messageId,
                       scheduledTaskId: active.id,
                       text: prompt,
                       attachments: [],
-                    },
-                    createdBy: active.createdBy,
-                    creationSource: active.creationSource,
-                  })
-                  .pipe(Effect.map((launched) => launched.threadId)),
-              )
-            : yield* Effect.exit(
-                // The stored selection only seeds fresh threads. A bound run
-                // follows the thread's current provider, so it passes none.
-                threadManagement
-                  .sendToThread({
-                    projectId: active.projectId,
-                    commandId,
-                    threadId: ThreadId.make(active.threadId),
-                    messageId,
-                    scheduledTaskId: active.id,
-                    text: prompt,
-                    attachments: [],
-                    mode: "queue",
-                    createdBy: active.createdBy,
-                    creationSource: active.creationSource,
-                  })
-                  .pipe(Effect.as(ThreadId.make(active.threadId))),
-              );
+                      mode: "queue",
+                      createdBy: active.createdBy,
+                      creationSource: active.creationSource,
+                    })
+                    .pipe(Effect.as(ThreadId.make(active.threadId))),
+                );
 
         const runSucceeded = result._tag === "Success";
         if (webhook !== undefined && runSucceeded) yield* Ref.set(webhook.dispatched, true);
@@ -953,7 +978,16 @@ export const layer = Layer.effect(
           Effect.suspend(() =>
             isMissedFixedTimeRun(task.schedule, dueAt, now)
               ? rescheduleMissedRun(task, now)
-              : runTask(task, "scheduled"),
+              : CommandJobs.commandJobName(task.prompt) !== null
+                ? // A command can run for minutes; other due tasks must not wait on it.
+                  runTask(task, "scheduled").pipe(
+                    Effect.catch((cause) =>
+                      Effect.logWarning("Command job run failed", { taskId: task.id, cause }),
+                    ),
+                    Effect.forkIn(commandJobScope),
+                    Effect.asVoid,
+                  )
+                : runTask(task, "scheduled"),
           ).pipe(
             Effect.catch((cause) =>
               Effect.logWarning("Scheduled task run failed", { taskId: task.id, cause }),
@@ -1018,6 +1052,49 @@ export const layer = Layer.effect(
 
     yield* scheduler.register("scheduled-tasks", runDueTasks());
 
+    // Coalesces into a running pass, otherwise starts one in the background.
+    const triggerCommandJob = Effect.fn("ScheduledTaskService.triggerCommandJob")(function* (
+      task: ScheduledTask,
+      jobName: string,
+    ) {
+      if (Option.isSome(commandJobs) && (yield* commandJobs.value.requestPass(task, jobName)))
+        return;
+      yield* runTask(task, "manual").pipe(
+        // The previous pass may still be releasing the task.
+        Effect.retry({ times: 5, schedule: Schedule.spaced("1 second") }),
+        Effect.catch((cause) =>
+          Effect.logWarning("Command job run failed", { taskId: task.id, cause }),
+        ),
+        Effect.forkIn(commandJobScope),
+      );
+    });
+
+    const stopCommandJob = (task: Pick<ScheduledTask, "id" | "projectId" | "prompt"> | null) => {
+      const jobName = task === null ? null : CommandJobs.commandJobName(task.prompt);
+      return task === null || jobName === null || Option.isNone(commandJobs)
+        ? Effect.void
+        : commandJobs.value.stop(task, jobName);
+    };
+
+    if (Option.isSome(commandJobs)) {
+      yield* commandJobs.value.wakeups.pipe(
+        Stream.runForEach((id) =>
+          findTask(id).pipe(
+            Effect.flatMap((task) => {
+              const jobName = task === null ? null : CommandJobs.commandJobName(task.prompt);
+              return task === null || jobName === null || !task.enabled
+                ? Effect.void
+                : triggerCommandJob(task, jobName);
+            }),
+            Effect.catch((cause) =>
+              Effect.logWarning("Could not wake command job", { taskId: id, cause }),
+            ),
+          ),
+        ),
+        Effect.forkIn(commandJobScope),
+      );
+    }
+
     const list: ScheduledTaskService["Service"]["list"] = () =>
       listRows().pipe(
         Effect.map((tasks) => ({ tasks })),
@@ -1038,7 +1115,7 @@ export const layer = Layer.effect(
 
     const upsert: ScheduledTaskService["Service"]["upsert"] = Effect.fn(
       "ScheduledTaskService.upsert",
-    )(function* (input) {
+    )(function* (input, options) {
       const now = yield* localNow;
       const uuid =
         input.commandId === undefined
@@ -1160,7 +1237,42 @@ export const layer = Layer.effect(
         lastRunError: existingTask?.lastRunError ?? null,
         runCount: existingTask?.runCount ?? 0,
       };
-      yield* saveTask(task, input.requireExisting === true, webhook);
+      // A factory caller's schedule and its origin commit together, so a crash between the two
+      // writes can never leave an enabled schedule whose launches no factory reservation counts.
+      const callerThreadId = options?.callerThreadId;
+      yield* sql
+        .withTransaction(
+          saveTask(task, input.requireExisting === true, webhook).pipe(
+            Effect.andThen(
+              callerThreadId === undefined
+                ? Effect.void
+                : factoryStore.recordScheduleOrigin({ scheduledTaskId: id, callerThreadId }).pipe(
+                    Effect.mapError((cause) =>
+                      taskError("Could not record the schedule's factory origin.", {
+                        taskId: id,
+                        cause,
+                      }),
+                    ),
+                  ),
+            ),
+          ),
+        )
+        .pipe(
+          Effect.mapError((cause) =>
+            isScheduledTaskError(cause)
+              ? cause
+              : taskError("Could not save schedule task.", { taskId: id, cause }),
+          ),
+        );
+      // Pausing a command-job task by editing it, or pointing it elsewhere, must not leave its
+      // running pass with no row that can stop it. The old row is what the job was bound to.
+      const previousJob =
+        existingTask === null ? null : CommandJobs.commandJobName(existingTask.prompt);
+      if (
+        previousJob !== null &&
+        (!input.enabled || CommandJobs.commandJobName(input.prompt) !== previousJob)
+      )
+        yield* stopCommandJob(existingTask);
       yield* notifyChanged;
       return { task: (yield* findTask(id)) ?? task };
     });
@@ -1189,6 +1301,7 @@ export const layer = Layer.effect(
       if (updated.length === 0) {
         return yield* taskError("Schedule task not found.", { taskId: input.id });
       }
+      if (!input.enabled) yield* stopCommandJob(existing);
       yield* notifyChanged;
       return {
         task: { ...existing, enabled: input.enabled, nextRunAt: next, updatedAt: iso(now) },
@@ -1228,7 +1341,10 @@ export const layer = Layer.effect(
       );
 
     const deleteTask: ScheduledTaskService["Service"]["delete"] = (input) =>
-      deleteRow(input.id).pipe(
+      findTask(input.id).pipe(
+        Effect.flatMap(stopCommandJob),
+        Effect.ignore,
+        Effect.andThen(deleteRow(input.id)),
         Effect.andThen(forgetWebhookTask(input.id)),
         Effect.andThen(notifyChanged),
         Effect.as({ id: input.id }),
@@ -1246,8 +1362,9 @@ export const layer = Layer.effect(
             DELETE FROM scheduled_task_webhook_deliveries
             WHERE task_id IN (SELECT task_id FROM scheduled_tasks WHERE thread_id = ${threadId})
           `;
-            return yield* sql<{ task_id: ScheduledTaskId }>`
-            DELETE FROM scheduled_tasks WHERE thread_id = ${threadId} RETURNING task_id
+            return yield* sql<{ task_id: ScheduledTaskId; project_id: ProjectId; prompt: string }>`
+            DELETE FROM scheduled_tasks WHERE thread_id = ${threadId}
+            RETURNING task_id, project_id, prompt
           `;
           }),
         )
@@ -1259,17 +1376,60 @@ export const layer = Layer.effect(
       yield* Effect.forEach(removed, ({ task_id }) => forgetWebhookTask(task_id), {
         discard: true,
       });
+      // A task created from a thread is bound to it, so deleting the thread can remove a
+      // command-job task mid-pass.
+      yield* Effect.forEach(
+        removed,
+        (row) => stopCommandJob({ id: row.task_id, projectId: row.project_id, prompt: row.prompt }),
+        { discard: true },
+      );
       if (removed.length > 0) yield* notifyChanged;
+    });
+
+    // A factory execution may run its own schedules, or wake a thread that is already factory
+    // work; any other run would start an execution no factory reservation counts.
+    const fenceFactoryCaller = Effect.fnUntraced(function* (
+      task: ScheduledTask,
+      callerThreadId: ThreadId,
+    ) {
+      const reachable = Effect.gen(function* () {
+        if (Option.isNone(yield* factoryStore.bindingForThread(callerThreadId))) return true;
+        if (Option.isSome(yield* factoryStore.scheduleOrigin(task.id))) return true;
+        return (
+          task.threadId !== null &&
+          Option.isSome(yield* factoryStore.bindingForThread(ThreadId.make(task.threadId)))
+        );
+      }).pipe(
+        Effect.mapError((cause) =>
+          taskError("Could not read the schedule's factory origin.", { taskId: task.id, cause }),
+        ),
+      );
+      if (!(yield* reachable)) {
+        return yield* taskError(
+          "Factory work can only run schedules it created or that wake factory threads.",
+          { taskId: task.id },
+        );
+      }
     });
 
     const runNow: ScheduledTaskService["Service"]["runNow"] = Effect.fn(
       "ScheduledTaskService.runNow",
-    )(function* (input: ScheduledTaskRunNowInput) {
+    )(function* (
+      input: ScheduledTaskRunNowInput,
+      options?: { readonly callerThreadId?: ThreadId },
+    ) {
       const task = yield* loadTask(input.id);
+      if (options?.callerThreadId !== undefined)
+        yield* fenceFactoryCaller(task, options.callerThreadId);
       if (task.schedule.type === "webhook") {
         return yield* taskError("Webhook tasks run when their URL receives a request.", {
           taskId: input.id,
         });
+      }
+      const jobName = CommandJobs.commandJobName(task.prompt);
+      if (jobName !== null) {
+        yield* triggerCommandJob(task, jobName);
+        return { task, threadId: null };
       }
       return yield* runTask(task, "manual").pipe(
         Effect.mapError((cause) =>
@@ -2145,4 +2305,7 @@ export const layer = Layer.effect(
       triggerWebhook,
     });
   }),
+).pipe(
+  // FactoryStore keeps no in-memory state; a private instance reads the shared rows.
+  Layer.provide(FactoryStore.layer),
 );

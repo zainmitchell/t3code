@@ -20,6 +20,7 @@ import {
 } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { AgentScope } from "@t3tools/shared/AgentScope";
+import { ExecutionJoin, type JoinRole } from "@t3tools/shared/ExecutionJoin";
 import { MuseSettings } from "../settings.ts";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -532,6 +533,64 @@ describe("MuseAdapterV2", () => {
       assert.strictEqual(fake.closeCount(), 0);
       yield* startConversation(harness, fake);
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect("N26/N27: a contained thread starts Muse inside its container and admits it", () =>
+    Effect.gen(function* () {
+      const joins: Array<{ command: string; args: ReadonlyArray<string>; role?: JoinRole }> = [];
+      const admitted = yield* Deferred.make<number>();
+      const join = {
+        forThread: (threadId: string) =>
+          Effect.succeed(
+            threadId === THREAD_ID
+              ? Option.some((command: string, args: ReadonlyArray<string>, role?: JoinRole) =>
+                  Effect.sync(() => {
+                    joins.push({ command, args, ...(role === undefined ? {} : { role }) });
+                    return {
+                      command: "t3-custody",
+                      args: ["join", "generation", "--", command, ...args],
+                      admit: (pid: number) => Deferred.succeed(admitted, pid).pipe(Effect.asVoid),
+                      cancel: Effect.void,
+                    };
+                  }),
+                )
+              : Option.none(),
+          ),
+        heldForThread: () => Effect.succeedNone,
+      };
+      const hosts: Array<MuseSdkHostOptions> = [];
+      const fake = yield* makeFakeMuse();
+      yield* makeHarness(fake, INSTANCE_ID, undefined, undefined, undefined, runtimePolicy, {
+        createHost: async (options) => {
+          hosts.push(options);
+          options.onProcessSpawn?.(4242);
+          return fake.host;
+        },
+      }).pipe(Effect.provideService(ExecutionJoin, join));
+      // Muse itself is the provider process, started through the join and admitted by its pid.
+      assert.deepStrictEqual(joins, [{ command: "muse", args: [], role: "provider" }]);
+      assert.deepStrictEqual(hosts[0]?.launch, {
+        command: "t3-custody",
+        args: ["join", "generation", "--", "muse"],
+      });
+      assert.strictEqual(yield* Deferred.await(admitted), 4242);
+
+      // A thread whose work is not contained launches Muse as before.
+      const plainHosts: Array<MuseSdkHostOptions> = [];
+      const plain = yield* makeFakeMuse();
+      yield* makeHarness(plain, INSTANCE_ID, undefined, undefined, undefined, runtimePolicy, {
+        createHost: async (options) => {
+          plainHosts.push(options);
+          return plain.host;
+        },
+      });
+      assert.strictEqual(plainHosts[0]?.launch?.command, "muse");
+      assert.isUndefined(plainHosts[0]?.onProcessSpawn);
+    }).pipe(
+      Effect.provideService(HostProcess.Platform, "linux"),
+      Effect.scoped,
+      Effect.provide(testLayer),
+    ),
   );
 
   it.effect("pins Windows turns to Muse's verbatim root and starts Muse in the plain path", () =>

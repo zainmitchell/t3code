@@ -1382,6 +1382,47 @@ export function createServerEnvironmentAtoms<R, E>(
       scheduler: configScheduler,
       concurrency: configConcurrency,
     }),
+    factoryOverview: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:server:factory:overview",
+      tag: WS_METHODS.factoryOverview,
+    }),
+    // One answer per decision at a time; the server records only the first.
+    answerFactoryDecision: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:factory:decide",
+      tag: WS_METHODS.factoryDecide,
+      concurrency: {
+        mode: "singleFlight",
+        key: ({ environmentId, input }) => JSON.stringify([environmentId, input.decisionId]),
+      },
+    }),
+    rejectFactoryOutcome: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:factory:reject-outcome",
+      tag: WS_METHODS.factoryRejectOutcome,
+    }),
+    revokeFactoryGrant: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:factory:revoke-grant",
+      tag: WS_METHODS.factoryRevokeGrant,
+    }),
+    installFactoryConfiguration: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:factory:configure",
+      tag: WS_METHODS.factoryConfigure,
+    }),
+    observeFactoryClaims: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:factory:observe-claims",
+      tag: WS_METHODS.factoryObserveClaims,
+    }),
+    transferFactoryWork: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:factory:transfer",
+      tag: WS_METHODS.factoryTransfer,
+    }),
+    rollbackFactoryTransfer: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:factory:rollback-transfer",
+      tag: WS_METHODS.factoryRollbackTransfer,
+    }),
+    disposeFactoryClaim: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:factory:dispose-claim",
+      tag: WS_METHODS.factoryDisposeClaim,
+    }),
     createGuestShare: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:guest-share:create",
       tag: WS_METHODS.guestShareCreate,
