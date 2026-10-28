@@ -1,8 +1,17 @@
 # Native agent messaging for T3 Code v0.1.2
 
+> [!IMPORTANT]
+> **Superseded on 2026-10-28. Do not install this patch for new setups.** Linked environments are now part of official T3 Code. Use [nightly v0.1.4-nightly.20261028.3824](https://github.com/pingdotgg/t3code/releases/tag/v0.1.4-nightly.20261028.3824) or any later nightly instead. The original feature PRs this preview bundled, [#16653](https://github.com/pingdotgg/t3code/pull/16653) mode limits, [#16654](https://github.com/pingdotgg/t3code/pull/16654) launch keys, [#16655](https://github.com/pingdotgg/t3code/pull/16655) links and [#16684](https://github.com/pingdotgg/t3code/pull/16684) forwarding, merged upstream on 2026-10-27, along with [#16695](https://github.com/pingdotgg/t3code/pull/16695) link confinement, [#16698](https://github.com/pingdotgg/t3code/pull/16698) Connections UI, [#16719](https://github.com/pingdotgg/t3code/pull/16719) remote delegation and [#17130](https://github.com/pingdotgg/t3code/pull/17130) machine mentions with the Labs beta.
+>
+> In the official nightly, turn on **Linked environments** in **Settings → Labs** on both machines (on mobile, **Settings → Labs** lists each connected machine). Then, on the machine you will work from, open **Settings → Connections → Linked environments** and choose **Link**. The [official remote access guide](https://github.com/pingdotgg/t3code/blob/eb751fa0730d6a51d56547cb7fcaf4822a7e0e3b/docs/user/remote-access.md#link-another-environment) covers pairing codes, access levels and revoking a link; the [peer-link notes](https://github.com/pingdotgg/t3code/blob/eb751fa0730d6a51d56547cb7fcaf4822a7e0e3b/docs/internals/remote.md#peer-links) describe how the beta gates both sides.
+>
+> Do not apply this patch, or its branch, on top of an official nightly. Upgrading or migrating a T3 home that ran this preview to an official nightly has not been verified, and we have no tested migration path. This preview added its own peer-link migration to the v0.1.2 history.
+>
+> The rest of this page is the original preview description, kept for history, attribution and evidence. Its PR states are dated snapshots.
+
 The review branch now includes [fixes after the frozen preview.1 download](BRANCH-UPDATES.md), including their verification and remaining limits. The original archive and raw patch are unchanged.
 
-This community source preview extends T3's existing native thread tools with recoverable launches, full Stop/retry behavior, forwarded permission ceilings, and selected tools for explicitly linked environments. It is a reduced stable integration of existing T3 work and selected fixes, with the PR relationships and verification limits below.
+This community source preview extended T3's existing native thread tools with recoverable launches, full Stop/retry behavior, forwarded permission ceilings, and selected tools for explicitly linked environments. It is a reduced stable integration of existing T3 work and selected fixes, with the PR relationships and verification limits below.
 
 ## Why this exists
 
@@ -88,7 +97,7 @@ Physical routes/T3 Connect, real provider turns, every client/device, other oper
 
 ## Source, installation, and public history
 
-Use the [applied source branch](https://github.com/zainmitchell/t3code/tree/community/native-messaging-v0.1.2) or the [preview Release](https://github.com/zainmitchell/t3code/releases/tag/community-native-messaging-v0.1.2-preview.1). The release includes the patch, manifest, MIT notice, guides, evidence and checksums; GitHub's tag archive contains full patched source. [INSTALL.md](INSTALL.md) explains both paths.
+For new installs, use the official nightly named at the top of this page. The [applied source branch](https://github.com/zainmitchell/t3code/tree/community/native-messaging-v0.1.2) and the [preview Release](https://github.com/zainmitchell/t3code/releases/tag/community-native-messaging-v0.1.2-preview.1) remain available as historical records. The release includes the patch, manifest, MIT notice, guides, evidence and checksums; GitHub's tag archive contains full patched source. [INSTALL.md](INSTALL.md) explains both paths.
 
 The exact base is official T3 Code v0.1.2, `044f07257c9684ae4543bd1e1ebf9c394e9e3830`. The exercised toolchain was Windows x64, Node 26.12.1 and Vite+ 1.3.0. It needs a source build, not a prompt/skill import, and supplies no desktop installer. PeerLinks adds migration 68 after the released stable history. Custom histories need deliberate integration. Try disposable state first; reversing a patch does not restore an older database.
 
@@ -103,7 +112,7 @@ Useful feedback is a concrete coordination failure, its target revision, or a mi
 
 ## Maintenance, upstream intent, and bug reports
 
-This is a temporary community patch fork for free, self-hosted open-source use. The owner maintains the patches and tracks bugs in [the fork's Issues](https://github.com/zainmitchell/t3code/issues) until T3 ships the capability or a better replacement. The intent is to retire these fork-specific changes as upstream meets the need.
+This is a temporary community patch fork for free, self-hosted open-source use. The owner maintains the patches and tracks bugs in [the fork's Issues](https://github.com/zainmitchell/t3code/issues) until T3 ships the capability or a better replacement. The intent is to retire these fork-specific changes as upstream meets the need. Upstream now provides linked environments, so this messaging patch is retired and receives no further fixes.
 
 We welcome upstream adoption through maintainer-approved direction and focused contributions. The stable bundle is a distribution unit, not a demand to merge that entire bundle as one upstream PR. This work carries no upstream endorsement, approval, or merge commitment. Reports should identify the source base, patch/version, reproduction, expected and observed behavior, and suitably redacted evidence.
 

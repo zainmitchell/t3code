@@ -1,6 +1,11 @@
 # Build and try the Native messaging source preview
 
-The current branch includes [review fixes after preview.1](BRANCH-UPDATES.md). The preview.1 download remains frozen and does not include those fixes. Its MANIFEST.json describes that original patch. Use the branch build below to try the corrected source while review continues.
+> [!WARNING]
+> **Superseded on 2026-10-28: do not use this guide for new installs.** Use official T3 Code [nightly v0.1.4-nightly.20261028.3824](https://github.com/pingdotgg/t3code/releases/tag/v0.1.4-nightly.20261028.3824) or any later nightly, which includes linked environments. In the official nightly, turn on **Linked environments** in **Settings → Labs** on both machines (on mobile, **Settings → Labs** lists each connected machine). Then, on the machine you will work from, open **Settings → Connections → Linked environments** and choose **Link**. See the [official remote access guide](https://github.com/pingdotgg/t3code/blob/eb751fa0730d6a51d56547cb7fcaf4822a7e0e3b/docs/user/remote-access.md#link-another-environment).
+>
+> Do not apply this patch, or its branch, on top of an official nightly. Upgrading or migrating a T3 home that ran this preview to an official nightly has not been verified, and we have no tested migration path. This preview added its own peer-link migration to the v0.1.2 history. The steps below are kept as a historical record of how the v0.1.2 preview was built.
+
+The current branch includes [review fixes after preview.1](BRANCH-UPDATES.md). The preview.1 download remains frozen and does not include those fixes. Its MANIFEST.json describes that original patch. The branch build below was the way to try the corrected source; it is now historical.
 
 This preview targets official T3 Code v0.1.2, commit `044f07257c9684ae4543bd1e1ebf9c394e9e3830`. Windows backend setup was exercised with Node 26.12.1 and Vite+ 1.3.0. It provides source code, not a desktop installer or automatic app update. Use disposable state for the first trial.
 
