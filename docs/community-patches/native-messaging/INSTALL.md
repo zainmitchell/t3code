@@ -1,0 +1,67 @@
+# Build and try the Native messaging source preview
+
+> [!WARNING]
+> **Superseded on 2026-10-28: do not use this guide for new installs.** Use official T3 Code [nightly v0.1.4-nightly.20261028.3824](https://github.com/pingdotgg/t3code/releases/tag/v0.1.4-nightly.20261028.3824) or any later nightly, which includes linked environments. In the official nightly, turn on **Linked environments** in **Settings → Labs** on both machines (on mobile, **Settings → Labs** lists each connected machine). Then, on the machine you will work from, open **Settings → Connections → Linked environments** and choose **Link**. See the [official remote access guide](https://github.com/pingdotgg/t3code/blob/eb751fa0730d6a51d56547cb7fcaf4822a7e0e3b/docs/user/remote-access.md#link-another-environment).
+>
+> Do not apply this patch, or its branch, on top of an official nightly. Upgrading or migrating a T3 home that ran this preview to an official nightly has not been verified, and we have no tested migration path. This preview added its own peer-link migration to the v0.1.2 history. The steps below are kept as a historical record of how the v0.1.2 preview was built.
+
+The current branch includes [review fixes after preview.1](BRANCH-UPDATES.md). The preview.1 download remains frozen and does not include those fixes. Its MANIFEST.json describes that original patch. The branch build below was the way to try the corrected source; it is now historical.
+
+This preview targets official T3 Code v0.1.2, commit `044f07257c9684ae4543bd1e1ebf9c394e9e3830`. Windows backend setup was exercised with Node 26.12.1 and Vite+ 1.3.0. It provides source code, not a desktop installer or automatic app update. Use disposable state for the first trial.
+
+## Build the already-patched branch
+
+Install Node and Vite+ using the [upstream development setup](https://github.com/pingdotgg/t3code/blob/044f07257c9684ae4543bd1e1ebf9c394e9e3830/docs/operations/development.md#first-checkout). The recorded exercise used the versions named above. Clone the [feature branch](https://github.com/zainmitchell/t3code/tree/community/native-messaging-v0.1.2), then install its pinned dependencies and build the server:
+
+```sh
+git clone --branch community/native-messaging-v0.1.2 --single-branch https://github.com/zainmitchell/t3code.git t3-native-messaging-example
+cd t3-native-messaging-example
+vp i --frozen-lockfile
+vp run --filter t3 build:bundle
+```
+
+The branch already contains the patch. This path needs no additional `git apply` step.
+
+## Apply only the patch to an existing clean source checkout
+
+Alternatively, download the source-patch ZIP from the [preview Release](https://github.com/zainmitchell/t3code/releases/tag/community-native-messaging-v0.1.2-preview.1), check its SHA-256 against the Release's checksum file, and extract it outside the checkout. In a clean official source checkout:
+
+```sh
+git checkout --detach v0.1.2
+git rev-parse HEAD
+git apply --check /path/to/t3-v0.1.2-native-messaging.patch
+git apply /path/to/t3-v0.1.2-native-messaging.patch
+vp i --frozen-lockfile
+vp run --filter t3 build:bundle
+```
+
+The HEAD output before application must be `044f07257c9684ae4543bd1e1ebf9c394e9e3830`. Replace `/path/to` with the extracted package directory. MANIFEST.json binds the delivered patch and resulting source-file hashes. The full MIT notice must accompany copies or substantial portions.
+
+## Start with a new T3 home
+
+Choose an unused loopback port and new disposable directories. From the source checkout:
+
+```sh
+node apps/server/dist/bin.mjs serve --host 127.0.0.1 --port 47831 --base-dir /path/to/new-example-home --no-browser /path/to/example-project
+```
+
+On Windows, replace both paths with absolute paths. The built CLI uses `--base-dir`; the development runner's `--home-dir` is a different interface. Runtime state lives below `<example-home>/userdata`. The headless server prints its readiness and pairing details. Those details are credentials and stay private. The source retains upstream package-version metadata; this preview is identified by its source base and patch checksum, not an official application release stamp.
+
+The recorded exercise used fresh homes, synthetic projects, disabled providers, authenticated application APIs, and scheduler subscriptions. Exact manual UI navigation, a desktop installer, production-state upgrades, real provider actions, physical remote routes, and other operating systems remain unverified. See RUNTIME-VERIFICATION.json and VERIFICATION.json.
+
+## Use messaging and linked environments
+
+The launch and Stop improvements also work locally. Supply a stable `clientRequestId` for one top-level launch and reuse it when recovering that same unanswered request. Follow the returned thread and run to determine actual preparation and execution success. `t3_thread_interrupt` with `stop: true` requests the broader Stop operation; acceptance does not prove every arbitrary process ended.
+
+For another environment, run the built CLI's `environment link --help` and obtain a pairing code from the destination. Store the link in the same home used by the server above:
+
+```sh
+node apps/server/dist/bin.mjs environment link https://peer.example --pairing-code DESTINATION_PAIRING_CODE --access approval-required --base-dir /path/to/new-example-home
+node apps/server/dist/bin.mjs environment list --base-dir /path/to/new-example-home
+```
+
+Replace the destination URL and pairing-code placeholder. Use the same absolute `--base-dir` for `serve`, `environment link`, and `environment list`. Without that flag or a matching `T3CODE_HOME`, the CLI can store the link in a different home from the running server.
+
+The agent discovers links with `t3_environment_links` and uses `environmentId` only on supported native tools. Both servers need compatible code. Keep pairing details private and use owner-trusted environments. The destination can revoke its connection.
+
+The patch adds peer-link migration 68 after the official stable history. A custom fork that already used that number requires integration. Before any existing-state upgrade, stop the server and retain a complete backup. Reversing source code does not restore an earlier database. This preview does not include the later link-origin ownership, remote delegation, or handoff layers described in UPSTREAM.md.

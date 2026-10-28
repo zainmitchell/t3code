@@ -1,9 +1,16 @@
-import { MessageId, ThreadId, OrchestratorMcpFailure, ProjectId } from "@t3tools/contracts";
+import {
+  CommandId,
+  MessageId,
+  ThreadId,
+  OrchestratorMcpFailure,
+  ProjectId,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as ThreadLaunch from "../../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadMessageIntake from "../../../orchestration-v2/ThreadMessageIntake.ts";
+import * as ThreadManagement from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as Claims from "../../../orchestration-v2/AttachmentClaims.ts";
 import * as Project from "../../../project/ProjectService.ts";
 import * as ManagedProjectFolders from "../../../project/ManagedProjectFolders.ts";
@@ -12,6 +19,7 @@ import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
 import * as ServerSettings from "../../../serverSettings.ts";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import { resolveRuntimeMode } from "../../OrchestratorMcpService.ts";
+import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import { newCommandId, readCaller, resolveProjectId, unavailable } from "../../threadAccess.ts";
 import { ProjectToolkit } from "./tools.ts";
@@ -58,9 +66,18 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
     (input) => input,
     (input, { runtimeMode, interactionMode }) =>
       Effect.gen(function* () {
+        const scope = yield* McpInvocationContext.McpInvocationContext;
         const context = yield* readCaller();
         const { caller } = context;
-        const commandId = yield* newCommandId();
+        // A retry with the same key replays the first launch: the ids derive
+        // from the caller and the key, and the launch service replays a
+        // command it already accepted.
+        const commandId =
+          input.clientRequestId === undefined
+            ? yield* newCommandId()
+            : CommandId.make(
+                `mcp:launch:${encodeURIComponent(scope.requestNamespace)}:${encodeURIComponent(input.clientRequestId)}`,
+              );
         const threadId = ThreadId.make(commandId);
         const messageId = MessageId.make(commandId);
         const attachments = input.attachments ?? [];
@@ -91,6 +108,19 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
                 ),
               )).projectId
             : yield* resolveProjectId(context, input.projectId);
+        // Accepted creates reuse their model. Only their first message needs
+        // base validation; message replays reuse stored preparation.
+        const acceptedLaunch =
+          input.clientRequestId === undefined
+            ? undefined
+            : Option.getOrUndefined(
+                yield* ThreadLaunch.ThreadLaunchService.pipe(
+                  Effect.flatMap((launches) =>
+                    launches.getAcceptedLaunch({ commandId, threadId, projectId }),
+                  ),
+                  Effect.mapError(unavailable),
+                ),
+              );
         const readProject = Project.ProjectService.pipe(
           Effect.flatMap((projects) => projects.getById(projectId)),
           Effect.mapError(unavailable),
@@ -108,7 +138,18 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
         // A launch is accepted before its worktree is provisioned, so a base
         // ref that cannot resolve is refused while the agent can still act on it.
         const strategy = input.workspaceStrategy;
-        if (strategy?.type === "worktree")
+        const acceptedIdleFirstMessage =
+          acceptedLaunch !== undefined &&
+          strategy?.type === "worktree" &&
+          (input.message !== undefined || attachments.length > 0) &&
+          (yield* ThreadManagement.ThreadManagementService.pipe(
+            Effect.flatMap((threads) => threads.getMessageCount(threadId)),
+            Effect.mapError(unavailable),
+          )) === 0;
+        if (
+          (acceptedLaunch === undefined || acceptedIdleFirstMessage) &&
+          strategy?.type === "worktree"
+        )
           yield* ThreadLaunch.ThreadLaunchService.pipe(
             Effect.flatMap((launches) =>
               launches.checkWorktreeBase({ projectId, workspaceStrategy: strategy }),
@@ -117,7 +158,7 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
               (error) =>
                 new OrchestratorMcpFailure({
                   code: "invalid_request",
-                  message: `${error.message} No thread was created. Pass a branch, tag, or commit that exists there${
+                  message: `${error.message} ${acceptedLaunch === undefined ? "No thread was created." : "The accepted thread remains idle."} Pass a branch, tag, or commit that exists there${
                     strategy.startFromOrigin === true
                       ? "; the project has no usable remote to fetch it from."
                       : ", or set startFromOrigin:true if it exists only on a remote."
@@ -142,6 +183,7 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
               )
             : undefined;
         const modelSelection =
+          acceptedLaunch?.modelSelection ??
           input.modelSelection ??
           caller?.modelSelection ??
           projectDefaults?.defaultModelSelection ??

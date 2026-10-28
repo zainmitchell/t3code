@@ -1,16 +1,24 @@
-import { defineConfig, type CodeRabbitContext } from "@coderabbitai/config";
+import { defineConfig, type CodeRabbitConfig, type CodeRabbitContext } from "@coderabbitai/config";
+
+// The SDK requires unexported enums here; these literals match the service's configuration schema.
+type KnowledgeBase = NonNullable<CodeRabbitConfig["knowledge_base"]>;
+const localScope = "local" as NonNullable<KnowledgeBase["issues"]>["scope"];
+const disabledIntegration = "disabled" as NonNullable<KnowledgeBase["mcp"]>["usage"];
 
 const UNGATED_AUTHORS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
 const isGated = ({ pr }: CodeRabbitContext) => !UNGATED_AUTHORS.has(pr?.authorAssociation ?? "");
 
 export default defineConfig((ctx) => ({
+  inheritance: false,
   reviews: {
     high_level_summary: false,
     review_status: false,
     request_changes_workflow: false,
+    related_issues: false,
+    related_prs: false,
     allow_author_approval: !isGated(ctx),
     auto_review: {
-      enabled: true,
+      enabled: false,
     },
     pre_merge_checks: {
       docstrings: { mode: "off" },
@@ -29,6 +37,15 @@ export default defineConfig((ctx) => ({
     ],
   },
   knowledge_base: {
+    automatic_linking_mode: "disabled",
+    linked_repositories: [],
+    issues: { scope: localScope },
+    pull_requests: { scope: localScope },
+    learnings: { scope: localScope },
+    jira: { usage: disabledIntegration },
+    linear: { usage: disabledIntegration },
+    mcp: { usage: disabledIntegration },
+    web_search: { enabled: false },
     code_guidelines: {
       filePatterns: [
         { files: "docs/internals/effect-services.md", applyTo: "{apps,packages,infra}/**/*.ts" },

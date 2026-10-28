@@ -1,0 +1,30 @@
+{
+  "sourceBase": "044f07257c9684ae4543bd1e1ebf9c394e9e3830",
+  "patchSha256": "7e4564c13a86f167eac91ec1fe3604b6eee83a029c5d2e4b7caed2f3deec4dbb",
+  "host": "Windows x64",
+  "node": "26.12.1",
+  "feature": "native-messaging",
+  "observed": {
+    "freshHomeStartup": "passed",
+    "peerLinkMigration": "present",
+    "authenticatedProjectApi": "passed",
+    "authenticatedClientRpc": "passed",
+    "runtimeSourceMapBinding": "critical changed services match source",
+    "threadAndSessionProjections": 0
+  },
+  "enabledProviders": 0,
+  "proofServersStopped": true,
+  "notVerified": [
+    "Manual task-creation UI steps",
+    "Desktop installation or production-state upgrade",
+    "Real provider turns or worker-directed actions",
+    "External CI integration",
+    "Physical host-to-host routes or T3 Connect",
+    "Other operating systems",
+    "Full client/device acceptance",
+    "MCP OAuth client acceptance"
+  ],
+  "scope": "Windows disposable backend proof; no live production installation",
+  "distributedPreviewPatchSha256": "3556c7e4b0ffa39cf131d507396c8d7263558d1d4b8bcb5d7241911a934f7771",
+  "previewDifference": "Whitespace-only formatting in PeerForwarding.test.ts; original behavioral evidence is for the patchSha256 already recorded above"
+}

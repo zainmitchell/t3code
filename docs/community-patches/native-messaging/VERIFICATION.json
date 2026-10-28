@@ -1,0 +1,47 @@
+{
+  "target": "Official T3 Code v0.1.2 source",
+  "baseCommit": "044f07257c9684ae4543bd1e1ebf9c394e9e3830",
+  "patchSha256": "7e4564c13a86f167eac91ec1fe3604b6eee83a029c5d2e4b7caed2f3deec4dbb",
+  "host": "Windows x64",
+  "node": "26.12.1",
+  "focused": {
+    "tests": 196,
+    "files": 8,
+    "exitCode": 0
+  },
+  "supplemental": {
+    "tests": 31,
+    "files": 5,
+    "exitCode": 0
+  },
+  "postCleanupPeerRecheck": {
+    "tests": 14,
+    "files": 2,
+    "exitCode": 0
+  },
+  "typecheck": "passed",
+  "format": "passed",
+  "lint": "passed with warnings",
+  "unusedCodeCheck": "passed",
+  "serverBundle": "passed",
+  "applyChecks": "passed alone and in either order with the other package; identical combined tree",
+  "combinedFocused": {
+    "tests": 242,
+    "files": 12,
+    "exitCode": 0
+  },
+  "combinedTypecheck": "passed",
+  "combinedServerBundle": "passed",
+  "exampleSmoke": null,
+  "notVerified": [
+    "Full repository test suite",
+    "Physical cross-machine routes or real T3 Connect",
+    "Real provider/model execution",
+    "Browser/desktop/mobile runtime behavior",
+    "Other operating systems",
+    "Installation against existing production state"
+  ],
+  "distribution": "Source patch only. No application binary, private evidence, account identity, or fork history.",
+  "distributedPreviewPatchSha256": "3556c7e4b0ffa39cf131d507396c8d7263558d1d4b8bcb5d7241911a934f7771",
+  "previewDifference": "Whitespace-only formatting in PeerForwarding.test.ts; original behavioral evidence is for the patchSha256 already recorded above"
+}
