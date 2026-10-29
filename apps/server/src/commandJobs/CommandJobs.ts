@@ -989,7 +989,22 @@ export const layer = Layer.effect(
           yield* saveReceipts();
           const launched = yield* Effect.result(launch(request, valid.success));
           if (launched._tag === "Failure") {
-            receipts.delete(request.workId);
+            // A launch can commit its thread and then fail, so only a missing receipt forgets the
+            // intent; otherwise it keeps its error and the next pass finishes it from the pin.
+            const committed = yield* Effect.result(
+              threads.hasReceipt(launchCommandId(job, request.workId)),
+            );
+            if (committed._tag === "Success" && !committed.success) {
+              receipts.delete(request.workId);
+            } else {
+              receipts.set(request.workId, {
+                ...receipts.get(request.workId)!,
+                recoveryError:
+                  committed._tag === "Failure"
+                    ? `${launched.failure.message} Whether it was accepted is unknown (its receipt could not be read).`
+                    : launched.failure.message,
+              });
+            }
             yield* saveReceipts();
             outcome.failed.push({
               index,

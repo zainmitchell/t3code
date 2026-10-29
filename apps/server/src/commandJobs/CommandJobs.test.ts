@@ -143,6 +143,11 @@ const setup = Effect.fn("setup")(function* (options: {
   readonly acceptedCommands?: ReadonlySet<string>;
   /** The receipt store cannot be read: whether a launch was accepted is unknown. */
   readonly receiptsUnreadable?: boolean;
+  /**
+   * While set, launch records the call and then fails. "accepted" commits its command first, as a
+   * launch failing after `thread.create` does; "unreadable" leaves the receipt store unreadable.
+   */
+  readonly launchFails?: { current: "accepted" | "unreadable" | "not-accepted" | null };
   readonly baseRefMissing?: boolean;
   readonly events?: Queue.Queue<OrchestrationV2DomainEvent>;
   readonly processes?: Layer.Layer<ProcessRunner.ProcessRunner>;
@@ -231,6 +236,8 @@ const setup = Effect.fn("setup")(function* (options: {
     fs.readFileString(jobFile(name)).pipe(Effect.map((text) => JSON.parse(text)));
 
   const calls: Calls = { launches: [], sends: [], sendLimits: [], interrupts: [] };
+  const acceptedCommands = new Set(options.acceptedCommands);
+  let receiptsUnreadable = options.receiptsUnreadable === true;
   const layer = CommandJobs.layer.pipe(
     Layer.provideMerge(CommandJobFence.layer.pipe(Layer.provide(SqlitePersistence.layerMemory))),
     Layer.provide(
@@ -258,12 +265,25 @@ const setup = Effect.fn("setup")(function* (options: {
               : Effect.void,
           // Like the real service, a replayed command id resolves to the thread it created.
           launch: (input) =>
-            Effect.sync(() => {
+            Effect.suspend(() => {
               calls.launches.push(input);
-              return {
-                threadId: ThreadId.make(`thread:${input.commandId}`),
-                resumed: false,
-              } as ThreadLaunchService.ThreadLaunchResult;
+              const fails = options.launchFails?.current ?? null;
+              if (fails === null) {
+                return Effect.succeed({
+                  threadId: ThreadId.make(`thread:${input.commandId}`),
+                  resumed: false,
+                } as ThreadLaunchService.ThreadLaunchResult);
+              }
+              if (fails === "accepted") acceptedCommands.add(input.commandId);
+              if (fails === "unreadable") receiptsUnreadable = true;
+              return Effect.fail(
+                new ThreadLaunchService.ThreadLaunchError({
+                  operation: "create-thread",
+                  commandId: input.commandId,
+                  projectId: input.projectId,
+                  cause: "lost result after acceptance",
+                }),
+              );
             }),
         }),
         Layer.mock(ThreadManagementService.ThreadManagementService)({
@@ -274,14 +294,14 @@ const setup = Effect.fn("setup")(function* (options: {
           getThreadRecords: () =>
             Effect.sync(() => (options.records?.current ?? { runs: [], subagents: [] }) as never),
           hasReceipt: (commandId) =>
-            options.receiptsUnreadable === true
+            receiptsUnreadable
               ? Effect.fail(
                   new CommandReceiptStore.CommandReceiptStoreReadError({
                     commandId,
                     cause: new Error("Receipt storage unavailable."),
                   }),
                 )
-              : Effect.succeed(options.acceptedCommands?.has(commandId) ?? false),
+              : Effect.succeed(acceptedCommands.has(commandId)),
           sendToThread: (input) =>
             Effect.gen(function* () {
               calls.sends.push(input);
@@ -1121,6 +1141,73 @@ it.live("an accepted launch that cannot be finished is kept with its error, neve
     assert.match(input.workers[0].lastError, /no longer has launch permission/);
     assert.isNull(input.workers[0].terminal);
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.live.each(["accepted", "unreadable", "not-accepted"] as const)(
+  "a fresh launch that fails is forgotten only when it provably was not accepted: %s",
+  (outcome) =>
+    Effect.gen(function* () {
+      const launchFails: { current: typeof outcome | null } = { current: outcome };
+      const fixture = yield* setup({ launch: ceiling, launchFails });
+      yield* fixture.writePlan({ output: JSON.stringify({ requests: [launchRequest("w1")] }) });
+      yield* runJob(fixture.jobs);
+      assert.deepEqual(
+        fixture.calls.launches.map((launch) => String(launch.commandId)),
+        ["command-job:tick:w1"],
+        outcome,
+      );
+      const status = yield* fixture.readJson("status.json");
+      assert.deepEqual(
+        status.failed.map((failed: { workId: string }) => failed.workId),
+        ["w1"],
+        outcome,
+      );
+      const { receipts } = yield* fixture.readJson("receipts.json");
+      const workers = (yield* fixture.jobs.describe("tick")).workers;
+      if (outcome === "not-accepted") {
+        assert.lengthOf(receipts, 0);
+        assert.lengthOf(workers, 0);
+        return;
+      }
+      // The launch may have committed its thread: the intent and its pinned facts stay visible.
+      assert.equal(receipts[0]?.workId, "w1", outcome);
+      assert.equal(receipts[0].threadId, null);
+      assert.equal(receipts[0].launch.promptSha256, PROMPT_W1_SHA256);
+      assert.equal(receipts[0].launch.resolvedBaseCommit, fixture.baseCommit);
+      assert.isNotEmpty(receipts[0].recoveryError);
+      assert.deepEqual(
+        workers.map((worker) => [worker.workId, worker.threadId, worker.recoveryError]),
+        [["w1", null, receipts[0].recoveryError]],
+      );
+      if (outcome === "unreadable") {
+        yield* runJob(fixture.jobs);
+        assert.lengthOf(fixture.calls.launches, 1);
+        const input = yield* fixture.readJson("input.json");
+        assert.equal(input.workers[0].state, "launching");
+        assert.isNotEmpty(input.workers[0].lastError);
+        return;
+      }
+      // Once the cause clears, the next pass finishes it under the same command, from the pin.
+      launchFails.current = null;
+      yield* git(fixture.repo, "commit", "--allow-empty", "-q", "-m", "moved");
+      yield* runJob(fixture.jobs);
+      assert.deepEqual(
+        fixture.calls.launches.map((launch) => String(launch.commandId)),
+        ["command-job:tick:w1", "command-job:tick:w1"],
+      );
+      assert.deepEqual(fixture.calls.launches[1]?.workspaceStrategy, {
+        type: "worktree",
+        baseRef: fixture.baseCommit,
+        branch: "factory/w1",
+        startFromOrigin: false,
+      });
+      const resumed = (yield* fixture.readJson("receipts.json")).receipts;
+      assert.equal(resumed[0].threadId, "thread:command-job:tick:w1");
+      assert.notProperty(resumed[0], "recoveryError");
+      const after = yield* fixture.readJson("status.json");
+      assert.deepEqual(after.failed, []);
+      assert.deepEqual(after.unchanged, ["w1"]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
 it.live(
