@@ -219,12 +219,38 @@ const historical: QuarantineEvidence = {
   ],
   attempts: [{ ...attempt!, status: "completed", started: true }],
   providerTurns: 1,
-  launches: [{ runId, status: "succeeded", attempts: 1 }],
+  // The wake's launch was claimed; the fence's own retained refusal says no provider ran for it.
+  launches: [
+    { runId, status: "succeeded", attempts: 1 },
+    { runId: wakeRunId, status: "succeeded", attempts: 1 },
+  ],
   outcomes: [
     { outcomeId: "outcome:142", state: "verified", kind: "review_passed", fromExecution: true },
   ],
   quarantine: null,
 };
+// A later launch of the same execution, claimed and failed, with no start and no retained refusal.
+const laterRunId = RunId.make("run:142:3");
+const laterUnproved: QuarantineEvidence = {
+  ...historical,
+  runs: [
+    ...historical.runs,
+    {
+      ...run!,
+      runId: laterRunId,
+      status: "failed",
+      started: false,
+      obligation: "none",
+      generations: [],
+    },
+  ],
+  attempts: [
+    ...historical.attempts,
+    { ...attempt!, attemptId: RunAttemptId.make("attempt:3"), runId: laterRunId },
+  ],
+  launches: [...historical.launches, { runId: laterRunId, status: "failed", attempts: 1 }],
+};
+const [, , laterRun] = laterUnproved.runs;
 const [reviewRun, wakeRun] = historical.runs;
 
 describe("quarantineRefusals", () => {
@@ -234,6 +260,20 @@ describe("quarantineRefusals", () => {
     assert.deepStrictEqual(
       quarantineRefusals(
         { ...historical, reservation: { ...historical.reservation, admittedIn: null } },
+        servingId,
+      ),
+      [],
+    );
+    // A launch never claimed started nothing, whatever its run's failure.
+    assert.deepStrictEqual(
+      quarantineRefusals(
+        {
+          ...laterUnproved,
+          launches: [
+            ...historical.launches,
+            { runId: laterRunId, status: "cancelled", attempts: 0 },
+          ],
+        },
         servingId,
       ),
       [],
@@ -331,6 +371,20 @@ describe("quarantineRefusals", () => {
       { ...historical, custody: { state: "quiescent", reasons: ["contained_quiet"] } },
     ],
     ["no_run", { ...historical, runs: [] }],
+    // An earlier report says nothing about a later launch whose outcome no record proves.
+    ["launch_outcome_unproved", laterUnproved],
+    // A failed session open is not a refusal before any provider work: the CLI may have started.
+    [
+      "launch_outcome_unproved",
+      {
+        ...laterUnproved,
+        runs: [...historical.runs, { ...laterRun!, beforeTurn: "provider-session-open-failure" }],
+      },
+    ],
+    [
+      "launch_outcome_unproved",
+      { ...laterUnproved, runs: historical.runs, attempts: historical.attempts },
+    ],
   ])("refuses %s", (refusal, evidence) => {
     assert.include(quarantineRefusals(evidence, servingId), refusal);
   });
