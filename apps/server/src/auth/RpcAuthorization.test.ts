@@ -5,6 +5,7 @@ import {
   AuthProvidersManageScope,
   AuthSettingsWriteScope,
   DEFAULT_SERVER_SETTINGS,
+  FactoryId,
   ProviderInstanceId,
   ThreadId,
   AuthOrchestrationOperateScope,
@@ -87,6 +88,93 @@ it("requires operate permission for tool updates even alongside a read-only chec
     AuthOrchestrationOperateScope,
   );
   expect(requiredScopeForDeviceList({ updateTool: "hub" })).toBe(AuthOrchestrationOperateScope);
+});
+
+describe("factory owner authorization", () => {
+  it("reads factories with read scope, answers them with operate and configures them with settings", () => {
+    expect(requiredScopeForRpcMethod(WS_METHODS.factoryOverview)).toBe(AuthOrchestrationReadScope);
+    for (const method of [
+      WS_METHODS.factoryDecide,
+      WS_METHODS.factoryEnter,
+      WS_METHODS.factoryRejectOutcome,
+      WS_METHODS.factoryRevokeGrant,
+      WS_METHODS.factoryRecoverRun,
+      WS_METHODS.factoryObserveClaims,
+      WS_METHODS.factoryTransfer,
+      WS_METHODS.factoryRollbackTransfer,
+      WS_METHODS.factoryDisposeClaim,
+    ]) {
+      expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationOperateScope);
+    }
+    for (const method of [
+      WS_METHODS.factoryConfigure,
+      WS_METHODS.factorySwitchProvider,
+      WS_METHODS.factoryDisposeNeverStarted,
+    ]) {
+      expect(requiredScopeForRpcMethod(method)).toBe(AuthSettingsWriteScope);
+    }
+  });
+
+  const tested = [
+    WS_METHODS.factoryOverview,
+    WS_METHODS.factoryDecide,
+    WS_METHODS.factoryConfigure,
+  ] as const;
+  const group = WsRpcGroup.omit(
+    ...[...WsRpcGroup.requests.keys()].filter(
+      (tag): tag is Exclude<keyof typeof RPC_REQUIRED_SCOPES, (typeof tested)[number]> =>
+        !(tested as ReadonlyArray<string>).includes(tag),
+    ),
+  );
+
+  it.effect.each([
+    { scopes: [AuthOrchestrationReadScope], allowed: ["overview"] },
+    {
+      scopes: [AuthOrchestrationReadScope, AuthOrchestrationOperateScope],
+      allowed: ["overview", "decide"],
+    },
+    {
+      scopes: [AuthOrchestrationReadScope, AuthOrchestrationOperateScope, AuthSettingsWriteScope],
+      allowed: ["overview", "decide", "configure"],
+    },
+  ])("a session with $scopes reaches only $allowed", ({ scopes, allowed }) =>
+    Effect.gen(function* () {
+      const handled: Array<string> = [];
+      const client = yield* RpcTest.makeClient(group).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            group.toLayerHandler(WS_METHODS.factoryOverview, () =>
+              Effect.sync(() => handled.push("overview")).pipe(Effect.as({ factories: [] })),
+            ),
+            group.toLayerHandler(WS_METHODS.factoryDecide, () =>
+              Effect.sync(() => handled.push("decide")).pipe(Effect.as({ resolved: true })),
+            ),
+            group.toLayerHandler(WS_METHODS.factoryConfigure, () =>
+              Effect.sync(() => handled.push("configure")).pipe(
+                Effect.as({
+                  factoryId: FactoryId.make("alpha"),
+                  enabled: true,
+                  configurationRevision: 1,
+                  policyRevision: "policy",
+                }),
+              ),
+            ),
+            RpcAuthorization.layer(scopes),
+          ),
+        ),
+      );
+      yield* Effect.exit(client[WS_METHODS.factoryOverview]({}));
+      yield* Effect.exit(
+        client[WS_METHODS.factoryDecide]({
+          factoryId: FactoryId.make("alpha"),
+          decisionId: "decision",
+          answer: "approve",
+        }),
+      );
+      yield* Effect.exit(client[WS_METHODS.factoryConfigure]({ configuration: "{}" }));
+      expect(handled).toEqual(allowed);
+    }).pipe(Effect.scoped),
+  );
 });
 
 describe("RPC scope middleware", () => {

@@ -42,6 +42,10 @@ import { buildCodexAdditionalContext } from "../../apps/server/src/provider/Code
 import { AttachmentToolkit } from "../../apps/server/src/mcp/toolkits/attachment/tools.ts";
 import { DeviceToolkit } from "../../apps/server/src/mcp/toolkits/device/tools.ts";
 import { EnvironmentToolkit } from "../../apps/server/src/mcp/toolkits/environment/tools.ts";
+import {
+  FactoryToolkit,
+  hiddenFromAgents as factoryOwnerOnly,
+} from "../../apps/server/src/mcp/toolkits/factory/tools.ts";
 import { HtmlToolkit } from "../../apps/server/src/mcp/toolkits/html/tools.ts";
 import { OrchestratorToolkit } from "../../apps/server/src/mcp/toolkits/orchestrator/tools.ts";
 import { PreviewToolkit } from "../../apps/server/src/mcp/toolkits/preview/tools.ts";
@@ -360,6 +364,7 @@ const t3SourceTools: ReadonlyArray<Tool.Any> = [
   EnvironmentToolkit,
   PreviewControlsToolkit,
   WorktreeToolkit,
+  FactoryToolkit,
   PullRequestsToolkit,
   PreviewToolkit,
   DeviceToolkit,
@@ -382,10 +387,13 @@ const enabledWhen = (predicate: () => boolean) =>
 const hiddenFromSubagents = enabledWhen(McpInvocationContext.hiddenFromSubagents);
 // The Linked environments beta starts off, and T3 lists its tools only while it is on.
 const hiddenWhileLinksOff = enabledWhen(McpInvocationContext.hiddenWhileLinksOff);
+// Every eval thread is an agent's, and T3 lists factory owner tools only to the owner's clients.
+const hiddenFromAgents = enabledWhen(factoryOwnerOnly);
 const visibleT3Tools = (options: { readonly subagent?: boolean; readonly links?: boolean }) =>
   t3Tools.filter(
     (tool) =>
       (options.links === true || !hiddenWhileLinksOff.has(tool.name)) &&
+      !hiddenFromAgents.has(tool.name) &&
       !(options.subagent === true && hiddenFromSubagents.has(tool.name)),
   );
 

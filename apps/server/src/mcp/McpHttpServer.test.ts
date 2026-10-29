@@ -1,3 +1,4 @@
+import * as FactoryLifecycle from "../factory/FactoryLifecycle.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
@@ -1072,6 +1073,122 @@ it.effect("lists pull request watch tools only to threads that are not delegated
       expect(childTools).toContain("link_pull_request");
       expect(childTools).not.toContain("watch_pull_request");
       expect(childTools).not.toContain("unwatch_pull_request");
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("lists owner factory tools only to clients and binds a report to its thread", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const agentThreadId = ThreadId.make("thread-factory-stage");
+      const ownerToken = "owner-payload.owner-signature";
+      const agentScope: McpInvocationContext.McpThreadInvocationScope = {
+        environmentId,
+        requestNamespace: "agentToken",
+        thread: {
+          threadId: agentThreadId,
+          providerSessionId: "agentToken",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+        },
+        client: undefined,
+        capabilities: new Set(["orchestration"]),
+        issuedAt: 1,
+      };
+      const ownerScope: McpInvocationContext.McpInvocationScope = {
+        environmentId,
+        requestNamespace: "client:owner",
+        thread: undefined,
+        client: { sessionId: "owner", label: "Owner laptop", access: "full-access" },
+        capabilities: new Set(["orchestration"]),
+        issuedAt: 1,
+      };
+      const reported: Array<unknown> = [];
+      const serverLayer = McpHttpServer.layerFactoryToolkit.pipe(
+        Layer.provideMerge(
+          McpHttpServer.layerMcpTransport.pipe(Layer.provide(ServerSettings.layerTest())),
+        ),
+        Layer.provide(
+          Layer.mock(McpSessionRegistry.McpSessionRegistry)({
+            resolve: (token) => Effect.succeed(token === "agentToken" ? agentScope : undefined),
+          }),
+        ),
+        Layer.provide(
+          Layer.succeed(McpHttpServer.McpClientAuthenticator, {
+            authenticate: (request) =>
+              Effect.succeed(
+                request.headers.authorization === `Bearer ${ownerToken}` ? ownerScope : undefined,
+              ),
+          }),
+        ),
+        Layer.provide(
+          Layer.mergeAll(
+            McpToolAccessTestkit.liveThreadsLayer,
+            Layer.mock(FactoryLifecycle.FactoryLifecycle)({
+              report: (input) =>
+                Effect.sync(() => reported.push(input)).pipe(
+                  Effect.as({ outcomeId: "outcome-1", state: "reported" as const }),
+                ),
+            }),
+          ),
+        ),
+      );
+      yield* HttpRouter.serve(serverLayer, { disableListenLog: true, disableLogger: true }).pipe(
+        Layer.build,
+      );
+      const httpClient = yield* HttpClient.HttpClient;
+      const session = (token: string) =>
+        Effect.gen(function* () {
+          const headers = {
+            accept: "application/json, text/event-stream",
+            authorization: `Bearer ${token}`,
+          };
+          const initialize = yield* httpClient.post("/mcp", {
+            headers,
+            body: HttpBody.text(
+              `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"1.0.0"}}}`,
+              "application/json",
+            ),
+          });
+          return (method: string, params: object) =>
+            httpClient
+              .post("/mcp", {
+                headers: {
+                  ...headers,
+                  "mcp-session-id": initialize.headers["mcp-session-id"]!,
+                  "mcp-protocol-version": "2025-06-18",
+                },
+                body: HttpBody.text(
+                  JSON.stringify({ jsonrpc: "2.0", id: 2, method, params }),
+                  "application/json",
+                ),
+              })
+              .pipe(Effect.flatMap((response) => response.json));
+        });
+      const listed = (token: string) =>
+        Effect.gen(function* () {
+          const body = (yield* (yield* session(token))("tools/list", {})) as {
+            readonly result: { readonly tools: ReadonlyArray<{ readonly name: string }> };
+          };
+          return body.result.tools.map((tool) => tool.name).toSorted();
+        });
+
+      const shared = ["t3_factory_enter", "t3_factory_report", "t3_factory_state"];
+      const ownerOnly = [
+        "t3_factory_decide",
+        "t3_factory_dispose_claim",
+        "t3_factory_reject_outcome",
+        "t3_factory_revoke_grant",
+        "t3_factory_rollback_transfer",
+        "t3_factory_transfer",
+      ];
+      expect(yield* listed("agentToken")).toEqual(shared);
+      expect(yield* listed(ownerToken)).toEqual([...shared, ...ownerOnly].toSorted());
+
+      yield* (yield* session("agentToken"))("tools/call", {
+        name: "t3_factory_report",
+        arguments: { outcome: "failed", failure: "boom", summary: "failed" },
+      });
+      expect(reported).toMatchObject([{ threadId: agentThreadId, report: { outcome: "failed" } }]);
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );

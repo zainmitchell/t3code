@@ -11,7 +11,9 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 
+import * as FactoryStore from "../factory/FactoryStore.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 
 const EPOCH = DateTime.makeUnsafe("2026-01-01T00:00:00.000Z");
@@ -100,3 +102,17 @@ export const idleThreadProjection = (
     updatedAt: shell.updatedAt,
   };
 };
+
+/** A factory store in which only `bound` threads run factory work. Callers read only its presence. */
+export const factoryStoreLayer = (bound: ReadonlySet<ThreadId>) =>
+  Layer.mock(FactoryStore.FactoryStore)({
+    servingId: "serving:test",
+    bindingForThread: (threadId) =>
+      Effect.succeed(
+        bound.has(threadId)
+          ? Option.some({
+              reservationId: `reservation:${threadId}`,
+            } as FactoryStore.FactoryReservation)
+          : Option.none(),
+      ),
+  });

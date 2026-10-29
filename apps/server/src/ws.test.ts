@@ -1,13 +1,20 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
+  AuthOrchestrationOperateScope,
   AuthSessionId,
+  CommandId,
   EnvironmentId,
+  FactoryId,
+  RuntimeRequestId,
   ProjectId,
   ThreadId,
   ProviderDriverKind,
   ProviderInstanceId,
+  factoryCardRequestId,
+  ORCHESTRATION_V2_WS_METHODS,
   WS_METHODS,
+  WsRpcGroup,
   WsServerRefreshProvidersRpc,
   WsSubscribeServerConfigRpc,
   type OrchestrationV2StoredEvent,
@@ -80,6 +87,9 @@ import * as ReviewService from "./review/ReviewService.ts";
 import * as ScheduledTasks from "./scheduledTasks/ScheduledTaskService.ts";
 import * as SecretRequests from "./secrets/SecretRequests.ts";
 import * as GuestShareService from "./guest/GuestShareService.ts";
+import * as FactoryClaimService from "./factory/FactoryClaimService.ts";
+import * as FactoryLifecycle from "./factory/FactoryLifecycle.ts";
+import * as RpcAuthorization from "./auth/RpcAuthorization.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
@@ -518,6 +528,8 @@ const layerUnusedConfigRpcServices = Layer.mergeAll(
   Layer.mock(ScheduledTasks.ScheduledTaskService)({}),
   Layer.mock(SecretRequests.SecretRequests)({}),
   Layer.mock(GuestShareService.GuestShareService)({}),
+  Layer.mock(FactoryLifecycle.FactoryLifecycle)({}),
+  Layer.mock(FactoryClaimService.FactoryClaimService)({}),
   Layer.mock(ServerLifecycleEvents.ServerLifecycleEvents)({}),
   Layer.mock(ServerRuntimeStartup.ServerRuntimeStartup)({}),
   Layer.mock(ServerSelfUpdate.ServerSelfUpdate)({}),
@@ -860,6 +872,110 @@ it.effect("on-demand clients get provider config without workspace snapshots", (
       [[[snapshotFor("/b", "2026-10-25T00:00:00.000Z")], []]],
     );
     yield* server.write(0, { _tag: "Interrupt", requestId: configRequest, interruptors: [] });
+  }).pipe(
+    Effect.provide(
+      Layer.mergeAll(
+        Layer.fresh(layerConfigSources),
+        Layer.mock(PreviewAutomationBroker.PreviewAutomationBroker)({}),
+        Layer.mock(ServerBrowser.ServerBrowser)({}),
+      ),
+    ),
+    Effect.scoped,
+  ),
+);
+
+it.effect("a factory owner answer acts as the authenticated session, never the payload", () =>
+  Effect.gen(function* () {
+    const answered: Array<{ readonly by: string }> = [];
+    const responses = yield* Queue.unbounded<unknown>();
+    const tested = [WS_METHODS.factoryDecide, ORCHESTRATION_V2_WS_METHODS.dispatchCommand] as const;
+    const group = WsRpcGroup.omit(
+      ...[...WsRpcGroup.requests.keys()].filter(
+        (tag): tag is Exclude<RpcGroup.Rpcs<typeof WsRpcGroup>["_tag"], (typeof tested)[number]> =>
+          !(tested as ReadonlyArray<string>).includes(tag),
+      ),
+    );
+    const server = yield* RpcServer.makeNoSerialization(group, {
+      ...WS_RPC_SERVER_OPTIONS,
+      onFromServer: (response) =>
+        response._tag === "Exit" ? Queue.offer(responses, response.exit) : Effect.void,
+    }).pipe(
+      Effect.provide(
+        Layer.merge(
+          RpcAuthorization.layer([AuthOrchestrationOperateScope]),
+          layerWsRpc(
+            {
+              sessionId: AuthSessionId.make("owner-session"),
+              subject: "owner",
+              method: "browser-session-cookie",
+              scopes: [],
+            },
+            {},
+            yield* ServerBrowser.ServerBrowser,
+          ).pipe(
+            Layer.provide(
+              Layer.mergeAll(
+                layerUnusedConfigRpcServices,
+                Layer.mock(ExternalLauncher.ExternalLauncher)({}),
+                Layer.mock(ProviderRegistry.ProviderRegistry)({}),
+                Layer.mock(UsageLimitSources.UsageLimitSources)({}),
+                Layer.mock(RemoteOpenTargets.RemoteOpenTargets)({}),
+                Layer.mock(DirectEndpoints.DirectEndpoints)({}),
+                Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({ namedProjectsRoot: "" }),
+                Layer.mock(ScratchThreadPromotion.ScratchThreadPromotion)({}),
+                Layer.mock(ServerEnvironment.ServerEnvironment)({}),
+                Layer.mock(EnvironmentAuth.EnvironmentAuth)({}),
+                Layer.mock(FactoryLifecycle.FactoryLifecycle)({
+                  resolveReservedDecision: (input) =>
+                    Effect.sync(() => answered.push(input)).pipe(Effect.as(true)),
+                  answerCard: (input) =>
+                    Effect.sync(() => answered.push(input)).pipe(Effect.as({ sequence: 7 })),
+                }),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    // A client that names its own actor is still recorded as the session it authenticated as.
+    const forged = {
+      factoryId: FactoryId.make("alpha"),
+      decisionId: "d1",
+      answer: "approve",
+      by: "someone-else",
+    };
+    yield* server.write(0, {
+      _tag: "Request",
+      id: RpcMessage.RequestId("decide"),
+      tag: WS_METHODS.factoryDecide,
+      payload: forged,
+      headers: Headers.empty,
+    });
+    assert.deepInclude(yield* Queue.take(responses), {
+      _tag: "Success",
+      value: { resolved: true },
+    });
+    // A decision card in a chat is answered through the factory, not as an ordinary answer.
+    yield* server.write(0, {
+      _tag: "Request",
+      id: RpcMessage.RequestId("card"),
+      tag: ORCHESTRATION_V2_WS_METHODS.dispatchCommand,
+      payload: {
+        type: "runtime-request.respond",
+        commandId: CommandId.make("card-answer"),
+        threadId: ThreadId.make("owner-thread"),
+        requestId: RuntimeRequestId.make(
+          factoryCardRequestId({ factoryId: "alpha", kind: "gate", subjectId: "d1", n: 1 }),
+        ),
+        answers: { decision: "approve" },
+      },
+      headers: Headers.empty,
+    });
+    assert.deepInclude(yield* Queue.take(responses), { _tag: "Success", value: { sequence: 7 } });
+    assert.deepEqual(
+      answered.map((input) => input.by),
+      ["session:owner:owner-session", "session:owner:owner-session"],
+    );
   }).pipe(
     Effect.provide(
       Layer.mergeAll(

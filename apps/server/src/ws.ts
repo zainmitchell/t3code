@@ -56,6 +56,8 @@ import {
   ORCHESTRATION_PROTOCOL_QUERY_PARAM,
   ORCHESTRATION_PROTOCOL_VERSION,
   OrchestrationV2DispatchCommandError,
+  FactoryOwnerError,
+  isFactoryCardRequestId,
   OrchestrationV2GetShellSnapshotError,
   OrchestrationV2GetThreadProjectionError,
   OrchestrationV2ThreadLaunchError,
@@ -122,6 +124,9 @@ import * as DocumentText from "./provider/DocumentText.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ScheduledTasks from "./scheduledTasks/ScheduledTaskService.ts";
 import * as SecretRequests from "./secrets/SecretRequests.ts";
+import * as FactoryClaimService from "./factory/FactoryClaimService.ts";
+import * as FactoryLifecycle from "./factory/FactoryLifecycle.ts";
+import { factoryStateView, transferView } from "./factory/factoryStateView.ts";
 import * as GuestShareService from "./guest/GuestShareService.ts";
 import {
   buildActiveShellSnapshot,
@@ -1269,6 +1274,23 @@ export const layerWsRpc = (
       const providerSessionManager = yield* ProviderSessionManager.ProviderSessionManagerV2;
       const scheduledTasks = yield* ScheduledTasks.ScheduledTaskService;
       const secretRequests = yield* SecretRequests.SecretRequests;
+      const factoryLifecycle = yield* FactoryLifecycle.FactoryLifecycle;
+      const factoryClaims = yield* FactoryClaimService.FactoryClaimService;
+      // Who acted, as the server authenticated them: an owner's client or a host administrator.
+      const factoryActor = `session:${currentSession.subject}:${currentSession.sessionId}`;
+      const isFactoryLifecycleError = Schema.is(FactoryLifecycle.FactoryLifecycleError);
+      const isFactoryConfigurationInvalid = Schema.is(FactoryLifecycle.FactoryConfigurationInvalid);
+      // The owner needs the reason, which a lifecycle error carries as its cause.
+      const factoryOwnerFailure = (cause: unknown) =>
+        new FactoryOwnerError({
+          message: `The factory could not complete that: ${
+            isFactoryLifecycleError(cause)
+              ? `${cause.message} ${String(cause.cause)}`
+              : isFactoryConfigurationInvalid(cause)
+                ? cause.message
+                : String(cause)
+          }`.slice(0, 2_000),
+        });
       const guestShares = yield* GuestShareService.GuestShareService;
       const pullRequests = yield* PullRequestService.PullRequestService;
       const reviewGuides = yield* PullRequestReviewGuideService.PullRequestReviewGuideService;
@@ -1862,55 +1884,79 @@ export const layerWsRpc = (
 
       const handlers = ServerWsRpcGroup.of({
         [ORCHESTRATION_V2_WS_METHODS.dispatchCommand]: (command) =>
-          Effect.annotateCurrentSpan({
-            "orchestration_v2.command_id": command.commandId,
-            "orchestration_v2.command_type": command.type,
-            "orchestration_v2.thread_id":
-              command.type === "thread.fork" || command.type === "thread.merge_back"
-                ? command.targetThreadId
-                : command.type === "delegated_task.request" ||
-                    command.type === "delegated_task.wake-policy" ||
-                    command.type === "delegated_task.completion-delivery.acknowledge" ||
-                    command.type === "delegated_task.completion-delivery.dispose" ||
-                    command.type === "thread.created.record"
-                  ? command.parentThreadId
-                  : command.threadId,
-            ...(command.type === "thread.fork" || command.type === "thread.merge_back"
-              ? { "orchestration_v2.source_thread_id": command.sourceThreadId }
-              : {}),
-          }).pipe(
-            Effect.andThen(
-              startup
-                .enqueueCommand(
-                  (command.type === "prepared-run.retry"
-                    ? threadLaunch.retryPreparation(command)
-                    : ThreadMessageIntake.dispatchCommand(
-                        ThreadManagementService.withCreationProvenance(command, {
-                          createdBy: "user",
-                          creationSource:
-                            "creationSource" in command ? command.creationSource : "web",
-                        }),
-                      )
-                  ).pipe(Effect.provide(intakeContext)),
-                )
+          command.type === "runtime-request.respond" &&
+          command.answers !== undefined &&
+          isFactoryCardRequestId(command.requestId)
+            ? // A factory decision card: only this person's own session answers it, through the
+              // factory's owner-only service, never as an ordinary answer an agent could give.
+              factoryLifecycle
+                .answerCard({
+                  threadId: command.threadId,
+                  requestId: command.requestId,
+                  answers: command.answers,
+                  by: factoryActor,
+                })
                 .pipe(
-                  Effect.tap((result) =>
-                    result.replayed ? Effect.void : recordClientCommandAnalytics(command),
-                  ),
-                  Effect.map((result) => ({ sequence: result.sequence })),
                   Effect.mapError((cause) => {
-                    const detail = userFacingDispatchErrorMessage(cause);
+                    const detail = cause._tag === "FactoryCardRefused" ? cause.message : undefined;
                     return new OrchestrationV2DispatchCommandError({
                       commandId: command.commandId,
                       commandType: command.type,
-                      message: detail ?? "Failed to dispatch orchestration V2 command",
+                      message: detail ?? "Failed to answer the factory decision",
                       ...(detail === undefined ? {} : { detail }),
                       cause,
                     });
                   }),
+                )
+            : Effect.annotateCurrentSpan({
+                "orchestration_v2.command_id": command.commandId,
+                "orchestration_v2.command_type": command.type,
+                "orchestration_v2.thread_id":
+                  command.type === "thread.fork" || command.type === "thread.merge_back"
+                    ? command.targetThreadId
+                    : command.type === "delegated_task.request" ||
+                        command.type === "delegated_task.wake-policy" ||
+                        command.type === "delegated_task.completion-delivery.acknowledge" ||
+                        command.type === "delegated_task.completion-delivery.dispose" ||
+                        command.type === "thread.created.record"
+                      ? command.parentThreadId
+                      : command.threadId,
+                ...(command.type === "thread.fork" || command.type === "thread.merge_back"
+                  ? { "orchestration_v2.source_thread_id": command.sourceThreadId }
+                  : {}),
+              }).pipe(
+                Effect.andThen(
+                  startup
+                    .enqueueCommand(
+                      (command.type === "prepared-run.retry"
+                        ? threadLaunch.retryPreparation(command)
+                        : ThreadMessageIntake.dispatchCommand(
+                            ThreadManagementService.withCreationProvenance(command, {
+                              createdBy: "user",
+                              creationSource:
+                                "creationSource" in command ? command.creationSource : "web",
+                            }),
+                          )
+                      ).pipe(Effect.provide(intakeContext)),
+                    )
+                    .pipe(
+                      Effect.tap((result) =>
+                        result.replayed ? Effect.void : recordClientCommandAnalytics(command),
+                      ),
+                      Effect.map((result) => ({ sequence: result.sequence })),
+                      Effect.mapError((cause) => {
+                        const detail = userFacingDispatchErrorMessage(cause);
+                        return new OrchestrationV2DispatchCommandError({
+                          commandId: command.commandId,
+                          commandType: command.type,
+                          message: detail ?? "Failed to dispatch orchestration V2 command",
+                          ...(detail === undefined ? {} : { detail }),
+                          cause,
+                        });
+                      }),
+                    ),
                 ),
-            ),
-          ),
+              ),
         [ORCHESTRATION_V2_WS_METHODS.stopWorkflow]: (input) => threadManagement.stopWorkflow(input),
         [ORCHESTRATION_V2_WS_METHODS.getWorkflowScript]: (input) =>
           readWorkflowScript({ scriptPath: input.scriptPath }),
@@ -2160,6 +2206,119 @@ export const layerWsRpc = (
         [WS_METHODS.secretsAnswerRequest]: (input) =>
           Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": input.threadId }).pipe(
             Effect.andThen(secretRequests.answer(input)),
+          ),
+        [WS_METHODS.factoryOverview]: () =>
+          factoryLifecycle.overview().pipe(
+            Effect.map((factories) => ({
+              factories: factories.map(({ factoryId, state }) => ({
+                factoryId,
+                state: factoryStateView(state),
+              })),
+            })),
+            Effect.mapError(factoryOwnerFailure),
+          ),
+        [WS_METHODS.factoryEnter]: (input) =>
+          factoryLifecycle.enter(input).pipe(Effect.mapError(factoryOwnerFailure)),
+        // Every client on this transport is a person's own session or this host's administrator:
+        // agents reach the factory through MCP, where only the owner's own client may answer.
+        [WS_METHODS.factoryDecide]: (input) =>
+          factoryLifecycle.resolveReservedDecision({ ...input, by: factoryActor }).pipe(
+            Effect.map((resolved) => ({ resolved })),
+            Effect.mapError(factoryOwnerFailure),
+          ),
+        [WS_METHODS.factoryRejectOutcome]: (input) =>
+          factoryLifecycle.rejectOutcome({ ...input, by: factoryActor }).pipe(
+            Effect.map((rejected) => ({ rejected })),
+            Effect.mapError(factoryOwnerFailure),
+          ),
+        [WS_METHODS.factoryRevokeGrant]: (input) =>
+          factoryLifecycle.revokeGrant({ ...input, by: factoryActor }).pipe(
+            Effect.map((revoked) => ({ revoked })),
+            Effect.mapError(factoryOwnerFailure),
+          ),
+        [WS_METHODS.factoryRecoverRun]: (input) =>
+          factoryClaims.recoverInterruptedRun(input).pipe(
+            Effect.tap((result) =>
+              Effect.logInfo("Factory owner recovery of an interrupted run", {
+                ...input,
+                by: factoryActor,
+                ...result,
+              }),
+            ),
+            Effect.mapError(factoryOwnerFailure),
+          ),
+        [WS_METHODS.factoryDisposeNeverStarted]: (input) =>
+          factoryLifecycle.disposeNeverStarted({ ...input, by: factoryActor }).pipe(
+            Effect.tap((result) =>
+              Effect.logInfo("Factory owner never-started disposition", {
+                factoryId: input.factoryId,
+                reservationId: input.reservationId,
+                by: factoryActor,
+                disposed: result.disposed,
+                refusals: result.refusals,
+                evidenceDigest: result.evidenceDigest,
+              }),
+            ),
+            Effect.mapError(factoryOwnerFailure),
+          ),
+        [WS_METHODS.factoryConfigure]: (input) =>
+          factoryLifecycle.installConfiguration(input.configuration).pipe(
+            Effect.map((configuration) => ({
+              factoryId: configuration.factoryId,
+              enabled: configuration.enabled,
+              configurationRevision: configuration.revision,
+              policyRevision: configuration.policyRevision,
+            })),
+            Effect.mapError(factoryOwnerFailure),
+          ),
+        [WS_METHODS.factorySwitchProvider]: (input) =>
+          providerRegistry.getProviders.pipe(
+            Effect.flatMap((providers) => factoryLifecycle.switchProvider(input, providers)),
+            Effect.tap((result) =>
+              Effect.logInfo("Factory owner provider switch", {
+                factoryId: input.factoryId,
+                from: input.from,
+                to: input.to,
+                apply: input.apply,
+                by: factoryActor,
+                outcome: result.outcome,
+                revision: result.revision,
+                switchedRevision: result.switchedRevision,
+              }),
+            ),
+            Effect.mapError(factoryOwnerFailure),
+          ),
+        [WS_METHODS.factoryObserveClaims]: (input) =>
+          factoryLifecycle.observeClaims(input).pipe(
+            Effect.map((held) => ({
+              claims: held.flatMap((reservation) =>
+                reservation.origin === "observed"
+                  ? [
+                      {
+                        reservationId: reservation.reservationId,
+                        itemKey: reservation.itemKey,
+                        carrierKey: reservation.carrierKey,
+                      },
+                    ]
+                  : [],
+              ),
+            })),
+            Effect.mapError(factoryOwnerFailure),
+          ),
+        [WS_METHODS.factoryTransfer]: (input) =>
+          factoryLifecycle.transferLegacy({ ...input, by: factoryActor }).pipe(
+            Effect.map((result) => transferView(input.transferId, result)),
+            Effect.mapError(factoryOwnerFailure),
+          ),
+        [WS_METHODS.factoryRollbackTransfer]: (input) =>
+          factoryLifecycle.rollbackTransfer({ ...input, by: factoryActor }).pipe(
+            Effect.map((result) => transferView(input.transferId, result)),
+            Effect.mapError(factoryOwnerFailure),
+          ),
+        [WS_METHODS.factoryDisposeClaim]: (input) =>
+          factoryLifecycle.disposeObservedClaim({ ...input, by: factoryActor }).pipe(
+            Effect.map((disposed) => ({ disposed })),
+            Effect.mapError(factoryOwnerFailure),
           ),
         [WS_METHODS.scheduledTasksListWebhookDeliveries]: (input) =>
           Effect.annotateCurrentSpan({ "scheduled_task.id": input.id }).pipe(

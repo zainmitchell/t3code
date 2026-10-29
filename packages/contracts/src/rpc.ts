@@ -371,6 +371,34 @@ import {
 } from "./scheduledTask.ts";
 import { SecretRequestAnswerInput, SecretRequestError } from "./secretRequest.ts";
 import {
+  FactoryConfigureInput,
+  FactoryConfigureResult,
+  FactoryDecideInput,
+  FactoryDecideResult,
+  FactoryDisposeClaimInput,
+  FactoryDisposeClaimResult,
+  FactoryDisposeNeverStartedInput,
+  FactoryDisposeNeverStartedResult,
+  FactoryEnterInput,
+  FactoryEnterResult,
+  FactoryObserveClaimsInput,
+  FactoryObserveClaimsResult,
+  FactoryOverview,
+  FactoryOverviewInput,
+  FactoryOwnerError,
+  FactoryRecoverRunInput,
+  FactoryRecoverRunResult,
+  FactoryRejectOutcomeInput,
+  FactoryRejectOutcomeResult,
+  FactoryRevokeGrantInput,
+  FactoryRevokeGrantResult,
+  FactoryRollbackTransferInput,
+  FactorySwitchProviderInput,
+  FactorySwitchProviderResult,
+  FactoryTransferInput,
+  FactoryTransferResult,
+} from "./factoryMcp.ts";
+import {
   ProjectCloneActionInput,
   ProjectCloneActionResult,
   ProjectCloneListEvent,
@@ -535,6 +563,19 @@ export const WS_METHODS = {
   scheduledTasksRunNow: "scheduledTasks.runNow",
   scheduledTasksRotateWebhookToken: "scheduledTasks.rotateWebhookToken",
   secretsAnswerRequest: "secrets.answerRequest",
+  factoryOverview: "factory.overview",
+  factoryDecide: "factory.decide",
+  factoryEnter: "factory.enter",
+  factoryRejectOutcome: "factory.rejectOutcome",
+  factoryRevokeGrant: "factory.revokeGrant",
+  factoryRecoverRun: "factory.recoverRun",
+  factoryDisposeNeverStarted: "factory.disposeNeverStarted",
+  factoryConfigure: "factory.configure",
+  factorySwitchProvider: "factory.switchProvider",
+  factoryObserveClaims: "factory.observeClaims",
+  factoryTransfer: "factory.transfer",
+  factoryRollbackTransfer: "factory.rollbackTransfer",
+  factoryDisposeClaim: "factory.disposeClaim",
   guestShareCreate: "guestShare.create",
   scheduledTasksListWebhookDeliveries: "scheduledTasks.listWebhookDeliveries",
   scheduledTasksGetWebhookDelivery: "scheduledTasks.getWebhookDelivery",
@@ -1895,6 +1936,84 @@ const WsSecretsAnswerRequestRpc = Rpc.make(WS_METHODS.secretsAnswerRequest, {
   error: Schema.Union([SecretRequestError, EnvironmentAuthorizationError]),
 });
 
+const WsFactoryOverviewRpc = Rpc.make(WS_METHODS.factoryOverview, {
+  payload: FactoryOverviewInput,
+  success: FactoryOverview,
+  error: Schema.Union([FactoryOwnerError, EnvironmentAuthorizationError]),
+});
+
+const WsFactoryDecideRpc = Rpc.make(WS_METHODS.factoryDecide, {
+  payload: FactoryDecideInput,
+  success: FactoryDecideResult,
+  error: Schema.Union([FactoryOwnerError, EnvironmentAuthorizationError]),
+});
+
+const WsFactoryEnterRpc = Rpc.make(WS_METHODS.factoryEnter, {
+  payload: FactoryEnterInput,
+  success: FactoryEnterResult,
+  error: Schema.Union([FactoryOwnerError, EnvironmentAuthorizationError]),
+});
+
+const WsFactoryRejectOutcomeRpc = Rpc.make(WS_METHODS.factoryRejectOutcome, {
+  payload: FactoryRejectOutcomeInput,
+  success: FactoryRejectOutcomeResult,
+  error: Schema.Union([FactoryOwnerError, EnvironmentAuthorizationError]),
+});
+
+const WsFactoryRevokeGrantRpc = Rpc.make(WS_METHODS.factoryRevokeGrant, {
+  payload: FactoryRevokeGrantInput,
+  success: FactoryRevokeGrantResult,
+  error: Schema.Union([FactoryOwnerError, EnvironmentAuthorizationError]),
+});
+
+const WsFactoryRecoverRunRpc = Rpc.make(WS_METHODS.factoryRecoverRun, {
+  payload: FactoryRecoverRunInput,
+  success: FactoryRecoverRunResult,
+  error: Schema.Union([FactoryOwnerError, EnvironmentAuthorizationError]),
+});
+
+const WsFactoryDisposeNeverStartedRpc = Rpc.make(WS_METHODS.factoryDisposeNeverStarted, {
+  payload: FactoryDisposeNeverStartedInput,
+  success: FactoryDisposeNeverStartedResult,
+  error: Schema.Union([FactoryOwnerError, EnvironmentAuthorizationError]),
+});
+
+const WsFactoryConfigureRpc = Rpc.make(WS_METHODS.factoryConfigure, {
+  payload: FactoryConfigureInput,
+  success: FactoryConfigureResult,
+  error: Schema.Union([FactoryOwnerError, EnvironmentAuthorizationError]),
+});
+
+const WsFactorySwitchProviderRpc = Rpc.make(WS_METHODS.factorySwitchProvider, {
+  payload: FactorySwitchProviderInput,
+  success: FactorySwitchProviderResult,
+  error: Schema.Union([FactoryOwnerError, EnvironmentAuthorizationError]),
+});
+
+const WsFactoryObserveClaimsRpc = Rpc.make(WS_METHODS.factoryObserveClaims, {
+  payload: FactoryObserveClaimsInput,
+  success: FactoryObserveClaimsResult,
+  error: Schema.Union([FactoryOwnerError, EnvironmentAuthorizationError]),
+});
+
+const WsFactoryTransferRpc = Rpc.make(WS_METHODS.factoryTransfer, {
+  payload: FactoryTransferInput,
+  success: FactoryTransferResult,
+  error: Schema.Union([FactoryOwnerError, EnvironmentAuthorizationError]),
+});
+
+const WsFactoryRollbackTransferRpc = Rpc.make(WS_METHODS.factoryRollbackTransfer, {
+  payload: FactoryRollbackTransferInput,
+  success: FactoryTransferResult,
+  error: Schema.Union([FactoryOwnerError, EnvironmentAuthorizationError]),
+});
+
+const WsFactoryDisposeClaimRpc = Rpc.make(WS_METHODS.factoryDisposeClaim, {
+  payload: FactoryDisposeClaimInput,
+  success: FactoryDisposeClaimResult,
+  error: Schema.Union([FactoryOwnerError, EnvironmentAuthorizationError]),
+});
+
 const WsScheduledTasksListWebhookDeliveriesRpc = Rpc.make(
   WS_METHODS.scheduledTasksListWebhookDeliveries,
   {
@@ -1995,6 +2114,19 @@ export const WsRpcGroup = RpcGroup.make(
   WsScheduledTasksRunNowRpc,
   WsScheduledTasksRotateWebhookTokenRpc,
   WsSecretsAnswerRequestRpc,
+  WsFactoryOverviewRpc,
+  WsFactoryDecideRpc,
+  WsFactoryEnterRpc,
+  WsFactoryRejectOutcomeRpc,
+  WsFactoryRevokeGrantRpc,
+  WsFactoryRecoverRunRpc,
+  WsFactoryDisposeNeverStartedRpc,
+  WsFactoryConfigureRpc,
+  WsFactorySwitchProviderRpc,
+  WsFactoryObserveClaimsRpc,
+  WsFactoryTransferRpc,
+  WsFactoryRollbackTransferRpc,
+  WsFactoryDisposeClaimRpc,
   WsScheduledTasksListWebhookDeliveriesRpc,
   WsScheduledTasksGetWebhookDeliveryRpc,
   WsServerReportClientActivityRpc,

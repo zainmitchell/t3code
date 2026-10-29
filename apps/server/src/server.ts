@@ -85,6 +85,12 @@ import * as DesktopBrowserChannel from "./preview/DesktopBrowserChannel.ts";
 import * as ServerBrowserStream from "./preview/ServerBrowserStream.ts";
 import * as PreviewBrowser from "./preview/PreviewBrowser.ts";
 import * as ProcessRunner from "./processRunner.ts";
+import * as FactoryExecutionGenerations from "./factory/FactoryExecutionGenerations.ts";
+import * as FactoryIntegrator from "./factory/FactoryIntegrator.ts";
+import * as FactoryLifecycle from "./factory/FactoryLifecycle.ts";
+import * as FactoryStore from "./factory/FactoryStore.ts";
+import * as FactoryTracker from "./factory/FactoryTracker.ts";
+import * as DelegateTaskCheck from "./mcp/DelegateTaskCheck.ts";
 import * as GitManager from "./git/GitManager.ts";
 import * as EnvironmentTheme from "./environmentTheme.ts";
 import * as Keybindings from "./keybindings.ts";
@@ -518,6 +524,9 @@ const layerScheduledTaskWebhookOrigin = Layer.effect(
 );
 
 const layerOrchestrationV2Runtime = RuntimeLayer.layerProduction.pipe(
+  // Factory claims are written to GitHub through the server's source-control transport.
+  Layer.provide(FactoryTracker.layerFromSourceControlDrivers),
+  Layer.provide(FactoryIntegrator.layer),
   Layer.provide(layerScheduledTaskWebhookOrigin),
   Layer.provide(ProviderEventIngestor.layerAnalytics),
   Layer.provide(layerCheckpointStore),
@@ -585,6 +594,7 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   HeldHooksWaker.layer,
   layerThreadSettlementWorker,
   layerIdleCompactionWorker,
+  FactoryLifecycle.layerDriver,
   StorageCleanup.layer.pipe(Layer.provide(ProjectionStoreV2.layer)),
   DatabaseStorage.layer.pipe(
     Layer.provide(ProjectionMaintenance.layer),
@@ -639,6 +649,14 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   ),
   Layer.provideMerge(ProviderRegistry.layer),
   Layer.provideMerge(ProviderInstanceRegistryHydration.layer),
+  // One set of execution containers per server, read by the runtime, terminals and launches. The
+  // persistence layer is the same memoized value as above, so this is the same database.
+  Layer.provideMerge(
+    FactoryExecutionGenerations.layerExecutionCustody.pipe(
+      Layer.provide(ProjectionStoreV2.layer),
+      Layer.provide(layerPersistence),
+    ),
+  ),
   // Provider hydration builds the Claude runner, which reports agents to the same scanner the
   // terminal and preview layers share.
   Layer.provideMerge(layerPortScanner),
@@ -740,6 +758,9 @@ const layerMakeRoutes = Layer.mergeAll(
   McpHttpServer.layer.pipe(
     Layer.provide(ProviderAdapterRegistry.layerFromProviderInstanceRegistry),
     Layer.provide(McpOAuth.layerMcpClientAuthenticator),
+    // Linked-environment starts check factory ownership; without it they fail closed.
+    Layer.provide(FactoryStore.layer),
+    Layer.provide(DelegateTaskCheck.layer.pipe(Layer.provide(ProcessRunner.layer))),
   ),
   // Follows delegated tasks running in linked environments, including after a restart.
   Layer.effectDiscard(

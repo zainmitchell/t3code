@@ -7,6 +7,7 @@ import {
   MessageId,
   type ModelSelection,
   OrchestratorMcpDelegateTaskResult,
+  OrchestratorMcpFailure,
   OrchestratorMcpThreadInterruptResult,
   OrchestratorMcpThreadSendResult,
   ProjectId,
@@ -50,6 +51,13 @@ import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as PeerForwarding from "../peer/PeerForwarding.ts";
 import * as PeerLinkRequests from "../peer/PeerLinkRequests.ts";
 import * as PeerLinks from "../peer/PeerLinks.ts";
+import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
+import * as ServerConfig from "../config.ts";
+import { DocumentText } from "../provider/DocumentText.ts";
+import { SourceControlRepositoryService } from "../sourceControl/SourceControlRepositoryService.ts";
+import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
+import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
+import { factoryStoreLayer, liveThreadsLayer } from "./McpToolAccess.testkit.ts";
 
 const layerOrchestratorToolkit = McpHttpServer.layerOrchestratorToolkit.pipe(
   Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
@@ -609,5 +617,121 @@ describe("orchestrator MCP toolkit", () => {
         }).pipe(Effect.provide(layerTest));
       }),
     ),
+  );
+});
+
+describe("linked-environment starts from factory work", () => {
+  const factoryThreadId = ThreadId.make("thread:factory-worker");
+  const ordinaryThreadId = ThreadId.make("thread:ordinary");
+  const box = EnvironmentId.make("environment:box");
+  const callerScope = (threadId: ThreadId): McpInvocationContext.McpInvocationScope => ({
+    environmentId: EnvironmentId.make("environment:here"),
+    requestNamespace: `provider:${threadId}`,
+    thread: {
+      threadId,
+      providerSessionId: `provider:${threadId}`,
+      providerInstanceId: codexInstanceId,
+    },
+    client: undefined,
+    capabilities: new Set(["orchestration"]),
+    issuedAt: 0,
+  });
+  const client = McpSchema.McpServerClient.of({
+    clientId: 1,
+    protocolVersion: "2025-06-18",
+    clientCapabilities: {},
+    clientInfo: { name: "factory-links", version: "1" },
+    initializePayload: {
+      protocolVersion: "2025-06-18",
+      capabilities: {},
+      clientInfo: { name: "factory-links", version: "1" },
+    },
+    getClient: Effect.die("unused"),
+  });
+  const remoteThread = ThreadId.make("thread:there");
+  // Each upstream tool that takes `environmentId`, classified by what it does there.
+  const calls = [
+    ["t3_thread_send", { threadId: remoteThread, message: "Do more there." }, "starts"],
+    ["t3_thread_launch", { title: "There", message: "Start there." }, "starts"],
+    ["schedule_task", { prompt: "Later there.", schedule: { type: "webhook" } }, "starts"],
+    ["schedule_task", { scheduledTaskId: "task:there", enabled: true }, "starts"],
+    ["t3_thread_read", { threadId: remoteThread }, "permitted"],
+    ["t3_thread_interrupt", { threadId: remoteThread }, "permitted"],
+    ["list_scheduled_tasks", {}, "permitted"],
+    ["delete_scheduled_task", { scheduledTaskId: "task:there" }, "permitted"],
+  ] as const;
+
+  it.effect("refuses only the starts a factory thread sends, before they leave", () =>
+    Effect.gen(function* () {
+      const forwarded: Array<string> = [];
+      const layerTools = Layer.mergeAll(
+        layerOrchestratorToolkit,
+        McpHttpServer.layerProjectRegistration,
+      ).pipe(
+        Layer.provideMerge(McpServer.McpServer.layer),
+        Layer.provide(
+          Layer.mergeAll(
+            liveThreadsLayer,
+            factoryStoreLayer(new Set([factoryThreadId])),
+            Layer.mock(PeerForwarding.PeerForwarding)({
+              call: (_scope, tool) =>
+                Effect.sync(() => forwarded.push(tool.name)).pipe(
+                  Effect.andThen(
+                    Effect.fail(
+                      new OrchestratorMcpFailure({ code: "orchestration_error", message: "there" }),
+                    ),
+                  ),
+                ),
+            }),
+            Layer.mock(PeerLinkRequests.PeerLinkRequests)({}),
+            Layer.mock(PeerLinks.PeerLinks)({}),
+            Layer.mock(RemoteDelegation.RemoteDelegation)({}),
+            Layer.mock(Orchestrator.OrchestratorV2)({}),
+            Layer.mock(ProjectService.ProjectService)({}),
+            Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({ namedProjectsRoot: "" }),
+            Layer.mock(ProviderRegistry.ProviderRegistry)({}),
+            Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({}),
+            Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+            Layer.mock(SecretRequests.SecretRequests)({}),
+            Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+            Layer.mock(GitVcsDriver.GitVcsDriver)({}),
+            Layer.mock(DocumentText)({}),
+            Layer.mock(SourceControlRepositoryService)({}),
+            ServerConfig.layerTest(process.cwd(), { prefix: "t3-factory-links-" }).pipe(
+              Layer.provide(NodeServices.layer),
+            ),
+            ServerSettings.layerTest(),
+            NodeServices.layer,
+          ),
+        ),
+      );
+      const outcome = (threadId: ThreadId, name: string, args: object) =>
+        McpServer.McpServer.pipe(
+          Effect.flatMap((server) =>
+            server.callTool({ name, arguments: { ...args, environmentId: box } }),
+          ),
+          Effect.map(({ content }) =>
+            content.map((part) => (part.type === "text" ? part.text : "")).join(""),
+          ),
+          Effect.provideService(McpInvocationContext.McpInvocationContext, callerScope(threadId)),
+          Effect.provideService(McpSchema.McpServerClient, client),
+        );
+
+      yield* Effect.gen(function* () {
+        for (const [name, args, kind] of calls) {
+          forwarded.length = 0;
+          const fromFactory = yield* outcome(factoryThreadId, name, args);
+          if (kind === "starts") {
+            expect(fromFactory, name).toContain("capability_denied");
+            expect(forwarded, name).toEqual([]);
+          } else {
+            expect(forwarded, name).toEqual([name]);
+          }
+          forwarded.length = 0;
+          yield* outcome(ordinaryThreadId, name, args);
+          expect(forwarded, `${name} from an ordinary thread`).toEqual([name]);
+        }
+      }).pipe(Effect.provide(layerTools));
+    }),
   );
 });

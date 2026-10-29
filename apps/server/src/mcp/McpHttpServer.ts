@@ -65,6 +65,8 @@ import {
   PreviewStandardToolkit,
 } from "./toolkits/preview/tools.ts";
 import * as WorktreeHandlers from "./toolkits/worktree/handlers.ts";
+import * as FactoryHandlers from "./toolkits/factory/handlers.ts";
+import { FactoryToolkit } from "./toolkits/factory/tools.ts";
 import { WorktreeToolkit } from "./toolkits/worktree/tools.ts";
 import * as WorktreeMcpService from "./WorktreeMcpService.ts";
 import * as PullRequestsHandlers from "./toolkits/pullRequests/handlers.ts";
@@ -1099,6 +1101,8 @@ const layerWorktreeToolkitRegistration = toolkitRegistration(
   WorktreeHandlers.layer,
 ).pipe(Layer.provide(WorktreeMcpService.layer));
 
+export const layerFactoryToolkit = toolkitRegistration(FactoryToolkit, FactoryHandlers.layer);
+
 const layerPreviewControlsRegistration = toolkitRegistration(
   PreviewControlsToolkit,
   PreviewControlsHandlers.layer,
@@ -1154,6 +1158,7 @@ export const layerTools = Layer.mergeAll(
   layerEnvironmentToolkit,
   layerPreviewControlsRegistration,
   layerWorktreeToolkitRegistration,
+  layerFactoryToolkit,
   layerPullRequestsToolkit,
   layerDeviceToolkit,
   layerHtmlToolkit,
