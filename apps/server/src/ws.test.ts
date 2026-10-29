@@ -6,6 +6,7 @@ import {
   CommandId,
   EnvironmentId,
   FactoryId,
+  FactoryOwnerError,
   RuntimeRequestId,
   ProjectId,
   ThreadId,
@@ -26,7 +27,9 @@ import {
 } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
 import * as DateTime from "effect/DateTime";
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
@@ -884,7 +887,7 @@ it.effect("on-demand clients get provider config without workspace snapshots", (
   ),
 );
 
-it.effect("a factory owner answer acts as the authenticated session, never the payload", () =>
+it.effect("a factory owner answer acts as the authenticated session and never sees a cause", () =>
   Effect.gen(function* () {
     const answered: Array<{ readonly by: string }> = [];
     const responses = yield* Queue.unbounded<unknown>();
@@ -927,7 +930,15 @@ it.effect("a factory owner answer acts as the authenticated session, never the p
                 Layer.mock(EnvironmentAuth.EnvironmentAuth)({}),
                 Layer.mock(FactoryLifecycle.FactoryLifecycle)({
                   resolveReservedDecision: (input) =>
-                    Effect.sync(() => answered.push(input)).pipe(Effect.as(true)),
+                    input.decisionId === "d-leak"
+                      ? Effect.fail(
+                          new FactoryLifecycle.FactoryLifecycleError({
+                            operation: "resolve-decision",
+                            factoryId: input.factoryId,
+                            cause: new Error("token=ghp_LEAKMARKER at C:/Users/secret/home"),
+                          }),
+                        )
+                      : Effect.sync(() => answered.push(input)).pipe(Effect.as(true)),
                   answerCard: (input) =>
                     Effect.sync(() => answered.push(input)).pipe(Effect.as({ sequence: 7 })),
                 }),
@@ -955,6 +966,22 @@ it.effect("a factory owner answer acts as the authenticated session, never the p
       _tag: "Success",
       value: { resolved: true },
     });
+    yield* server.write(0, {
+      _tag: "Request",
+      id: RpcMessage.RequestId("decide-leak"),
+      tag: WS_METHODS.factoryDecide,
+      payload: { ...forged, decisionId: "d-leak" },
+      headers: Headers.empty,
+    });
+    const failed = yield* Queue.take(responses);
+    assert.isTrue(Exit.isExit(failed) && Exit.isFailure(failed));
+    const failure =
+      Exit.isExit(failed) && Exit.isFailure(failed) ? Cause.squash(failed.cause) : null;
+    assert.instanceOf(failure, FactoryOwnerError);
+    assert.strictEqual(
+      failure.message,
+      "The factory could not complete that: Factory resolve-decision failed for alpha.",
+    );
     // A decision card in a chat is answered through the factory, not as an ordinary answer.
     yield* server.write(0, {
       _tag: "Request",

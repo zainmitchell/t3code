@@ -1,4 +1,5 @@
 import { OrchestrationDispatchCommandError } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as Orchestrator from "./orchestration-v2/Orchestrator.ts";
@@ -1280,17 +1281,31 @@ export const layerWsRpc = (
       const factoryActor = `session:${currentSession.subject}:${currentSession.sessionId}`;
       const isFactoryLifecycleError = Schema.is(FactoryLifecycle.FactoryLifecycleError);
       const isFactoryConfigurationInvalid = Schema.is(FactoryLifecycle.FactoryConfigurationInvalid);
-      // The owner needs the reason, which a lifecycle error carries as its cause.
-      const factoryOwnerFailure = (cause: unknown) =>
-        new FactoryOwnerError({
-          message: `The factory could not complete that: ${
-            isFactoryLifecycleError(cause)
-              ? `${cause.message} ${String(cause.cause)}`
-              : isFactoryConfigurationInvalid(cause)
-                ? cause.message
-                : String(cause)
-          }`.slice(0, 2_000),
-        });
+      // Clients get fixed text and typed attributes only; a cause can hold tokens or host paths.
+      const factoryOwnerMessage = (error: unknown) =>
+        isFactoryLifecycleError(error) || isFactoryConfigurationInvalid(error)
+          ? error.message
+          : "An unexpected error occurred.";
+      const factoryOwnerFailure =
+        (operation: string, factoryId?: string) =>
+        <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+          effect.pipe(
+            Effect.tapCause((cause) =>
+              Cause.hasInterruptsOnly(cause)
+                ? Effect.void
+                : Effect.logWarning("Factory owner request failed", cause).pipe(
+                    Effect.annotateLogs({ operation, factoryId: factoryId ?? "*" }),
+                  ),
+            ),
+            Effect.mapError(
+              (error) =>
+                new FactoryOwnerError({
+                  message: `The factory could not complete that: ${factoryOwnerMessage(
+                    error,
+                  )}`.slice(0, 2_000),
+                }),
+            ),
+          );
       const guestShares = yield* GuestShareService.GuestShareService;
       const pullRequests = yield* PullRequestService.PullRequestService;
       const reviewGuides = yield* PullRequestReviewGuideService.PullRequestReviewGuideService;
@@ -2215,26 +2230,28 @@ export const layerWsRpc = (
                 state: factoryStateView(state),
               })),
             })),
-            Effect.mapError(factoryOwnerFailure),
+            factoryOwnerFailure(WS_METHODS.factoryOverview),
           ),
         [WS_METHODS.factoryEnter]: (input) =>
-          factoryLifecycle.enter(input).pipe(Effect.mapError(factoryOwnerFailure)),
+          factoryLifecycle
+            .enter(input)
+            .pipe(factoryOwnerFailure(WS_METHODS.factoryEnter, input.factoryId)),
         // Every client on this transport is a person's own session or this host's administrator:
         // agents reach the factory through MCP, where only the owner's own client may answer.
         [WS_METHODS.factoryDecide]: (input) =>
           factoryLifecycle.resolveReservedDecision({ ...input, by: factoryActor }).pipe(
             Effect.map((resolved) => ({ resolved })),
-            Effect.mapError(factoryOwnerFailure),
+            factoryOwnerFailure(WS_METHODS.factoryDecide, input.factoryId),
           ),
         [WS_METHODS.factoryRejectOutcome]: (input) =>
           factoryLifecycle.rejectOutcome({ ...input, by: factoryActor }).pipe(
             Effect.map((rejected) => ({ rejected })),
-            Effect.mapError(factoryOwnerFailure),
+            factoryOwnerFailure(WS_METHODS.factoryRejectOutcome, input.factoryId),
           ),
         [WS_METHODS.factoryRevokeGrant]: (input) =>
           factoryLifecycle.revokeGrant({ ...input, by: factoryActor }).pipe(
             Effect.map((revoked) => ({ revoked })),
-            Effect.mapError(factoryOwnerFailure),
+            factoryOwnerFailure(WS_METHODS.factoryRevokeGrant, input.factoryId),
           ),
         [WS_METHODS.factoryRecoverRun]: (input) =>
           factoryClaims.recoverInterruptedRun(input).pipe(
@@ -2245,7 +2262,7 @@ export const layerWsRpc = (
                 ...result,
               }),
             ),
-            Effect.mapError(factoryOwnerFailure),
+            factoryOwnerFailure(WS_METHODS.factoryRecoverRun, input.factoryId),
           ),
         [WS_METHODS.factoryDisposeNeverStarted]: (input) =>
           factoryLifecycle.disposeNeverStarted({ ...input, by: factoryActor }).pipe(
@@ -2259,7 +2276,7 @@ export const layerWsRpc = (
                 evidenceDigest: result.evidenceDigest,
               }),
             ),
-            Effect.mapError(factoryOwnerFailure),
+            factoryOwnerFailure(WS_METHODS.factoryDisposeNeverStarted, input.factoryId),
           ),
         [WS_METHODS.factoryConfigure]: (input) =>
           factoryLifecycle.installConfiguration(input.configuration).pipe(
@@ -2269,7 +2286,7 @@ export const layerWsRpc = (
               configurationRevision: configuration.revision,
               policyRevision: configuration.policyRevision,
             })),
-            Effect.mapError(factoryOwnerFailure),
+            factoryOwnerFailure(WS_METHODS.factoryConfigure),
           ),
         [WS_METHODS.factorySwitchProvider]: (input) =>
           providerRegistry.getProviders.pipe(
@@ -2286,7 +2303,7 @@ export const layerWsRpc = (
                 switchedRevision: result.switchedRevision,
               }),
             ),
-            Effect.mapError(factoryOwnerFailure),
+            factoryOwnerFailure(WS_METHODS.factorySwitchProvider, input.factoryId),
           ),
         [WS_METHODS.factoryObserveClaims]: (input) =>
           factoryLifecycle.observeClaims(input).pipe(
@@ -2303,22 +2320,22 @@ export const layerWsRpc = (
                   : [],
               ),
             })),
-            Effect.mapError(factoryOwnerFailure),
+            factoryOwnerFailure(WS_METHODS.factoryObserveClaims, input.factoryId),
           ),
         [WS_METHODS.factoryTransfer]: (input) =>
           factoryLifecycle.transferLegacy({ ...input, by: factoryActor }).pipe(
             Effect.map((result) => transferView(input.transferId, result)),
-            Effect.mapError(factoryOwnerFailure),
+            factoryOwnerFailure(WS_METHODS.factoryTransfer, input.factoryId),
           ),
         [WS_METHODS.factoryRollbackTransfer]: (input) =>
           factoryLifecycle.rollbackTransfer({ ...input, by: factoryActor }).pipe(
             Effect.map((result) => transferView(input.transferId, result)),
-            Effect.mapError(factoryOwnerFailure),
+            factoryOwnerFailure(WS_METHODS.factoryRollbackTransfer, input.factoryId),
           ),
         [WS_METHODS.factoryDisposeClaim]: (input) =>
           factoryLifecycle.disposeObservedClaim({ ...input, by: factoryActor }).pipe(
             Effect.map((disposed) => ({ disposed })),
-            Effect.mapError(factoryOwnerFailure),
+            factoryOwnerFailure(WS_METHODS.factoryDisposeClaim, input.factoryId),
           ),
         [WS_METHODS.scheduledTasksListWebhookDeliveries]: (input) =>
           Effect.annotateCurrentSpan({ "scheduled_task.id": input.id }).pipe(

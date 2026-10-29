@@ -31,6 +31,8 @@ import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
+import * as ThreadSearch from "../orchestration-v2/ThreadSearch.ts";
+import * as PullRequestReviewGuideService from "../pullRequest/PullRequestReviewGuideService.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
@@ -649,16 +651,26 @@ describe("linked-environment starts from factory work", () => {
     getClient: Effect.die("unused"),
   });
   const remoteThread = ThreadId.make("thread:there");
+  const pullRequestUrl = "https://github.com/acme/app/pull/7";
   // Each upstream tool that takes `environmentId`, classified by what it does there.
   const calls = [
     ["t3_thread_send", { threadId: remoteThread, message: "Do more there." }, "starts"],
     ["t3_thread_launch", { title: "There", message: "Start there." }, "starts"],
     ["schedule_task", { prompt: "Later there.", schedule: { type: "webhook" } }, "starts"],
     ["schedule_task", { scheduledTaskId: "task:there", enabled: true }, "starts"],
+    ["run_scheduled_task_now", { taskId: "task:there" }, "starts"],
+    ["watch_pull_request", { threadId: remoteThread, url: pullRequestUrl }, "starts"],
+    ["write_pull_request_guides", { pullRequests: [{ url: pullRequestUrl }] }, "starts"],
     ["t3_thread_read", { threadId: remoteThread }, "permitted"],
     ["t3_thread_interrupt", { threadId: remoteThread }, "permitted"],
     ["list_scheduled_tasks", {}, "permitted"],
     ["delete_scheduled_task", { scheduledTaskId: "task:there" }, "permitted"],
+    ["unwatch_pull_request", { threadId: remoteThread, url: pullRequestUrl }, "permitted"],
+    [
+      "t3_queue",
+      { action: "cancel", threadId: remoteThread, queuedRunId: "run:there" },
+      "permitted",
+    ],
   ] as const;
 
   it.effect("refuses only the starts a factory thread sends, before they leave", () =>
@@ -667,6 +679,8 @@ describe("linked-environment starts from factory work", () => {
       const layerTools = Layer.mergeAll(
         layerOrchestratorToolkit,
         McpHttpServer.layerProjectRegistration,
+        McpHttpServer.layerThreadToolkit,
+        McpHttpServer.layerPullRequestsToolkit,
       ).pipe(
         Layer.provideMerge(McpServer.McpServer.layer),
         Layer.provide(
@@ -697,6 +711,8 @@ describe("linked-environment starts from factory work", () => {
             Layer.mock(GitVcsDriver.GitVcsDriver)({}),
             Layer.mock(DocumentText)({}),
             Layer.mock(SourceControlRepositoryService)({}),
+            Layer.mock(ThreadSearch.ThreadSearch)({}),
+            Layer.mock(PullRequestReviewGuideService.PullRequestReviewGuideService)({}),
             ServerConfig.layerTest(process.cwd(), { prefix: "t3-factory-links-" }).pipe(
               Layer.provide(NodeServices.layer),
             ),
@@ -722,7 +738,11 @@ describe("linked-environment starts from factory work", () => {
           forwarded.length = 0;
           const fromFactory = yield* outcome(factoryThreadId, name, args);
           if (kind === "starts") {
-            expect(fromFactory, name).toContain("capability_denied");
+            // Pull request tools render a failure as its message alone, without its code.
+            expect(fromFactory, name).toContain("This thread runs factory work");
+            if (!name.includes("pull_request")) {
+              expect(fromFactory, name).toContain("capability_denied");
+            }
             expect(forwarded, name).toEqual([]);
           } else {
             expect(forwarded, name).toEqual([name]);

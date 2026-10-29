@@ -178,7 +178,10 @@ export const writes = <P, A, E, R>(
   );
 
 /** Requires handler capability checks, not thread control; linked work is refused the same way. */
-export const writesWithCapability = <P, A, E, R>(handle: (params: P) => Effect.Effect<A, E, R>) =>
+export const writesWithCapability = <P, A, E, R>(
+  handle: (params: P) => Effect.Effect<A, E, R>,
+  options?: { readonly startsExecutions?: boolean },
+) =>
   declare(
     (params: P) =>
       writingCaller.pipe(
@@ -186,6 +189,7 @@ export const writesWithCapability = <P, A, E, R>(handle: (params: P) => Effect.E
         Effect.flatMap(() => handle(params)),
       ),
     () => writingCaller,
+    () => options?.startsExecutions === true,
   );
 
 /** `startsExecutions` marks a write that can start or queue a run in the threads it names. */
@@ -317,6 +321,8 @@ export const writesEnvironment = <P, A, E, R>(
      * everything already here as it was.
      */
     readonly linkedCallers?: "allowed";
+    /** Whether it can start or queue a run, such as running a scheduled task now. */
+    readonly startsExecutions?: boolean;
   },
 ) => {
   const check = orchestratingCaller.pipe(
@@ -334,6 +340,7 @@ export const writesEnvironment = <P, A, E, R>(
       orchestratingCaller.pipe(
         Effect.tap((caller) => assertFullAccess(caller, fullAccessRequired)),
       ),
+    () => options?.startsExecutions === true,
   );
 };
 

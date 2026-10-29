@@ -42,7 +42,7 @@ export const hiddenFromAgents = (): boolean => {
 
 const FactoryReportTool = Tool.make("t3_factory_report", {
   description:
-    "Needs an agent running a T3 factory lifecycle stage. Report this stage's outcome once its work is done: implemented (with subject.baseCommit and subject.headCommit), failed (with failure), review_passed or review_failed (with the reviewed subject.headCommit, and failure for the findings), correction_spec, or for a triage stage unit_proposed (with proposal: basis = the item version named in the brief, unit, ownedFiles, resources) or not_actionable (with failure). T3 binds the report to this thread's own execution and verifies it by reading the repository and tracker back before the next stage starts. Reporting the same outcome again returns the first report.",
+    "Needs an agent running a T3 factory lifecycle stage. Report this stage's outcome once its work is done: implemented (with subject.baseCommit and subject.headCommit), failed (with failure), review_passed or review_failed (the reviewed subject.headCommit; failure holds findings), correction_spec, or for triage unit_proposed (proposal: basis = the brief's item version, unit, ownedFiles, resources) or not_actionable (with failure). T3 binds it to this thread's execution and verifies it against the repository and tracker. A repeated report returns the first.",
   parameters: FactoryReportInput,
   success: FactoryReportResult,
   failure: Schema.Union([FactoryReportFailure, OrchestratorMcpFailure]),
@@ -57,7 +57,7 @@ const FactoryReportTool = Tool.make("t3_factory_report", {
 
 const FactoryEnterTool = Tool.make("t3_factory_enter", {
   description:
-    "Ask a T3 factory to take one tracker issue now, instead of launching a thread to build it. Name the factory and the issue (repository owner/name and number). The factory reads the issue at once: its own readiness, project policy, claim and capacity decide, and its native stages then implement, review, integrate and close it with their own claim and report authority. Asking again, concurrently or after a restart, never starts a second worker: existing native work comes back as it is. status started or active: a native stage holds it (threadId); held: it waits on an owner decision or another claim; not_ready: reason names what readiness or policy lacks; refused: this factory cannot take the issue. nextAction says who acts. This never makes an issue ready, answers an owner decision or reports for a stage.",
+    "Ask a T3 factory to take one tracker issue now, instead of launching a thread to build it. Name the factory, repository (owner/name) and issue number. Its readiness, policy, claim and capacity decide; its native stages then implement, review, integrate and close it. Asking again never starts a second worker. status started or active: a stage holds it (threadId); held: waits on an owner decision or claim; not_ready: reason says what is missing; refused: this factory cannot take it. nextAction says who acts. Never makes an issue ready, answers a decision or reports a stage.",
   parameters: FactoryEnterInput,
   success: FactoryEnterResult,
   failure: OrchestratorMcpFailure,
@@ -72,7 +72,7 @@ const FactoryEnterTool = Tool.make("t3_factory_enter", {
 
 const FactoryStateTool = Tool.make("t3_factory_state", {
   description:
-    "Read a T3 factory's capacity, its held and released reservations with their execution custody, its pending and answered owner decisions, and what its latest collection decided for each item and why.",
+    "Read a T3 factory's capacity, held and released reservations with custody, pending and answered owner decisions, and its latest collection decision per item with reasons.",
   parameters: FactoryStateInput,
   success: FactoryStateResult,
   failure: OrchestratorMcpFailure,
@@ -85,7 +85,7 @@ const FactoryStateTool = Tool.make("t3_factory_state", {
 
 const FactoryDecideTool = Tool.make("t3_factory_decide", {
   description:
-    "For the factory owner only: answer a pending reserved factory decision (see t3_factory_state). The answer is recorded once and starts the factory's next reconciliation. For a decision of kind grant, answer grant (or approve) with grantUnits to issue that many supervised starts for exactly that request; grantUnits with any other answer settles nothing. A ticket question (stage ticket) takes approve or abandon; any other answer asks it again. Agents running inside T3 threads cannot answer.",
+    "Owner only: answer a pending factory decision (see t3_factory_state). Recorded once; starts the next reconciliation. kind grant: answer grant (or approve) with grantUnits for that many supervised starts; grantUnits with another answer settles nothing. A ticket question (stage ticket) takes approve or abandon; other answers ask again. Agents are refused.",
   parameters: FactoryDecideInput,
   success: FactoryDecideResult,
   failure: OrchestratorMcpFailure,
@@ -100,7 +100,7 @@ const FactoryDecideTool = Tool.make("t3_factory_decide", {
 
 const FactoryDisposeClaimTool = Tool.make("t3_factory_dispose_claim", {
   description:
-    "For the factory owner only: dispose of custody the factory holds as unknown (an observed legacy or outside claim, or a transferred item's legacy custody), once you have checked its writer is stopped and its work is gone. That exact claim or custody is then neither charged nor counted again. Agents running inside T3 threads cannot dispose.",
+    "Owner only: dispose of custody held as unknown (an observed legacy or outside claim, or a transferred item's legacy custody) after checking its writer is stopped and its work gone. It is then never charged or counted again. Agents are refused.",
   parameters: FactoryDisposeClaimInput,
   success: FactoryDisposeClaimResult,
   failure: OrchestratorMcpFailure,
@@ -115,7 +115,7 @@ const FactoryDisposeClaimTool = Tool.make("t3_factory_dispose_claim", {
 
 const FactoryRejectOutcomeTool = Tool.make("t3_factory_reject_outcome", {
   description:
-    "For the factory owner only: explicitly reject a verified factory outcome (an implementation, review or spec). It is never consumed again, however often it is reported, and the item goes to correction. Agents running inside T3 threads cannot reject.",
+    "Owner only: reject a verified outcome (implementation, review or spec). It is never consumed again, however often reported, and the item goes to correction. Agents are refused.",
   parameters: FactoryRejectOutcomeInput,
   success: FactoryRejectOutcomeResult,
   failure: OrchestratorMcpFailure,
@@ -130,7 +130,7 @@ const FactoryRejectOutcomeTool = Tool.make("t3_factory_reject_outcome", {
 
 const FactoryRevokeGrantTool = Tool.make("t3_factory_revoke_grant", {
   description:
-    "For the factory owner only: revoke what remains of a finite factory grant (see t3_factory_state). Agents running inside T3 threads cannot revoke.",
+    "Owner only: revoke the rest of a finite grant (see t3_factory_state). Agents are refused.",
   parameters: FactoryRevokeGrantInput,
   success: FactoryRevokeGrantResult,
   failure: OrchestratorMcpFailure,
@@ -145,7 +145,7 @@ const FactoryRevokeGrantTool = Tool.make("t3_factory_revoke_grant", {
 
 const FactoryTransferTool = Tool.make("t3_factory_transfer", {
   description:
-    "For the factory owner only: hand a legacy command job's work on the named items to the factory. The job's writer is fenced at once (it starts no pass and applies no request), and the items are adopted once its last pass has stopped: answer draining means ask again with the same transferId. Each item keeps its original job, task, work, thread, run and receipt identities, and its legacy custody stays held until you dispose of it with t3_factory_dispose_claim after checking the legacy work yourself. Agents running inside T3 threads cannot transfer.",
+    "Owner only: hand a legacy command job's work on the named items to the factory. Its writer is fenced at once (no new pass or request); items are adopted once its last pass stops: on draining, ask again with the same transferId. Items keep their job, task, work, thread, run and receipt identities; legacy custody stays held until you check it and call t3_factory_dispose_claim. Agents are refused.",
   parameters: FactoryTransferInput,
   success: FactoryTransferResult,
   failure: OrchestratorMcpFailure,
@@ -160,7 +160,7 @@ const FactoryTransferTool = Tool.make("t3_factory_transfer", {
 
 const FactoryRollbackTransferTool = Tool.make("t3_factory_rollback_transfer", {
   description:
-    "For the factory owner only: give a transfer's items and writes back to its legacy command job, as long as no native work began on them. The job's writer is unfenced once no other transfer holds it. Agents running inside T3 threads cannot roll back.",
+    "Owner only: return a transfer's items and writes to its legacy command job if no native work began on them. Its writer is unfenced once no other transfer holds it. Agents are refused.",
   parameters: FactoryRollbackTransferInput,
   success: FactoryTransferResult,
   failure: OrchestratorMcpFailure,
