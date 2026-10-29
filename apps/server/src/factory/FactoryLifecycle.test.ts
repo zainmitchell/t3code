@@ -11020,9 +11020,10 @@ it.effect(
           assert.deepStrictEqual(next.map(stageOf), [[itemKeyFor(7802), "implement"]]);
           assert.strictEqual(yield* dispositionOf(7801), "quarantined");
           // The policy still weighs it as a native writer on its item.
-          assert.deepInclude(
-            (yield* PolicyFake).active.at(-1)?.map((entry) => [entry.itemKey, entry.custody]),
-            [itemKeyFor(7801), "native"],
+          assert.strictEqual(
+            (yield* PolicyFake).active.at(-1)?.find((entry) => entry.itemKey === itemKeyFor(7801))
+              ?.custody,
+            "native",
           );
           assert.deepStrictEqual(yield* occupiedNow, [1]);
 
