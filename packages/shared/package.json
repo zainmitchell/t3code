@@ -331,6 +331,10 @@
       "types": "./src/AgentScope.ts",
       "import": "./src/AgentScope.ts"
     },
+    "./ExecutionJoin": {
+      "types": "./src/ExecutionJoin.ts",
+      "import": "./src/ExecutionJoin.ts"
+    },
     "./HostProcess": {
       "types": "./src/HostProcess.ts",
       "import": "./src/HostProcess.ts"

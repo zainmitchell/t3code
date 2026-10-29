@@ -2223,7 +2223,9 @@ const make = Effect.gen(function* () {
         requestKey: key,
         operation: "delegate-task",
       });
-      const isRetryOfAcceptedDelegation = yield* threadManagement.hasReceipt(commandId);
+      const isRetryOfAcceptedDelegation = yield* threadManagement
+        .hasReceipt(commandId)
+        .pipe(Effect.mapError(threadManagementFailure));
       const target = yield* resolveTargetRechecking({
         parent,
         target: input.target,
@@ -2625,7 +2627,9 @@ const make = Effect.gen(function* () {
                 requestKey: key,
                 index,
               });
-              const isRetryOfAcceptedCreation = yield* threadManagement.hasReceipt(commandId);
+              const isRetryOfAcceptedCreation = yield* threadManagement
+                .hasReceipt(commandId)
+                .pipe(Effect.mapError(threadManagementFailure));
               const committedThread = isRetryOfAcceptedCreation
                 ? yield* threadManagement
                     .getThreadShell(threadId)
@@ -2664,6 +2668,9 @@ const make = Effect.gen(function* () {
                   type: "thread.create",
                   createdBy: "agent",
                   creationSource: "mcp",
+                  // From the authenticated caller, so a later start without a sender still
+                  // belongs to the caller's work.
+                  createdFrom: { type: "thread", threadId: scope.thread.threadId },
                   commandId,
                   threadId,
                   projectId: parent.thread.projectId,
