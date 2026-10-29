@@ -90,6 +90,7 @@ import {
   AGENT_STAGES,
   type FactoryStage,
   type FactoryStageType,
+  isFactoryStage,
   nextStage,
   stageBasis,
   triageBasis,
@@ -97,18 +98,6 @@ import {
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ProviderSessionManager from "../orchestration-v2/ProviderSessionManager.ts";
-
-const LIFECYCLE_STAGES: ReadonlySet<string> = new Set([
-  "implement",
-  "review",
-  "correct",
-  "rework",
-  "integrate",
-  "close",
-  "triage",
-]);
-const isLifecycleStage = (taskKind: string): taskKind is FactoryStageType =>
-  LIFECYCLE_STAGES.has(taskKind);
 
 const TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set([
   "completed",
@@ -484,21 +473,6 @@ export interface FactoryAdmissionProposer {
   >;
 }
 
-/** A proposer that decides each item on its own, in the order the pass read them. */
-export const perItemPolicy = (
-  propose: (
-    input: { readonly configuration: FactoryStore.FactoryConfiguration } & FactoryPolicyItem,
-  ) => Effect.Effect<FactoryPolicyDecision>,
-): FactoryAdmissionProposer => ({
-  decide: ({ configuration, items }) =>
-    Effect.forEach(items, (item) =>
-      Effect.map(propose({ configuration, ...item }), (decision) => ({
-        itemKey: item.observation.itemKey,
-        decision,
-      })),
-    ),
-});
-
 /** The policy could not decide: its pin, process or answer was not usable. Nothing starts. */
 export interface FactoryPolicyFailure {
   readonly type: "policy_failed";
@@ -693,16 +667,6 @@ export class FactoryLifecycle extends Context.Service<
      * agent only when it admits work.
      */
     readonly drive: Effect.Effect<never>;
-    /**
-     * The decision a request would make, so policy can name it in the packet (the helper's work
-     * key) before admitting it.
-     */
-    readonly decisionKeyFor: (
-      input: Pick<
-        FactoryAdmissionRequest,
-        "factoryId" | "itemKey" | "taskKind" | "policyRevision" | "basis"
-      >,
-    ) => Effect.Effect<Option.Option<FactoryDecisionKey>, FactoryLifecycleError>;
     /**
      * A worker's outcome for its own lifecycle stage. T3 binds it to the calling thread's
      * execution, then verifies it by reading back what it claims before anything depends on it.
@@ -932,7 +896,7 @@ const isGrantAnswer = (answer: string) =>
   ["grant", "approve"].includes(answer.trim().toLowerCase());
 
 /** Same item, task kind, policy and evidence is the same decision, whoever triggers it. */
-const decisionKeyOf = (
+export const decisionKeyOf = (
   input: Pick<
     FactoryAdmissionRequest,
     "factoryId" | "itemKey" | "taskKind" | "policyRevision" | "stage"
@@ -2294,7 +2258,7 @@ const make = Effect.gen(function* () {
         }
         show({
           itemKey,
-          stage: isLifecycleStage(running.taskKind) ? running.taskKind : stage.type,
+          stage: isFactoryStage(running.taskKind) ? running.taskKind : stage.type,
           custody: "native",
           issue: weighed,
         });
@@ -2821,7 +2785,7 @@ const make = Effect.gen(function* () {
       };
     }
     // The policy decides the brief; the lifecycle decides which stage it is for.
-    if (isLifecycleStage(decision.taskKind)) {
+    if (isFactoryStage(decision.taskKind)) {
       if (decision.taskKind !== stage.type || !AGENT_STAGES.has(stage.type)) {
         return { disposition: "stage_mismatch" };
       }
@@ -2850,7 +2814,7 @@ const make = Effect.gen(function* () {
       };
     }
     const admission = yield* admit(
-      isLifecycleStage(decision.taskKind)
+      isFactoryStage(decision.taskKind)
         ? {
             ...decision,
             stage: { type: stage.type, basis: stageBasis(stage) },
@@ -3242,34 +3206,6 @@ const make = Effect.gen(function* () {
           isLifecycleError(cause)
             ? cause
             : new FactoryLifecycleError({ operation: "enter", factoryId: input.factoryId, cause }),
-        ),
-      ),
-  );
-
-  const decisionKeyFor = Effect.fn("FactoryLifecycle.decisionKeyFor")(
-    function* (
-      input: Pick<
-        FactoryAdmissionRequest,
-        "factoryId" | "itemKey" | "taskKind" | "policyRevision" | "basis"
-      >,
-    ) {
-      const observation = yield* store.getObservation({
-        factoryId: input.factoryId,
-        observationId: input.basis.observationId,
-      });
-      return Option.isNone(observation) || observation.value.itemKey !== input.itemKey
-        ? Option.none<FactoryDecisionKey>()
-        : Option.some(decisionKeyOf(input, observation.value));
-    },
-    (effect, input) =>
-      effect.pipe(
-        Effect.mapError(
-          (cause) =>
-            new FactoryLifecycleError({
-              operation: "decision-key",
-              factoryId: input.factoryId,
-              cause,
-            }),
         ),
       ),
   );
@@ -3872,7 +3808,6 @@ const make = Effect.gen(function* () {
     enter,
     reconcile,
     drive,
-    decisionKeyFor,
     configure,
     installConfiguration,
     switchProvider: Effect.fn("FactoryLifecycle.switchProvider")(function (input, providers) {

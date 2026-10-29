@@ -584,7 +584,22 @@ interface PolicyFakeState {
   readonly active: Array<ReadonlyArray<FactoryLifecycle.FactoryPolicyActive>>;
 }
 
-type ProposeFn = Parameters<typeof FactoryLifecycle.perItemPolicy>[0];
+type ProposeFn = (
+  input: {
+    readonly configuration: FactoryStore.FactoryConfiguration;
+  } & FactoryLifecycle.FactoryPolicyItem,
+) => Effect.Effect<FactoryLifecycle.FactoryPolicyDecision>;
+
+/** A proposer that decides each item on its own, in the order the pass read them. */
+const perItemPolicy = (propose: ProposeFn): FactoryLifecycle.FactoryAdmissionProposer => ({
+  decide: ({ configuration, items }) =>
+    Effect.forEach(items, (item) =>
+      Effect.map(propose({ configuration, ...item }), (decision) => ({
+        itemKey: item.observation.itemKey,
+        decision,
+      })),
+    ),
+});
 
 class PolicyFake extends Context.Service<PolicyFake, PolicyFakeState>()(
   "t3/factory/FactoryLifecycle.test/PolicyFake",
@@ -608,7 +623,7 @@ const layerAdmissionPolicy = Layer.effect(
     forFactory: ({ policyRevision }: { readonly policyRevision: string }) => {
       if (!fake.available) return Option.none();
       fake.revisions.push(policyRevision);
-      const perItem = FactoryLifecycle.perItemPolicy((input) => fake.propose(input));
+      const perItem = perItemPolicy((input) => fake.propose(input));
       return Option.some<FactoryLifecycle.FactoryAdmissionProposer>({
         decide: (input) => {
           fake.active.push(input.active);
@@ -1585,7 +1600,6 @@ const layerGitGraphFake = Layer.effect(
     return FactoryGitReadback.FactoryGitReadback.of({
       commitExists: (input) => Effect.succeed(graph.parents.has(input.commit)),
       isAncestor: (input) => Effect.succeed(ancestors(input.descendant).has(input.ancestor)),
-      parentsOf: (input) => Effect.succeed(graph.parents.get(input.commit) ?? []),
       branchExists: (input) => Effect.succeed(graph.branches.has(input.branch)),
     });
   }),
@@ -5294,14 +5308,14 @@ it.effect("Claims/N14: a packet must name the configured helper and required arg
         observationId: recorded.observation.observationId,
         deadline: yield* inOneHour,
       };
-      const decisionKey = Option.getOrThrow(
-        yield* factory.decisionKeyFor({
+      const decisionKey = FactoryLifecycle.decisionKeyOf(
+        {
           factoryId,
           itemKey: itemKeyOf(itemKey),
           taskKind: "implement",
           policyRevision: "policy-r1",
-          basis,
-        }),
+        },
+        recorded.observation,
       );
       const withPacket = (text: string) =>
         admissionFor(itemKey, basis, {

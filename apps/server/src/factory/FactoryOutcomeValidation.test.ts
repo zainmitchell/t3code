@@ -138,7 +138,6 @@ const fakeGit = (
         ancestor === descendant || (repository.ancestry.get(descendant)?.has(ancestor) ?? false),
       );
     },
-    parentsOf: () => Effect.die("unused"),
     branchExists: () => Effect.die("unused"),
   };
 };

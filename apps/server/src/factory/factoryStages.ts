@@ -5,19 +5,24 @@
  * as reviews fail with new evidence, and an unchanged basis never yields a second decision.
  */
 
-export type FactoryStageType =
-  | "implement"
-  | "review"
-  | "correct"
-  | "rework"
-  | "integrate"
-  | "close"
-  /**
-   * Decomposition: a cheap worker proposes the unit spec an item lacks (owned files, resources,
-   * one-screen contract), bound to the exact item version it read. Its result is evidence the
-   * policy reads on a later pass, never a build start, and it leaves the lifecycle where it was.
-   */
-  | "triage";
+import * as Schema from "effect/Schema";
+
+/**
+ * `triage` is decomposition: a cheap worker proposes the unit spec an item lacks (owned files,
+ * resources, one-screen contract), bound to the exact item version it read. Its result is evidence
+ * the policy reads on a later pass, never a build start, and it leaves the lifecycle where it was.
+ */
+export const FactoryStageSchema = Schema.Literals([
+  "implement",
+  "review",
+  "correct",
+  "rework",
+  "integrate",
+  "close",
+  "triage",
+]);
+export type FactoryStageType = typeof FactoryStageSchema.Type;
+export const isFactoryStage = Schema.is(FactoryStageSchema);
 
 /** Stages a worker runs. Integration and closure are T3's own effects, never a worker's. */
 export const AGENT_STAGES: ReadonlySet<FactoryStageType> = new Set([

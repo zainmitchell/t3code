@@ -1,14 +1,7 @@
 import * as Schema from "effect/Schema";
 
-const Stage = Schema.Literals([
-  "implement",
-  "review",
-  "correct",
-  "rework",
-  "integrate",
-  "close",
-  "triage",
-]);
+import { FactoryStageSchema } from "./factoryStages.ts";
+
 const OutcomeKind = Schema.Literals([
   "implemented",
   "failed",
@@ -36,7 +29,7 @@ export const FactoryItemEventRecord = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("outcome"),
     outcomeId: Schema.String,
-    stage: Stage,
+    stage: FactoryStageSchema,
     kind: OutcomeKind,
     /** The admitted stage execution that produced it; absent for T3's own effects. */
     reservationId: Schema.optional(Schema.String),

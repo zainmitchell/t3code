@@ -510,6 +510,22 @@ export const layer: Layer.Layer<
           });
         },
       );
+      const refuseFactoryStart = Effect.fn("ProviderTurnStartService.refuseFactoryStart")(
+        function* (signal: string, title: string, cause: unknown, message: string) {
+          yield* settleRunBeforeStart({
+            signal,
+            status: "failed",
+            now: yield* DateTime.now,
+            providerInstanceId: run.providerInstanceId,
+            itemProviderThreadId: providerThread.id,
+            item: {
+              type: "error",
+              title,
+              failure: makeProviderFailure({ cause, message, class: "provider_error" }),
+            },
+          });
+        },
+      );
       if (message.attachments.length === 0 && message.text.trimStart().startsWith("/")) {
         const isEmptyCompaction =
           message.text.trim().toLowerCase() === "/compact" && !projection.hasConversation;
@@ -605,24 +621,14 @@ export const layer: Layer.Layer<
       // A transferred legacy worker's thread starts no new turn: its custody is not T3's to
       // extend, and the factory admits any further work on the item itself.
       if (Option.isSome(binding) && binding.value.origin === "transferred") {
-        yield* settleRunBeforeStart({
-          signal: START_REFUSAL_SIGNALS.legacyCustody,
-          status: "failed",
-          now: yield* DateTime.now,
-          providerInstanceId: run.providerInstanceId,
-          itemProviderThreadId: providerThread.id,
-          item: {
-            type: "error",
-            title: "Transferred legacy work starts nothing",
-            failure: makeProviderFailure({
-              cause:
-                "This thread's legacy work was transferred to a factory, which admits new work.",
-              message:
-                "This thread's legacy work was transferred to a factory, which admits new work.",
-              class: "provider_error",
-            }),
-          },
-        });
+        const refused =
+          "This thread's legacy work was transferred to a factory, which admits new work.";
+        yield* refuseFactoryStart(
+          START_REFUSAL_SIGNALS.legacyCustody,
+          "Transferred legacy work starts nothing",
+          refused,
+          refused,
+        );
         return;
       }
       // A factory execution whose tracker claim is not verified starts nothing, however the run
@@ -634,22 +640,13 @@ export const layer: Layer.Layer<
           .isClaimReady(binding.value)
           .pipe(Effect.mapError((cause) => new ProviderTurnStartError({ runId, cause }))))
       ) {
-        yield* settleRunBeforeStart({
-          signal: START_REFUSAL_SIGNALS.claimNotReady,
-          status: "failed",
-          now: yield* DateTime.now,
-          providerInstanceId: run.providerInstanceId,
-          itemProviderThreadId: providerThread.id,
-          item: {
-            type: "error",
-            title: "Factory claim is not verified",
-            failure: makeProviderFailure({
-              cause: "The tracker claim for this factory execution is not verified.",
-              message: "The tracker claim for this factory execution is not verified.",
-              class: "provider_error",
-            }),
-          },
-        });
+        const refused = "The tracker claim for this factory execution is not verified.";
+        yield* refuseFactoryStart(
+          START_REFUSAL_SIGNALS.claimNotReady,
+          "Factory claim is not verified",
+          refused,
+          refused,
+        );
         return;
       }
       // A claimed decision's first provider turn may run long after its verifying commit, so the
@@ -674,22 +671,12 @@ export const layer: Layer.Layer<
           .pipe(Effect.mapError((cause) => new ProviderTurnStartError({ runId, cause })));
         if (decision.type === "refused") {
           const refused = decision.reason;
-          yield* settleRunBeforeStart({
-            signal: START_REFUSAL_SIGNALS.firstStartPrecondition,
-            status: "failed",
-            now: yield* DateTime.now,
-            providerInstanceId: run.providerInstanceId,
-            itemProviderThreadId: providerThread.id,
-            item: {
-              type: "error",
-              title: "Factory execution can no longer start",
-              failure: makeProviderFailure({
-                cause: refused,
-                message: `This factory execution may not start: ${refused}.`,
-                class: "provider_error",
-              }),
-            },
-          });
+          yield* refuseFactoryStart(
+            START_REFUSAL_SIGNALS.firstStartPrecondition,
+            "Factory execution can no longer start",
+            refused,
+            `This factory execution may not start: ${refused}.`,
+          );
           return;
         }
       }
@@ -704,22 +691,12 @@ export const layer: Layer.Layer<
           threadId: projection.thread.id,
           runId,
         });
-        yield* settleRunBeforeStart({
-          signal: START_REFUSAL_SIGNALS.selectionPinned,
-          status: "failed",
-          now: yield* DateTime.now,
-          providerInstanceId: run.providerInstanceId,
-          itemProviderThreadId: providerThread.id,
-          item: {
-            type: "error",
-            title: "Factory execution selection is pinned",
-            failure: makeProviderFailure({
-              cause: refused,
-              message: refused.message,
-              class: "provider_error",
-            }),
-          },
-        });
+        yield* refuseFactoryStart(
+          START_REFUSAL_SIGNALS.selectionPinned,
+          "Factory execution selection is pinned",
+          refused,
+          refused.message,
+        );
         return;
       }
       // A cached session does not prove the turn joins the same native process (an adapter may
@@ -792,22 +769,12 @@ export const layer: Layer.Layer<
               runId,
               custody: custody.state,
             });
-            yield* settleRunBeforeStart({
-              signal: START_REFUSAL_SIGNALS.custodyUnknown,
-              status: "failed",
-              now: yield* DateTime.now,
-              providerInstanceId: run.providerInstanceId,
-              itemProviderThreadId: providerThread.id,
-              item: {
-                type: "error",
-                title: "Factory execution custody is unknown",
-                failure: makeProviderFailure({
-                  cause: refused,
-                  message: refused.message,
-                  class: "provider_error",
-                }),
-              },
-            });
+            yield* refuseFactoryStart(
+              START_REFUSAL_SIGNALS.custodyUnknown,
+              "Factory execution custody is unknown",
+              refused,
+              refused.message,
+            );
             return;
           }
         }
@@ -829,24 +796,12 @@ export const layer: Layer.Layer<
           }),
         );
         if (held._tag === "Failure") {
-          const cause = Cause.squash(held.cause);
-          yield* settleRunBeforeStart({
-            signal: START_REFUSAL_SIGNALS.containmentUnavailable,
-            status: "failed",
-            now: yield* DateTime.now,
-            providerInstanceId: run.providerInstanceId,
-            itemProviderThreadId: providerThread.id,
-            item: {
-              type: "error",
-              title: "Factory execution cannot be contained",
-              failure: makeProviderFailure({
-                cause,
-                message:
-                  "T3 could not create this factory execution's process container, so it will not start the provider outside one.",
-                class: "provider_error",
-              }),
-            },
-          });
+          yield* refuseFactoryStart(
+            START_REFUSAL_SIGNALS.containmentUnavailable,
+            "Factory execution cannot be contained",
+            Cause.squash(held.cause),
+            "T3 could not create this factory execution's process container, so it will not start the provider outside one.",
+          );
           return;
         }
       }

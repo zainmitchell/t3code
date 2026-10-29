@@ -20,17 +20,7 @@ import {
   encodeItemEvent,
   type FactoryItemEventRecord,
 } from "./factoryItemEvents.ts";
-import type { FactoryStageType, ItemEvent } from "./factoryStages.ts";
-
-const Stage = Schema.Literals([
-  "implement",
-  "review",
-  "correct",
-  "rework",
-  "integrate",
-  "close",
-  "triage",
-]);
+import { FactoryStageSchema, isFactoryStage, type ItemEvent } from "./factoryStages.ts";
 
 /**
  * An outcome as T3 holds it: a worker's report, or a record of T3's own effect in the same
@@ -94,7 +84,7 @@ const OutcomeFields = {
   factoryId: FactoryId,
   itemKey: FactoryItemKey,
   origin: FactoryOutcomeOrigin,
-  stage: Stage,
+  stage: FactoryStageSchema,
   report: FactoryOutcomeReport,
   /** The digest of the report as received, which its tracker record carries. */
   reportDigest: Schema.String,
@@ -269,16 +259,6 @@ const decodeOutcome = Schema.decodeUnknownEffect(OutcomeJson);
 const DecisionJson = Schema.fromJsonString(ReservedDecision);
 const encodeDecision = Schema.encodeEffect(DecisionJson, total);
 const decodeDecision = Schema.decodeUnknownEffect(DecisionJson);
-
-const LIFECYCLE_STAGES: ReadonlySet<string> = new Set([
-  "implement",
-  "review",
-  "correct",
-  "rework",
-  "integrate",
-  "close",
-  "triage",
-]);
 
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -581,12 +561,12 @@ const make = Effect.gen(function* () {
         for (const { seq, record } of records) {
           switch (record.type) {
             case "admitted":
-              if (!LIFECYCLE_STAGES.has(record.stage)) break;
+              if (!isFactoryStage(record.stage)) break;
               admittedAt.set(record.reservationId, seq);
               events.push({
                 type: "admitted",
                 seq,
-                stage: record.stage as FactoryStageType,
+                stage: record.stage,
                 reservationId: record.reservationId,
               });
               break;

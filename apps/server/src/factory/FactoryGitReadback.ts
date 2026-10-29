@@ -31,10 +31,6 @@ export interface FactoryGitReadbackShape {
     readonly ancestor: string;
     readonly descendant: string;
   }) => Effect.Effect<boolean, FactoryGitReadbackError>;
-  readonly parentsOf: (input: {
-    readonly projectId: ProjectId;
-    readonly commit: string;
-  }) => Effect.Effect<ReadonlyArray<string>, FactoryGitReadbackError>;
   readonly branchExists: (input: {
     readonly projectId: ProjectId;
     readonly branch: string;
@@ -105,15 +101,6 @@ export const layer = Layer.effect(
               : result.exitCode === 1
                 ? Effect.succeed(false)
                 : Effect.fail(fail("isAncestor")(result.stderr)),
-        );
-      }),
-      parentsOf: Effect.fn("FactoryGitReadback.parentsOf")(function (input) {
-        return Effect.flatMap(
-          run("parentsOf", input.projectId, ["rev-list", "--parents", "-n", "1", input.commit]),
-          (result) =>
-            result.exitCode === 0
-              ? Effect.succeed(result.stdout.trim().split(/\s+/).slice(1))
-              : Effect.fail(fail("parentsOf")(result.stderr)),
         );
       }),
       branchExists: Effect.fn("FactoryGitReadback.branchExists")(function (input) {

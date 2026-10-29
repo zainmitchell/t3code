@@ -182,11 +182,6 @@ export const FactoryClaimRecord = Schema.Union([
   Schema.Struct({ ...ClaimFields, ...ReleasedClaim }),
 ]);
 export type FactoryClaimRecord = typeof FactoryClaimRecord.Type;
-export type VerifiedFactoryClaim = Extract<
-  FactoryClaimRecord,
-  { readonly state: "verified" | "workspace_authorized" }
->;
-
 /** The moves a claim may make; the held outcomes have none until an owner disposes of them. */
 const claimMoves: Record<FactoryClaimState, ReadonlyArray<FactoryClaimState>> = {
   pending: ["writing", "released"],
