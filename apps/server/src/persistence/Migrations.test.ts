@@ -1,8 +1,11 @@
 import { assert, describe, it } from "@effect/vitest";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Migrator from "effect/sql/Migrator";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import { migrationManifest, runMigrations } from "./Migrations.ts";
@@ -240,3 +243,18 @@ describe("runMigrations", () => {
     }),
   );
 });
+
+// Patched ledger ids 68-76 keep upstream file prefixes, so only names are compared. The npm
+// launcher's file-derived head (73) therefore trails BUILD_MIGRATION_HEAD (76).
+it.effect("registers every migration file", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const dir = path.join(import.meta.dirname, "Migrations");
+    const files = (yield* fs.readDirectory(dir)).flatMap((name) => {
+      const match = /^(\d+)_(\w+)\.ts$/.exec(name);
+      return match ? [match[2]] : [];
+    });
+    assert.deepStrictEqual(files.toSorted(), migrationManifest.map(([, name]) => name).toSorted());
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
