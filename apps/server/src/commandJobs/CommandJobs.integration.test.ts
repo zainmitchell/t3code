@@ -550,7 +550,7 @@ it.live("a task naming an unconfigured job fails instead of falling back to a mo
       });
       const settled = yield* runNowAndSettle(task);
       assert.equal(settled.lastRunStatus, "failed");
-      assert.include(settled.lastRunError ?? "", 'Command job "missing" is not configured.');
+      assert.equal(settled.lastRunError, 'Command job "missing" is not configured.');
       assert.lengthOf(yield* threads.listProjectThreads({ projectId, includeSubagents: true }), 0);
       assert.deepEqual(openedSessions, []);
     }).pipe(Effect.provide(makeLayer(fixture.stateDir, openedSessions)));

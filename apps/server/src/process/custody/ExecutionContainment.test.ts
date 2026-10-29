@@ -8,6 +8,7 @@ import * as NodeReadline from "node:readline";
 import { assert, describe, it } from "@effect/vitest";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
+import * as Queue from "effect/Queue";
 
 import * as ExecutionContainment from "./ExecutionContainment.ts";
 import {
@@ -63,6 +64,27 @@ const unanchoredHold = (helper: string, name: string) =>
         child.stdin.end();
       }),
   );
+
+it.effect("the hold handshake ends at the helper's close or first bad line", () =>
+  Effect.gen(function* () {
+    const rows = [
+      { lines: ["exited"], result: "the holder did not start", left: 0 },
+      { lines: ["identity m 1", "exited"], result: "the holder did not start", left: 0 },
+      { lines: ["identity m 1", "failed exists"], result: "failed exists", left: 0 },
+      { lines: ["garbage", "exited"], result: "the holder did not start", left: 1 },
+      { lines: ["identity m 1", "ready"], result: { machine: "m", session: 1 }, left: 0 },
+    ];
+    for (const row of rows) {
+      const lines = yield* Queue.unbounded<string>();
+      Queue.offerAllUnsafe(lines, row.lines);
+      const read = yield* ExecutionContainment.readHoldHandshake(lines).pipe(
+        Effect.match({ onFailure: (detail) => detail, onSuccess: (identity) => identity }),
+      );
+      assert.deepStrictEqual(read, row.result, row.lines.join(" | "));
+      assert.strictEqual(yield* Queue.size(lines), row.left, row.lines.join(" | "));
+    }
+  }),
+);
 
 // Job objects are the Windows mechanism; elsewhere containment is unavailable by design.
 describe.runIf(HostProcess.Platform.defaultValue() === "win32")(

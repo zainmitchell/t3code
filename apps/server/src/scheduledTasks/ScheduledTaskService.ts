@@ -73,6 +73,7 @@ import { constantTimeEquals, verifyWebhookSignature } from "./webhookVerificatio
 
 export const WEBHOOK_ROUTE_PREFIX = "/api/hooks";
 const isScheduledTaskError = Schema.is(ScheduledTaskError);
+const isCommandJobError = Schema.is(CommandJobs.CommandJobError);
 const PROMPT_TOO_LONG = "The filled-in prompt is too long.";
 const WEBHOOK_DELIVERY_RETENTION = 50;
 const WEBHOOK_DEDUPE_DELIVERY_RETENTION = 20;
@@ -908,7 +909,15 @@ export const layer = Layer.effect(
         if (webhook !== undefined && runSucceeded) yield* Ref.set(webhook.dispatched, true);
         const completedAt = yield* localNow;
         const lastRunStatus = runSucceeded ? ("succeeded" as const) : ("failed" as const);
-        const lastRunError = runSucceeded ? null : errorMessage(result.cause);
+        // A typed failure persists its own message: Cause.pretty would add its cause chain.
+        const failure = runSucceeded
+          ? undefined
+          : Option.getOrUndefined(Cause.findErrorOption<unknown>(result.cause));
+        const lastRunError = runSucceeded
+          ? null
+          : isCommandJobError(failure) || isScheduledTaskError(failure)
+            ? failure.message
+            : errorMessage(result.cause);
         const threadId = runSucceeded ? result.value : null;
         const current = yield* findTask(task.id);
         const scheduleSource = current ?? task;

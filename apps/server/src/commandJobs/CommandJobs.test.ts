@@ -487,9 +487,9 @@ it.live("checks every request against the job's ceiling before acting on it", ()
         'Model "frontier" is not a',
         'Runtime mode "full-access',
         'Branch must start with "f',
-        "Invalid request: Expecte",
+        "Invalid request.",
         "Only workers this job la",
-        "Invalid request: Expecte",
+        "Invalid request.",
         "Launch limit for this pa",
       ].map((reason) => reason.slice(0, 24)),
     );
@@ -636,17 +636,26 @@ it.live("a failing exit is visible and its logs stay bounded", () =>
     const fixture = yield* setup({ launch: ceiling });
     yield* fixture.writePlan({
       exitCode: 3,
-      stderr: `${"noise ".repeat(40_000)}final reason`,
+      // Within the log limit, whose truncation keeps the head, so the log keeps the secret.
+      stderr: `${"noise ".repeat(10_000)}request failed https://service/path?token=synthetic-secret`,
       output: JSON.stringify({ requests: [launchRequest("ignored")] }),
     });
     const failure = yield* runJob(fixture.jobs);
     const message = failure._tag === "Some" ? failure.value.message : "";
-    assert.match(message, /^Exited with code 3: /);
-    assert.isAtMost(message.length, 540);
+    assert.equal(message, "Exited with code 3.");
+    const status = yield* fixture.readJson("status.json");
+    assert.equal(status.error, "Exited with code 3.");
+    assert.equal(status.exitCode, 3);
+    assert.notInclude(message, "synthetic-secret");
+    assert.notInclude(JSON.stringify(status), "synthetic-secret");
     // Requests from a failed run are never acted on.
     assert.lengthOf(fixture.calls.launches, 0);
     const log = yield* fixture.fs.stat(fixture.jobFile("last-run.log"));
     assert.isBelow(Number(log.size), 3 * 64 * 1024);
+    assert.include(
+      yield* fixture.fs.readFileString(fixture.jobFile("last-run.log")),
+      "token=synthetic-secret",
+    );
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 

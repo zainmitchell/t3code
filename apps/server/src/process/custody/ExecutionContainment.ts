@@ -246,6 +246,23 @@ const produceHelper = Effect.fn("ExecutionContainment.produceHelper")(function* 
   return helper;
 });
 
+/**
+ * The holder's start: an identity line, then `ready`. `exited` (its close) ends it at either step;
+ * the failure is the helper's own `failed …` line where it wrote one.
+ */
+export const readHoldHandshake = Effect.fn("ExecutionContainment.readHoldHandshake")(function* (
+  lines: Queue.Dequeue<string>,
+) {
+  const startFailure = (line: string) =>
+    Effect.fail(line.startsWith("failed") ? line : "the holder did not start");
+  const first = yield* Queue.take(lines);
+  const identity = parseIdentity(first);
+  if (identity === null) return yield* startFailure(first);
+  const ready = yield* Queue.take(lines);
+  if (ready !== "ready") return yield* startFailure(ready);
+  return identity;
+});
+
 const holdWith = Effect.fn("ExecutionContainment.hold")(function* (helper: string, name: string) {
   const lines = yield* Queue.unbounded<string>();
   const exited = yield* Deferred.make<void>();
@@ -272,13 +289,13 @@ const holdWith = Effect.fn("ExecutionContainment.hold")(function* (helper: strin
     Deferred.doneUnsafe(exited, Effect.void);
   });
   const fail = (detail: string) => new ContainmentHolderError({ name, detail });
-  const identity = parseIdentity(yield* Queue.take(lines));
-  const ready = yield* Queue.take(lines);
-  if (identity === null || ready !== "ready" || child.pid === undefined) {
+  const stop = Effect.fn("ExecutionContainment.stopHolder")(function* (detail: string) {
     if (child.exitCode === null) child.kill();
     yield* Deferred.await(exited);
-    return yield* fail(ready.startsWith("failed") ? ready : "the holder did not start");
-  }
+    return yield* fail(detail);
+  });
+  const identity = yield* readHoldHandshake(lines).pipe(Effect.catch(stop));
+  if (child.pid === undefined) return yield* stop("the holder did not start");
   const permit = yield* Semaphore.make(1);
   const request = (line: string) =>
     permit.withPermits(1)(
