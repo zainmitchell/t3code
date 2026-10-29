@@ -34,6 +34,18 @@ export const factoryStateView = (state: FactoryState): FactoryStateResult => ({
           ...(reservation.workId === undefined ? {} : { workId: reservation.workId }),
         }
       : {}),
+    ...(reservation.origin === "admitted" && reservation.quarantine !== undefined
+      ? {
+          quarantine: {
+            by: reservation.quarantine.by,
+            reason: reservation.quarantine.reason,
+            quarantinedAt: reservation.quarantine.quarantinedAt,
+            evidenceDigest: reservation.quarantine.evidenceDigest,
+            nextAction:
+              "The owner proves this execution's processes ended and reconciles it, or ends the quarantine with t3_factory_quarantine; nothing else releases it.",
+          },
+        }
+      : {}),
   })),
   reservedDecisions: state.reservedDecisions.map((decision) => ({
     decisionId: decision.decisionId,

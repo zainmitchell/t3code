@@ -35,6 +35,7 @@ import {
 import { fixPath } from "./os-jank.ts";
 import * as Ws from "./ws.ts";
 import * as AgentScopeLive from "./process/agentScope.ts";
+import * as ExecutionJoin from "@t3tools/shared/ExecutionJoin";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
 import * as NodePtyAdapter from "./terminal/NodePtyAdapter.ts";
 import * as PullRequestHttp from "./pullRequest/http.ts";
@@ -649,8 +650,9 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   ),
   Layer.provideMerge(ProviderRegistry.layer),
   Layer.provideMerge(ProviderInstanceRegistryHydration.layer),
-  // One set of execution containers per server, read by the runtime, terminals and launches. The
-  // persistence layer is the same memoized value as above, so this is the same database.
+  // One set of execution containers per server, read by the runtime, terminals, tools and the
+  // provider adapters, which are built here and capture it. The persistence layer is the same
+  // memoized value as above, so this is the same database.
   Layer.provideMerge(
     FactoryExecutionGenerations.layerExecutionCustody.pipe(
       Layer.provide(ProjectionStoreV2.layer),
@@ -1124,6 +1126,8 @@ const layerMakeServer = Layer.unwrap(
       Layer.provideMerge(FetchHttpClient.layer),
       Layer.provide(VcsProcess.layer),
       Layer.provideMerge(AgentScopeLive.layer),
+      // Processes a contained execution starts through Effect join its container.
+      Layer.provideMerge(ExecutionJoin.layerContainedSpawner),
       Layer.provideMerge(layerPlatformServices),
     );
   }),

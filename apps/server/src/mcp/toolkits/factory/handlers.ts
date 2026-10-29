@@ -81,6 +81,14 @@ export const layer = McpToolAccess.toLayer(
           return { disposed };
         }),
       ),
+      t3_factory_quarantine: McpToolAccess.writesWithCapability((input) =>
+        Effect.gen(function* () {
+          const by = yield* ownerClient;
+          return yield* (yield* lifecycle)
+            .quarantine({ ...input, by })
+            .pipe(Effect.mapError(unavailable));
+        }),
+      ),
       t3_factory_reject_outcome: McpToolAccess.writesWithCapability((input) =>
         Effect.gen(function* () {
           const by = yield* ownerClient;

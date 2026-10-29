@@ -5,6 +5,8 @@ import {
   FactoryDisposeClaimResult,
   FactoryEnterInput,
   FactoryEnterResult,
+  FactoryQuarantineInput,
+  FactoryQuarantineResult,
   FactoryRejectOutcomeInput,
   FactoryRejectOutcomeResult,
   FactoryReportFailure,
@@ -173,12 +175,28 @@ const FactoryRollbackTransferTool = Tool.make("t3_factory_rollback_transfer", {
   .annotate(Tool.Idempotent, true)
   .annotate(McpSchema.EnabledWhen, hiddenFromAgents);
 
+const FactoryQuarantineTool = Tool.make("t3_factory_quarantine", {
+  description:
+    "Owner only: quarantine a held stage whose historical execution can never be proved to have ended (its custody is unknown only because its provider never joined a container), or end that quarantine. It stays held, owning its item and thread, but stops counting against its pool; nothing is released or relaunched. Call without expectDigest to read the evidence and refusals, then again with that digest. Agents are refused.",
+  parameters: FactoryQuarantineInput,
+  success: FactoryQuarantineResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+})
+  .annotate(Tool.Title, "Quarantine a historical factory stage")
+  .annotate(Tool.Readonly, false)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, true)
+  .annotate(McpSchema.EnabledWhen, hiddenFromAgents);
+
 export const FactoryToolkit = Toolkit.make(
   FactoryReportTool,
   FactoryEnterTool,
   FactoryStateTool,
   FactoryDecideTool,
   FactoryDisposeClaimTool,
+  FactoryQuarantineTool,
   FactoryRejectOutcomeTool,
   FactoryRevokeGrantTool,
   FactoryTransferTool,
