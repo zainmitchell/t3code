@@ -109,6 +109,8 @@ interface Repository {
   readonly commits: ReadonlySet<string>;
   /** Descendant to its ancestors. */
   readonly ancestry: ReadonlyMap<string, ReadonlySet<string>>;
+  /** Branch name to the commit it points at. */
+  readonly branches?: ReadonlyMap<string, string>;
   /** Whether a read of the repository fails, as an unreadable workspace does. */
   unreadable: boolean;
 }
@@ -127,18 +129,25 @@ const fakeGit = (
     // Like `git merge-base --is-ancestor`: an unknown object is exit 128, an error, not "no".
     isAncestor: ({ ancestor, descendant }) => {
       ancestryReads.push({ ancestor, descendant });
+      const commit = descendant.startsWith("refs/heads/")
+        ? repository.branches?.get(descendant.slice("refs/heads/".length))
+        : descendant;
       if (
         repository.unreadable ||
+        commit === undefined ||
         !repository.commits.has(ancestor) ||
-        !repository.commits.has(descendant)
+        !repository.commits.has(commit)
       ) {
         return Effect.fail(unreadable("isAncestor"));
       }
       return Effect.succeed(
-        ancestor === descendant || (repository.ancestry.get(descendant)?.has(ancestor) ?? false),
+        ancestor === commit || (repository.ancestry.get(commit)?.has(ancestor) ?? false),
       );
     },
-    branchExists: () => Effect.die("unused"),
+    branchExists: ({ branch }) =>
+      repository.unreadable
+        ? Effect.fail(unreadable("branchExists"))
+        : Effect.succeed(repository.branches?.has(branch) ?? false),
   };
 };
 
@@ -148,10 +157,17 @@ interface Readback {
   readonly head: string;
 }
 
-const makeFixture = (source: Repository | Readback) =>
+const makeFixture = (
+  source: Repository | Readback,
+  options: {
+    readonly reservation?: FactoryStore.FactoryReservation;
+    readonly configuration?: FactoryStore.FactoryConfiguration;
+  } = {},
+) =>
   Effect.gen(function* () {
     const outcomes = yield* FactoryOutcomeStore.FactoryOutcomeStore;
-    let reservation = admitted;
+    let reservation = options.reservation ?? admitted;
+    const configured = options.configuration ?? configuration;
     let custody: FactoryCustody = { state: "unknown", reasons: ["execution_unreadable"] };
     const ancestryReads: Array<{ readonly ancestor: string; readonly descendant: string }> = [];
     const git = "git" in source ? source.git : fakeGit(source, ancestryReads);
@@ -161,7 +177,7 @@ const makeFixture = (source: Repository | Readback) =>
         Effect.succeed(id === threadId ? Option.some(reservation) : Option.none()),
       getReservation: (id: FactoryReservationId) =>
         Effect.succeed(id === reservationId ? Option.some(reservation) : Option.none()),
-      getConfiguration: () => Effect.succeedSome(configuration),
+      getConfiguration: () => Effect.succeedSome(configured),
       listReservations: () => Effect.succeed([reservation]),
       releaseReservation: (_id: FactoryReservationId, releasedReason: "outcome_verified") =>
         Effect.sync(() => {
@@ -439,4 +455,111 @@ it.effect("verifies a present ancestor base and settles the quiet stage", () =>
     assert.strictEqual(fixture.reservation().state, "released");
     assert.deepStrictEqual(fixture.ancestryReads, [{ ancestor: realBase, descendant: head }]);
   }).pipe(Effect.provide(layerTest)),
+);
+
+const triage: FactoryStore.FactoryReservation = {
+  ...admitted,
+  decisionKey: FactoryDecisionKey.make("decision:triage"),
+  taskKind: "triage",
+  stageBasis: "triage:version:1",
+};
+
+const integratingLocally = (remote: string | null): FactoryStore.FactoryConfiguration => ({
+  ...configuration,
+  integration: {
+    branch: "main",
+    remote,
+    mode: "merge",
+    identity: { name: "T3", email: "t3@example.invalid" },
+  },
+});
+
+it.effect("verifies a proposal's candidate base only as T3 reads it on the integration line", () =>
+  Effect.gen(function* () {
+    // `main` holds realBase; `unrelated` exists but is on no line T3 integrates.
+    const repository = (): Repository => ({
+      ...btc131(),
+      branches: new Map([["main", head]]),
+    });
+    const cases: ReadonlyArray<{
+      readonly name: string;
+      readonly basis?: string;
+      readonly baseCommit?: string;
+      readonly configuration?: FactoryStore.FactoryConfiguration;
+      readonly expected: string;
+      readonly ancestryReads: ReadonlyArray<{
+        readonly ancestor: string;
+        readonly descendant: string;
+      }>;
+    }> = [
+      { name: "no candidate named", expected: "verified", ancestryReads: [] },
+      {
+        name: "another item version",
+        basis: "version:0",
+        baseCommit: realBase,
+        expected: "the proposal names item version version:0, not version:1",
+        ancestryReads: [],
+      },
+      {
+        name: "an invented base",
+        baseCommit: inventedBase,
+        configuration: integratingLocally(null),
+        expected: `base ${inventedBase} does not exist`,
+        ancestryReads: [],
+      },
+      {
+        name: "a base on the local integration branch",
+        baseCommit: realBase,
+        configuration: integratingLocally(null),
+        expected: "verified",
+        ancestryReads: [{ ancestor: realBase, descendant: "refs/heads/main" }],
+      },
+      {
+        name: "a base off the local integration branch",
+        baseCommit: unrelated,
+        configuration: integratingLocally(null),
+        expected: `base ${unrelated} is not on the integration branch main`,
+        ancestryReads: [{ ancestor: unrelated, descendant: "refs/heads/main" }],
+      },
+      {
+        name: "a remote integration branch, whose local copy may be stale",
+        baseCommit: unrelated,
+        configuration: integratingLocally("origin"),
+        expected: "verified",
+        ancestryReads: [],
+      },
+    ];
+    // Each row reads in its own store: equal reports are one outcome, whatever row filed it.
+    for (const row of cases) {
+      yield* Effect.gen(function* () {
+        const fixture = yield* makeFixture(repository(), {
+          reservation: triage,
+          ...(row.configuration === undefined ? {} : { configuration: row.configuration }),
+        });
+        const { outcomeId } = yield* fixture.ops.report({
+          threadId,
+          report: {
+            outcome: "unit_proposed",
+            summary: "One bounded unit.",
+            proposal: {
+              basis: row.basis ?? "version:1",
+              unit: "## Owned files\n- apps/server/src/a.ts",
+              ownedFiles: ["apps/server/src/a.ts"],
+            },
+            ...(row.baseCommit === undefined
+              ? {}
+              : { subject: { repository: "example/connector", baseCommit: row.baseCommit } }),
+          },
+        });
+        yield* fixture.ops.reconcile(factoryId);
+        const outcome = Option.getOrThrow(yield* fixture.outcomes.get(outcomeId));
+        assert.strictEqual(
+          outcome.state === "rejected" ? outcome.rejection : outcome.state,
+          row.expected,
+          row.name,
+        );
+        assert.deepStrictEqual(fixture.ancestryReads, row.ancestryReads, row.name);
+      }).pipe(Effect.provide(layerTest));
+    }
+  }),
 );

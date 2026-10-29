@@ -60,6 +60,16 @@ export const subjectOf = (itemKey: string) => {
   return match === null ? undefined : { repository: match[1]!, issueNumber: Number(match[2]) };
 };
 
+/** The branch T3 lands work on in the project's own repository; a remote's copy may be stale. */
+const localIntegrationBranch = (configuration: FactoryStore.FactoryConfiguration) => {
+  const integration = configuration.integration;
+  return integration !== undefined &&
+    integration.mode !== "pull_request" &&
+    integration.remote === null
+    ? integration.branch
+    : undefined;
+};
+
 const TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set([
   "completed",
   "interrupted",
@@ -306,11 +316,28 @@ export const makeFactoryOutcomes = (deps: FactoryOutcomeDependencies) => {
       case "unit_proposed": {
         // A proposal counts only for the exact item text the triage read.
         const proposed = report.proposal?.basis;
-        return proposed === reservation.value.itemVersion
+        if (proposed !== reservation.value.itemVersion) {
+          return {
+            rejected: `the proposal names item version ${proposed ?? "none"}, not ${reservation.value.itemVersion}`,
+          } as const;
+        }
+        // A named candidate base is a claim like any other: the work starts from it only if T3 reads it.
+        const base = report.subject?.baseCommit;
+        if (base === undefined) return { accepted: true } as const;
+        if (!(yield* git.commitExists({ projectId, commit: base }))) {
+          return { rejected: `base ${base} does not exist` } as const;
+        }
+        const branch = localIntegrationBranch(configuration);
+        if (branch === undefined || !(yield* git.branchExists({ projectId, branch }))) {
+          return { accepted: true } as const;
+        }
+        return (yield* git.isAncestor({
+          projectId,
+          ancestor: base,
+          descendant: `refs/heads/${branch}`,
+        }))
           ? ({ accepted: true } as const)
-          : ({
-              rejected: `the proposal names item version ${proposed ?? "none"}, not ${reservation.value.itemVersion}`,
-            } as const);
+          : ({ rejected: `base ${base} is not on the integration branch ${branch}` } as const);
       }
       case "integrated":
       case "closed":
