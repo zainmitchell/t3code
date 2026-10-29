@@ -4468,7 +4468,7 @@ it.effect(
 );
 
 // Review round 4 (Spec/G1-R4-S01): a fork an agent makes belongs to the agent's work, whatever
-// thread it selects as context. These call the real MCP t3_thread_fork tool.
+// thread it selects as context. These call the real MCP t3_thread_transfer tool.
 
 const mcpClient = McpSchema.McpServerClient.of({
   clientId: 1,
@@ -4495,13 +4495,13 @@ const layerThreadTools = McpHttpServer.layerThreadToolkit.pipe(
   ),
 );
 
-/** An agent in `callerThreadId` forks `sourceThreadId` at `runId` through t3_thread_fork. */
+/** An agent in `callerThreadId` forks `sourceThreadId` at `runId` through t3_thread_transfer. */
 const forkThroughTool = (callerThreadId: ThreadId, sourceThreadId: ThreadId, runId: RunId) =>
   Effect.gen(function* () {
     const server = yield* McpServer.McpServer;
     const result = yield* server.callTool({
-      name: "t3_thread_fork",
-      arguments: { threadId: sourceThreadId, sourcePoint: { type: "run", runId } },
+      name: "t3_thread_transfer",
+      arguments: { action: "fork", threadId: sourceThreadId, sourcePoint: { type: "run", runId } },
     });
     const payload = JSON.parse(
       result.content.flatMap((content) => (content.type === "text" ? [content.text] : [])).join(""),

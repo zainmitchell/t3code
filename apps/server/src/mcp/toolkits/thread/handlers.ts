@@ -174,6 +174,7 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
               .pipe(Effect.mapError(dispatchFailure));
             return { sequence: result.sequence, targetThreadId };
           }
+          const scope = yield* McpInvocationContext.McpInvocationContext;
           const targetThreadId = ThreadId.make(`${commandId}:fork`);
           const result = yield* threads
             .dispatch({
@@ -183,6 +184,10 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
               targetThreadId,
               sourcePoint,
               ...(input.title === undefined ? {} : { title: input.title }),
+              // The fork is the calling agent's work, whichever thread it selected as context.
+              ...(scope.thread === undefined
+                ? {}
+                : { createdFrom: { type: "thread", threadId: scope.thread.threadId } }),
               createdBy: "agent",
               creationSource: "mcp",
             })

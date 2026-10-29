@@ -262,6 +262,7 @@ it.effect(
           isNodeStored: () => Effect.die("not used"),
           canStartQueuedRun: () => Effect.die("not used"),
           getRecoveryThreadIds: () => Effect.die("unused getRecoveryThreadIds"),
+          getNeverDequeuedRunIds: () => Effect.die("unused getNeverDequeuedRunIds"),
           getUnreadableThreadIds: () => Effect.die("unused getUnreadableThreadIds"),
           getThreadSnapshot: () => Effect.die("unused getThreadSnapshot"),
           getThreadSnapshotWindow: () => Effect.die("unused getThreadSnapshotWindow"),
