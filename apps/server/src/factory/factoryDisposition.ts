@@ -6,6 +6,7 @@ import * as EffectOutbox from "../orchestration-v2/EffectOutbox.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import { START_REFUSAL_SIGNALS, type FactoryCustody } from "./factoryCustody.ts";
 import * as FactoryExecutionGenerations from "./FactoryExecutionGenerations.ts";
+import type * as FactoryOutcomeStore from "./FactoryOutcomeStore.ts";
 import * as FactoryStore from "./FactoryStore.ts";
 
 const SESSION_OPEN_FAILURE = "provider-session-open-failure";
@@ -175,6 +176,98 @@ export const neverStartedRefusals = (evidence: NeverStartedEvidence): ReadonlyAr
     run.generations.some((generation) => generation.state !== "ended"),
   )
     ? ["container_not_ended"]
+    : []),
+  ...(unprovedOnly(evidence.custody) ? [] : ["custody_not_unproved"]),
+];
+
+/**
+ * Every fact an owner's quarantine of a historical stage rests on: the never-started read of its
+ * execution, the stage's own reported outcomes, and the quarantine it is under, if any.
+ */
+export const readQuarantineEvidence = Effect.fn("factoryDisposition.readQuarantineEvidence")(
+  function* (
+    reservation: AdmittedReservation,
+    custody: FactoryCustody,
+    outcomes: ReadonlyArray<FactoryOutcomeStore.FactoryOutcome>,
+  ) {
+    const execution = yield* readNeverStartedEvidence(reservation, custody);
+    return {
+      ...execution,
+      outcomes: outcomes.map((outcome) => ({
+        outcomeId: outcome.outcomeId,
+        state: outcome.state,
+        kind: outcome.report.outcome,
+        fromExecution: outcome.origin.type === "execution",
+      })),
+      quarantine:
+        reservation.quarantine === undefined
+          ? null
+          : {
+              by: reservation.quarantine.by,
+              evidenceDigest: reservation.quarantine.evidenceDigest,
+              quarantinedAt: reservation.quarantine.quarantinedAt,
+            },
+    };
+  },
+);
+export type QuarantineEvidence = Effect.Success<ReturnType<typeof readQuarantineEvidence>>;
+
+const FENCE_REFUSALS: ReadonlySet<string> = new Set(Object.values(START_REFUSAL_SIGNALS));
+
+/**
+ * A claimed launch whose provider outcome its own run records: the run started, so its work is
+ * judged as a started run, or the start fence refused it before any provider session opened.
+ */
+const launchOutcomeProved = (evidence: QuarantineEvidence, runId: string) => {
+  const run = evidence.runs.find((candidate) => candidate.runId === runId);
+  return (
+    run !== undefined &&
+    (run.started || (run.beforeTurn !== null && FENCE_REFUSALS.has(run.beforeTurn)))
+  );
+};
+
+/**
+ * Why the evidence cannot carry an owner's quarantine of a historical stage; empty when it can.
+ * It qualifies only when its custody is unknown for want of a provider join alone: reported and
+ * verified, every run over and every claimed launch accounted for, admitted by an earlier serving
+ * process, and never joined. Nothing live, unread or of unproved outcome qualifies.
+ */
+export const quarantineRefusals = (
+  evidence: QuarantineEvidence,
+  servingId: string,
+): ReadonlyArray<string> => [
+  ...(evidence.quarantine === null ? [] : ["already_quarantined"]),
+  ...(evidence.runs.length === 0 ? ["no_run"] : []),
+  ...(evidence.runs.some((run) => !TERMINAL_RUN_STATUSES.has(run.status))
+    ? ["run_not_terminal"]
+    : []),
+  ...(evidence.runs.some((run) => run.started) ? [] : ["not_started"]),
+  ...(evidence.runs.some((run) => run.started && run.status !== "completed")
+    ? ["started_run_not_completed"]
+    : []),
+  ...(evidence.launches.some((launch) => launch.status === "pending" || launch.status === "running")
+    ? ["launch_pending"]
+    : []),
+  ...(evidence.launches.some(
+    (launch) => launch.attempts > 0 && !launchOutcomeProved(evidence, launch.runId),
+  )
+    ? ["launch_outcome_unproved"]
+    : []),
+  ...(evidence.outcomes.some((outcome) => outcome.fromExecution && outcome.state === "verified")
+    ? []
+    : ["no_verified_report"]),
+  ...(evidence.runs.some((run) =>
+    run.generations.some((generation) => generation.providerJoins > 0),
+  )
+    ? ["provider_joined"]
+    : []),
+  ...(evidence.reservation.admittedIn === servingId ? ["admitted_by_this_process"] : []),
+  ...(evidence.runs.some(
+    (run) =>
+      run.obligation !== "none" &&
+      (run.obligation === "missing" || run.obligation.state !== "settled"),
+  )
+    ? ["workspace_obligation_open"]
     : []),
   ...(unprovedOnly(evidence.custody) ? [] : ["custody_not_unproved"]),
 ];

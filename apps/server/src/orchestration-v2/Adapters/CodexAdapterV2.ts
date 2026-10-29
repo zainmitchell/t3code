@@ -40,6 +40,7 @@ import {
 } from "@t3tools/contracts";
 import { SKILL_MENTION_PATTERN } from "@t3tools/shared/composerInlineTokens";
 import { AgentScope } from "@t3tools/shared/AgentScope";
+import { ExecutionJoin, spawnJoined } from "@t3tools/shared/ExecutionJoin";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import {
   COMPUTER_USE_TOOL_SOURCE,
@@ -1294,6 +1295,11 @@ export interface CodexAppServerClientFactoryShape {
     readonly instanceId: ProviderInstanceId;
     readonly threadId: ThreadId;
     readonly providerSessionId: OrchestrationV2ProviderSession["id"];
+    /**
+     * The session serves only `threadId`. Only such a session can start inside that thread's
+     * execution container: a shared one would carry other threads' work in with it.
+     */
+    readonly exclusive: boolean;
     readonly runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
     readonly settings: CodexSettings;
     readonly environment: NodeJS.ProcessEnv;
@@ -1488,33 +1494,54 @@ export const layerAppServerClientFactory: Layer.Layer<
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const { native: nativeEventLogger } = yield* ProviderEventLoggers.ProviderEventLoggers;
     const agentScope = yield* AgentScope;
+    const executionJoin = yield* ExecutionJoin;
 
     return CodexAppServerClientFactory.of({
       open: Effect.fn("CodexAdapterV2.open")(function* (input) {
         const scope = yield* Scope.Scope;
+        const openError = (cause: unknown) =>
+          new ProviderAdapter.ProviderAdapterOpenSessionError({
+            driver: CODEX_PROVIDER,
+            providerSessionId: input.providerSessionId,
+            cause,
+          });
         const environment = {
           ...codexAppServerEnvironment(input.environment),
           ...(input.settings.homePath ? { CODEX_HOME: input.settings.homePath } : {}),
         };
-        const command = yield* makeCodexAppServerSpawnCommand({
-          command: input.settings.binaryPath || "codex",
-          args: codexAppServerArgs(
-            resolveCodexLaunchArgs(input.settings.launchArgs, input.environment),
-          ),
-          env: environment,
-          threadId: input.threadId,
-        }).pipe(Effect.provideService(AgentScope, agentScope));
-        const handle = yield* spawner.spawn(command).pipe(
-          Effect.provideService(Scope.Scope, scope),
-          Effect.mapError(
-            (cause) =>
-              new ProviderAdapter.ProviderAdapterOpenSessionError({
-                driver: CODEX_PROVIDER,
-                providerSessionId: input.providerSessionId,
-                cause,
-              }),
-          ),
+        const binaryPath = input.settings.binaryPath || "codex";
+        const args = codexAppServerArgs(
+          resolveCodexLaunchArgs(input.settings.launchArgs, input.environment),
         );
+        // A contained thread starts its app server inside its run's container or not at all.
+        const contained = input.exclusive
+          ? yield* executionJoin.forThread(input.threadId).pipe(Effect.mapError(openError))
+          : Option.none();
+        const handle = yield* (
+          Option.isSome(contained)
+            ? resolveSpawnCommand(binaryPath, args, { env: environment }).pipe(
+                Effect.flatMap((resolved) =>
+                  spawnJoined(
+                    spawner,
+                    contained.value,
+                    ChildProcess.make(resolved.command, resolved.args, {
+                      env: environment,
+                      shell: resolved.shell,
+                    }),
+                    "provider",
+                  ),
+                ),
+              )
+            : makeCodexAppServerSpawnCommand({
+                command: binaryPath,
+                args,
+                env: environment,
+                threadId: input.threadId,
+              }).pipe(
+                Effect.provideService(AgentScope, agentScope),
+                Effect.flatMap((command) => spawner.spawn(command)),
+              )
+        ).pipe(Effect.provideService(Scope.Scope, scope), Effect.mapError(openError));
         const protocolLogger = makeCodexAppServerProtocolLogger({
           nativeEventLogger,
           threadId: input.threadId,
@@ -1650,6 +1677,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           instanceId: adapterOptions.instanceId,
           threadId: input.threadId,
           providerSessionId: input.providerSessionId,
+          exclusive:
+            input.providerSessionId !==
+            idAllocator.derive.providerSession({ providerInstanceId: adapterOptions.instanceId }),
           runtimePolicy: input.runtimePolicy,
           settings: resolvedRuntime?.config ?? adapterOptions.settings,
           environment: resolvedRuntime?.environment ?? adapterOptions.environment,

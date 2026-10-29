@@ -158,6 +158,19 @@ export const FactoryStateResult = Schema.Struct({
       /** A transferred legacy worker's original job and work id. */
       job: Schema.optional(Schema.String),
       workId: Schema.optional(Schema.String),
+      /**
+       * The owner's quarantine of a historical stage: still held, owning its item, not charged
+       * against its pool, and proving nothing about its processes.
+       */
+      quarantine: Schema.optional(
+        Schema.Struct({
+          by: Schema.String,
+          reason: Schema.String,
+          quarantinedAt: Schema.String,
+          evidenceDigest: Schema.String,
+          nextAction: Schema.String,
+        }),
+      ),
     }),
   ),
   reservedDecisions: Schema.Array(
@@ -476,6 +489,25 @@ export const FactoryDisposeNeverStartedResult = Schema.Struct({
   disposed: Schema.Boolean,
   refusals: Schema.Array(Schema.String),
   /** The canonical evidence the digest is of, when the reservation could be read. */
+  evidence: Schema.optional(Schema.String),
+  evidenceDigest: Schema.optional(Schema.String),
+});
+
+/**
+ * The owner quarantines a held stage whose historical execution can never be proved to have
+ * ended (`enter`), or ends that quarantine (`leave`). Without `expectDigest` it only reads the
+ * evidence; with it, the change is recorded only if the evidence is still exactly that.
+ */
+export const FactoryQuarantineInput = Schema.Struct({
+  factoryId: FactoryId,
+  reservationId: FactoryReservationId,
+  action: Schema.Literals(["enter", "leave"]),
+  reason: TrimmedNonEmptyString.check(Schema.isMaxLength(2_000)),
+  expectDigest: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(128))),
+});
+export const FactoryQuarantineResult = Schema.Struct({
+  applied: Schema.Boolean,
+  refusals: Schema.Array(Schema.String),
   evidence: Schema.optional(Schema.String),
   evidenceDigest: Schema.optional(Schema.String),
 });

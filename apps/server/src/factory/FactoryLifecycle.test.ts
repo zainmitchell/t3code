@@ -7298,6 +7298,35 @@ it.effect(
 );
 
 it.effect(
+  "Custody/F1: a completed contained stage whose provider started outside its container stays held",
+  () =>
+    runIsolated(
+      Effect.gen(function* () {
+        // As the stable port's adapters did: the run's container is held, but the provider
+        // process never joined it, so its quiet container proves nothing about that process.
+        (yield* ScriptedJoinTarget).skip = true;
+        const { execution, run } = yield* finishedWorkspaceExecution(
+          6631,
+          { type: "root" },
+          { awaitStart: true },
+        );
+        const [own] = yield* generationFactsOf(run.id);
+        assert.deepStrictEqual([own?.state, own?.providerJoins], ["held", undefined]);
+        assert.deepStrictEqual(yield* custodyOfReservation(execution), {
+          state: "unknown",
+          reasons: ["process_containment_unsupported"],
+        });
+        yield* TestClock.adjust("2 hours");
+        assert.deepStrictEqual(yield* custodyOfReservation(execution), {
+          state: "unknown",
+          reasons: ["process_containment_unsupported"],
+        });
+        assert.strictEqual(yield* occupied, 1);
+      }),
+    ),
+);
+
+it.effect(
   "N26/N27: a review on Codex or Muse settles once its own contained provider has ended",
   () =>
     Effect.gen(function* () {
@@ -10880,6 +10909,302 @@ const configurePullRequestFactory = Effect.gen(function* () {
   yield* configureLifecycleFactory;
   return yield* configureFactory(lifecycleConfiguration({ integration: pullRequestIntegration }));
 });
+
+/**
+ * A historical stage's shape: it ran on the deployed build, reported a
+ * verified outcome, and holds its item because its provider never joined its container. The
+ * serving process that admitted it is gone, so its record names an earlier one.
+ */
+const historicalStage = (issueNumber: number, overrides: Partial<FakeIssue> = {}) =>
+  Effect.gen(function* () {
+    yield* configureLifecycleFactory;
+    yield* seedIssue(issueNumber, overrides);
+    yield* seedIssue(issueNumber + 1);
+    // The deployed build's provider starts outside the container it was given.
+    const target = yield* ScriptedJoinTarget;
+    target.skip = true;
+    const admitted = admittedBy(yield* advance("tracker_event", 1));
+    assert.strictEqual(yield* dispositionOf(issueNumber + 1), "refused:capacity_exhausted");
+    yield* recordCommit(`c${String(issueNumber).padStart(7, "0")}`, [lifecycleBase]);
+    const execution = yield* workStage(admitted, {
+      outcome: "implemented",
+      subject: {
+        ...subjectFor(`c${String(issueNumber).padStart(7, "0")}`, lifecycleBase),
+        branch: `t3-factory/${issueNumber}`,
+      },
+      summary: `Implemented ${issueNumber}.`,
+    });
+    target.skip = false;
+    // Its later stage never starts while the held stage owns the item, nor does the next ticket.
+    assert.deepStrictEqual(
+      (yield* advance("outcome")).filter((admission) => admission.type === "admitted"),
+      [],
+    );
+    const reservationId = FactoryReservationId.make(`reservation:${execution.commandId}`);
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`UPDATE factory_reservations SET record_json = json_set(record_json, '$.admittedIn', 'serving:deployed') WHERE reservation_id = ${reservationId}`;
+    const held = yield* reservationOf(reservationId);
+    assert.deepStrictEqual(
+      [held?.state, held?.custody],
+      ["held", { state: "unknown", reasons: ["process_containment_unsupported"] }],
+    );
+    return { execution, reservationId };
+  });
+
+const quarantine = (
+  reservationId: FactoryReservationId,
+  action: "enter" | "leave",
+  expectDigest?: string,
+) =>
+  Effect.flatMap(FactoryLifecycle.FactoryLifecycle, (factory) =>
+    factory.quarantine({
+      factoryId,
+      reservationId,
+      action,
+      by: "owner",
+      reason: "historical execution; no provider join was recorded",
+      ...(expectDigest === undefined ? {} : { expectDigest }),
+    }),
+  );
+
+const occupiedNow = Effect.map(
+  Effect.flatMap(FactoryLifecycle.FactoryLifecycle, (factory) => factory.readState({ factoryId })),
+  (state) => state.pools.map((pool) => pool.occupiedUnits),
+);
+
+it.effect(
+  "Quarantine/Q1: a historical stage frees its unit for disjoint work but keeps its item, thread and outcome",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const { execution, reservationId } = yield* historicalStage(7801);
+          const historyBefore = yield* itemHistory(7801);
+          assert.deepStrictEqual(historyBefore, ["implement", "implemented"]);
+
+          // A read changes nothing; a stale digest refuses; the exact one quarantines once.
+          const read = yield* quarantine(reservationId, "enter");
+          assert.deepStrictEqual([read.applied, read.refusals], [false, []]);
+          assert.deepStrictEqual(yield* occupiedNow, [1]);
+          const stale = yield* quarantine(reservationId, "enter", "0".repeat(64));
+          assert.deepStrictEqual(stale.refusals, ["evidence_changed"]);
+          // Two owners confirming at once record one quarantine.
+          const [first, second] = yield* Effect.all(
+            [
+              quarantine(reservationId, "enter", read.evidenceDigest),
+              quarantine(reservationId, "enter", read.evidenceDigest),
+            ],
+            { concurrency: 2 },
+          );
+          assert.deepStrictEqual([first.applied, second.applied].toSorted(), [false, true]);
+          assert.include((first.applied ? second : first).refusals, "already_quarantined");
+
+          // Still held and unknown: it proves nothing, and owns its item and thread.
+          const held = yield* reservationOf(reservationId);
+          assert.strictEqual(held?.state, "held");
+          assert.deepStrictEqual(held?.custody, {
+            state: "unknown",
+            reasons: ["process_containment_unsupported"],
+          });
+          assert.deepStrictEqual(yield* occupiedNow, [0]);
+          const view = factoryStateView(
+            yield* (yield* FactoryLifecycle.FactoryLifecycle).readState({ factoryId }),
+          ).reservations.find((reservation) => reservation.reservationId === reservationId);
+          assert.strictEqual(view?.quarantine?.evidenceDigest, read.evidenceDigest);
+          assert.include(view?.quarantine?.nextAction, "t3_factory_quarantine");
+
+          // The disjoint ticket advances within the pool's one unit; the held item does not.
+          const next = (yield* advance("owner_decision")).filter(
+            (admission) => admission.type === "admitted",
+          );
+          assert.deepStrictEqual(next.map(stageOf), [[itemKeyFor(7802), "implement"]]);
+          assert.strictEqual(yield* dispositionOf(7801), "quarantined");
+          // The policy still weighs it as a native writer on its item.
+          assert.strictEqual(
+            (yield* PolicyFake).active.at(-1)?.find((entry) => entry.itemKey === itemKeyFor(7801))
+              ?.custody,
+            "native",
+          );
+          assert.deepStrictEqual(yield* occupiedNow, [1]);
+
+          // Unchanged passes, and a restart, keep one quarantine and decide nothing new for it.
+          const runsBefore = yield* runCount(execution.threadId);
+          const startsOn = Effect.map(
+            startedTurns,
+            (turns) => turns.filter((turn) => turn.threadId === execution.threadId).length,
+          );
+          const startsBefore = yield* startsOn;
+          const recordsBefore =
+            (yield* (yield* FactoryOutcomeStore.FactoryOutcomeStore).itemRecords({
+              factoryId,
+              itemKey: itemKeyFor(7801),
+            })).length;
+          yield* advance("clock");
+          yield* (yield* ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService).recover;
+          yield* advance("restart");
+          assert.strictEqual(yield* dispositionOf(7801), "quarantined");
+          assert.strictEqual(yield* runCount(execution.threadId), runsBefore);
+          assert.strictEqual(yield* startsOn, startsBefore);
+          assert.strictEqual(
+            (yield* (yield* FactoryOutcomeStore.FactoryOutcomeStore).itemRecords({
+              factoryId,
+              itemKey: itemKeyFor(7801),
+            })).length,
+            recordsBefore,
+          );
+          const state = yield* (yield* FactoryLifecycle.FactoryLifecycle).readState({ factoryId });
+          assert.deepStrictEqual(state.reservedDecisions, []);
+          assert.deepStrictEqual(yield* itemHistory(7801), historyBefore);
+          assert.strictEqual(
+            state.reservations.filter(
+              (reservation) =>
+                reservation.itemKey === itemKeyFor(7801) && reservation.state === "held",
+            ).length,
+            1,
+          );
+
+          // The held item cannot be admitted again, by entry or by a pass.
+          const entered = yield* (yield* FactoryLifecycle.FactoryLifecycle).enter({
+            factoryId,
+            repository: claimRepository,
+            issueNumber: 7801,
+          });
+          assert.strictEqual(entered.threadId, execution.threadId);
+          assert.strictEqual(yield* runCount(execution.threadId), runsBefore);
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Quarantine/Q2: ending a quarantine charges the stage again, only on fresh evidence, and keeps its history",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const { reservationId } = yield* historicalStage(7811);
+          // Nothing to end yet.
+          assert.deepStrictEqual((yield* quarantine(reservationId, "leave")).refusals, [
+            "not_quarantined",
+          ]);
+          const entered = yield* quarantine(reservationId, "enter");
+          assert.isTrue(
+            (yield* quarantine(reservationId, "enter", entered.evidenceDigest)).applied,
+          );
+          // The evidence it entered on is stale for ending it.
+          const leaveRead = yield* quarantine(reservationId, "leave");
+          assert.deepStrictEqual(leaveRead.refusals, []);
+          assert.deepStrictEqual(
+            (yield* quarantine(reservationId, "leave", entered.evidenceDigest)).refusals,
+            ["evidence_changed"],
+          );
+          assert.isTrue(
+            (yield* quarantine(reservationId, "leave", leaveRead.evidenceDigest)).applied,
+          );
+          assert.deepStrictEqual(yield* occupiedNow, [1]);
+          const held = yield* reservationOf(reservationId);
+          assert.strictEqual(held?.state, "held");
+          assert.isTrue(held?.origin === "admitted" && held.quarantine === undefined);
+          assert.deepStrictEqual(
+            held?.origin === "admitted"
+              ? held.quarantineHistory?.map((ended) => [
+                  ended.evidenceDigest,
+                  ended.left.evidenceDigest,
+                ])
+              : undefined,
+            [[entered.evidenceDigest, leaveRead.evidenceDigest]],
+          );
+          assert.strictEqual(yield* dispositionOf(7811), "in_progress");
+        }),
+      ),
+    ),
+);
+
+it.effect("Quarantine/Q3: live, joined, current or unreported stages are never quarantined", () =>
+  runIsolated(
+    Effect.scoped(
+      Effect.gen(function* () {
+        yield* configureLifecycleFactory;
+        yield* seedIssue(7821);
+        const admitted = admittedBy(yield* advance("tracker_event", 1));
+        const running = yield* startStage(admitted);
+        const reservationId = FactoryReservationId.make(`reservation:${running.commandId}`);
+        // Running now, under the process that admitted it.
+        const live = yield* quarantine(reservationId, "enter");
+        assert.includeMembers(
+          [...live.refusals],
+          ["run_not_terminal", "custody_not_unproved", "admitted_by_this_process"],
+        );
+        // Ended without a report: an ambiguous writer, still charged.
+        (yield* ScriptedJoinTarget).skip = true;
+        yield* completeLatestRun(running.threadId);
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`UPDATE factory_reservations SET record_json = json_set(record_json, '$.admittedIn', 'serving:deployed') WHERE reservation_id = ${reservationId}`;
+        const unreported = yield* quarantine(reservationId, "enter");
+        assert.include(unreported.refusals, "no_verified_report");
+        assert.isFalse(
+          (yield* quarantine(reservationId, "enter", unreported.evidenceDigest)).applied,
+        );
+        assert.deepStrictEqual(yield* occupiedNow, [1]);
+        // A reservation of another factory or of nothing is not this owner's to quarantine.
+        assert.deepStrictEqual(
+          (yield* quarantine(FactoryReservationId.make("reservation:missing"), "enter")).refusals,
+          ["unknown_reservation"],
+        );
+      }),
+    ),
+  ),
+);
+
+it.effect(
+  "Quarantine/Q5: work overlapping a quarantined stage's files waits; disjoint work takes its freed unit",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const { reservationId } = yield* historicalStage(7851, owning("src/shared.py"));
+          const read = yield* quarantine(reservationId, "enter");
+          assert.isTrue((yield* quarantine(reservationId, "enter", read.evidenceDigest)).applied);
+          yield* keepClearOfLineages;
+          yield* seedIssue(7853, owning("src/shared.py"));
+          yield* seedIssue(7854, owning("src/disjoint.py"));
+          assert.deepStrictEqual(admittedItems(yield* collectIssues([7853, 7854])), [
+            itemKeyFor(7854),
+          ]);
+          assert.strictEqual(yield* dispositionOf(7853), "nothing_proposed");
+          assert.strictEqual(yield* dispositionOf(7851), "quarantined");
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Quarantine/Q4: a closed item's quarantined stage stays closed, unrelaunched, with its review kept",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const { execution, reservationId } = yield* historicalStage(7831);
+          // The owner closed the issue; T3 did not.
+          (yield* GitHubFake).issues.get(issueKey(claimRepository, 7831))!.state = "closed";
+          const read = yield* quarantine(reservationId, "enter");
+          assert.isTrue((yield* quarantine(reservationId, "enter", read.evidenceDigest)).applied);
+          const patchesBefore = yield* closeRequests;
+          const runsBefore = yield* runCount(execution.threadId);
+          yield* advance("clock");
+          yield* advance("clock");
+          assert.strictEqual(
+            (yield* GitHubFake).issues.get(issueKey(claimRepository, 7831))!.state,
+            "closed",
+          );
+          assert.strictEqual(yield* closeRequests, patchesBefore);
+          assert.strictEqual(yield* runCount(execution.threadId), runsBefore);
+          assert.deepStrictEqual(yield* itemHistory(7831), ["implement", "implemented"]);
+          assert.strictEqual((yield* reservationOf(reservationId))?.state, "held");
+        }),
+      ),
+    ),
+);
 
 const pullsFor = (branch: string) =>
   Effect.map(GitHubFake, (fake) => [...fake.pulls.values()].filter((pull) => pull.head === branch));

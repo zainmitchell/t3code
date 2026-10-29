@@ -256,6 +256,31 @@ const NeverStartedAttestation = Schema.Struct({
   attestedAt: Schema.String,
 });
 
+/**
+ * The owner's quarantine of a held stage whose historical execution can never be proved to have
+ * ended: it stays held, owning its item and fencing its thread, but is no longer charged against
+ * its pool. It proves nothing about its processes. `evidence` is what its digest names.
+ */
+const ReservationQuarantine = Schema.Struct({
+  by: Bounded,
+  reason: TrimmedNonEmptyString.check(Schema.isMaxLength(2_000)),
+  evidenceDigest: Bounded,
+  evidence: Schema.String,
+  quarantinedAt: Schema.String,
+});
+export type ReservationQuarantine = typeof ReservationQuarantine.Type;
+
+/** A quarantine the owner ended: the stage is charged again, and still unproved. */
+const EndedQuarantine = Schema.Struct({
+  ...ReservationQuarantine.fields,
+  left: Schema.Struct({
+    by: Bounded,
+    reason: TrimmedNonEmptyString.check(Schema.isMaxLength(2_000)),
+    evidenceDigest: Bounded,
+    leftAt: Schema.String,
+  }),
+});
+
 /** A factory decision admitted through `factory.execution.start`. */
 const AdmittedReservation = Schema.Struct({
   origin: Schema.Literal("admitted"),
@@ -278,6 +303,8 @@ const AdmittedReservation = Schema.Struct({
   /** The serving process that admitted it; see `FactoryStore.servingId`. */
   admittedIn: Schema.optional(Bounded),
   neverStartedAttestation: Schema.optional(NeverStartedAttestation),
+  quarantine: Schema.optional(ReservationQuarantine),
+  quarantineHistory: Schema.optional(Schema.Array(EndedQuarantine)),
 });
 
 /** A counted descendant of a native execution, admitted under the configuration current then. */
@@ -744,6 +771,25 @@ export class FactoryStore extends Context.Service<
       readonly evidenceDigest: string;
       readonly evidence: string;
     }) => Effect.Effect<boolean, FactoryStoreError>;
+    /**
+     * Enters or ends the owner's quarantine of a held admitted reservation, only while its stored
+     * record is still `expected`: the record the evidence was read with.
+     */
+    readonly recordQuarantine: (input: {
+      readonly reservationId: FactoryReservationId;
+      readonly expected: FactoryReservation;
+      readonly change:
+        | {
+            readonly type: "enter";
+            readonly quarantine: Omit<ReservationQuarantine, "quarantinedAt">;
+          }
+        | {
+            readonly type: "leave";
+            readonly by: string;
+            readonly reason: string;
+            readonly evidenceDigest: string;
+          };
+    }) => Effect.Effect<boolean, FactoryStoreError>;
     readonly disposedCarriers: (
       factoryId: FactoryId,
     ) => Effect.Effect<ReadonlySet<string>, FactoryStoreError>;
@@ -952,10 +998,12 @@ const make = Effect.gen(function* () {
       ),
     );
 
+  // A quarantined stage still owns its item, but no longer counts against its pool.
   const occupiedUnits = (factoryId: FactoryId, poolId: FactoryPoolId) =>
     sql<{ readonly units: number }>`
       SELECT COALESCE(SUM(units), 0) AS units FROM factory_reservations
       WHERE factory_id = ${factoryId} AND pool_id = ${poolId} AND state = 'held'
+        AND json_extract(record_json, '$.quarantine') IS NULL
     `.pipe(Effect.map((rows) => rows[0]?.units ?? 0));
 
   /** The admitted decision a native reservation belongs to. */
@@ -1925,6 +1973,69 @@ const make = Effect.gen(function* () {
         );
       },
       Effect.mapError(fail("attest-never-started")),
+    ),
+    recordQuarantine: Effect.fn("FactoryStore.recordQuarantine")(
+      function* (input: {
+        readonly reservationId: FactoryReservationId;
+        readonly expected: FactoryReservation;
+        readonly change:
+          | {
+              readonly type: "enter";
+              readonly quarantine: Omit<ReservationQuarantine, "quarantinedAt">;
+            }
+          | {
+              readonly type: "leave";
+              readonly by: string;
+              readonly reason: string;
+              readonly evidenceDigest: string;
+            };
+      }) {
+        const { expected, change } = input;
+        if (expected.origin !== "admitted" || expected.state !== "held") return false;
+        const at = DateTime.formatIso(yield* DateTime.now);
+        let next: FactoryReservation;
+        if (change.type === "enter") {
+          if (expected.quarantine !== undefined) return false;
+          next = { ...expected, quarantine: { ...change.quarantine, quarantinedAt: at } };
+        } else {
+          const { quarantine, ...rest } = expected;
+          if (quarantine === undefined) return false;
+          next = {
+            ...rest,
+            quarantineHistory: [
+              ...(expected.quarantineHistory ?? []),
+              {
+                ...quarantine,
+                left: {
+                  by: change.by,
+                  reason: change.reason,
+                  evidenceDigest: change.evidenceDigest,
+                  leftAt: at,
+                },
+              },
+            ],
+          };
+        }
+        return yield* sql.withTransaction(
+          Effect.gen(function* () {
+            const current = yield* reservationById(input.reservationId);
+            if (
+              Option.isNone(current) ||
+              (yield* encodeReservation(current.value)) !== (yield* encodeReservation(expected))
+            ) {
+              return false;
+            }
+            const updated = yield* sql`
+              UPDATE factory_reservations
+              SET record_json = ${yield* encodeReservation(next)}
+              WHERE reservation_id = ${input.reservationId} AND state = 'held'
+              RETURNING reservation_id
+            `;
+            return updated.length === 1;
+          }),
+        );
+      },
+      Effect.mapError(fail("record-quarantine")),
     ),
     issueGrant: Effect.fn("FactoryStore.issueGrant")(
       function* (input: {

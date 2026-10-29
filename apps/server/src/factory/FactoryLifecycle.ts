@@ -69,7 +69,12 @@ import * as FactoryGitReadback from "./FactoryGitReadback.ts";
 import * as FactoryOutcomeStore from "./FactoryOutcomeStore.ts";
 import { entryView } from "./factoryEntry.ts";
 import { canonical, makeFactoryOutcomes, subjectOf } from "./factoryOutcomes.ts";
-import { neverStartedRefusals, readNeverStartedEvidence } from "./factoryDisposition.ts";
+import {
+  neverStartedRefusals,
+  quarantineRefusals,
+  readNeverStartedEvidence,
+  readQuarantineEvidence,
+} from "./factoryDisposition.ts";
 import { makeNativeStages, TICKET_DECISION_STAGE } from "./factoryNativeStages.ts";
 import { makeBookkeeping } from "./factoryBookkeeping.ts";
 import { makeSwitchProvider } from "./factoryProviderSwitch.ts";
@@ -284,6 +289,8 @@ export type FactoryItemDisposition =
   | "read_superseded"
   | "done"
   | "in_progress"
+  /** Held under the owner's quarantine: owns its item, is not charged, proves nothing. */
+  | "quarantined"
   | "not_owned"
   | "foreign_claim"
   | "not_eligible"
@@ -685,6 +692,27 @@ export class FactoryLifecycle extends Context.Service<
       readonly by: string;
       readonly reason: string;
     }) => Effect.Effect<boolean, FactoryLifecycleError>;
+    /**
+     * The owner's quarantine of a held stage whose historical execution can never be proved to
+     * have ended, or its end. A read without `expectDigest`; an exact digest records it. The stage
+     * keeps its item, thread and claim; only its pool stops counting it. Nothing is released.
+     */
+    readonly quarantine: (input: {
+      readonly factoryId: FactoryId;
+      readonly reservationId: FactoryReservationId;
+      readonly action: "enter" | "leave";
+      readonly by: string;
+      readonly reason: string;
+      readonly expectDigest?: string | undefined;
+    }) => Effect.Effect<
+      {
+        readonly applied: boolean;
+        readonly refusals: ReadonlyArray<string>;
+        readonly evidence?: string;
+        readonly evidenceDigest?: string;
+      },
+      FactoryLifecycleError
+    >;
     /**
      * The owner's attestation that an admitted stage never started, for one whose custody is
      * unknown only because nothing proves its preparation history. A read without `expectDigest`;
@@ -1573,10 +1601,14 @@ const make = Effect.gen(function* () {
         pools: (configuration?.pools ?? []).map((pool) => ({
           poolId: pool.poolId,
           capacityUnits: pool.capacityUnits,
-          // A released reservation stays as history and holds nothing.
+          // A released reservation stays as history and holds nothing; a quarantined one still
+          // owns its item but is not charged.
           occupiedUnits: reservations
             .filter(
-              (reservation) => reservation.poolId === pool.poolId && reservation.state === "held",
+              (reservation) =>
+                reservation.poolId === pool.poolId &&
+                reservation.state === "held" &&
+                (reservation.origin !== "admitted" || reservation.quarantine === undefined),
             )
             .reduce((total, reservation) => total + reservation.units, 0),
         })),
@@ -2262,6 +2294,15 @@ const make = Effect.gen(function* () {
           custody: "native",
           issue: weighed,
         });
+        if (running.origin === "admitted" && running.quarantine !== undefined) {
+          note(
+            itemKey,
+            stage.type,
+            "quarantined",
+            `its ${running.taskKind} stage's historical execution has no proof its processes ended; it still owns this item, uncharged since ${running.quarantine.quarantinedAt}. Next: the owner proves its processes ended and reconciles it, or ends the quarantine with t3_factory_quarantine.`,
+          );
+          continue;
+        }
         note(
           itemKey,
           stage.type,
@@ -3927,6 +3968,88 @@ const make = Effect.gen(function* () {
             (cause) =>
               new FactoryLifecycleError({
                 operation: "dispose-never-started",
+                factoryId: input.factoryId,
+                cause,
+              }),
+          ),
+        ),
+    ),
+    quarantine: Effect.fn("FactoryLifecycle.quarantine")(
+      function* (input: {
+        readonly factoryId: FactoryId;
+        readonly reservationId: FactoryReservationId;
+        readonly action: "enter" | "leave";
+        readonly by: string;
+        readonly reason: string;
+        readonly expectDigest?: string | undefined;
+      }) {
+        const result = yield* sql.withTransaction(
+          Effect.gen(function* () {
+            const found = yield* store.getReservation(input.reservationId);
+            if (Option.isNone(found) || found.value.factoryId !== input.factoryId) {
+              return { applied: false, refusals: ["unknown_reservation"] };
+            }
+            const reservation = found.value;
+            if (reservation.origin !== "admitted" || reservation.state !== "held") {
+              return { applied: false, refusals: ["not_held_admitted"] };
+            }
+            const facts = yield* readQuarantineEvidence(
+              reservation,
+              yield* custodyOf(reservation),
+              yield* outcomeStore.listForOrigin(reservation.reservationId),
+            ).pipe(Effect.provide(custodyContext));
+            const evidence = canonical({ action: input.action, ...facts });
+            const read = { evidence, evidenceDigest: sha256(evidence) };
+            const refusals =
+              input.action === "enter"
+                ? quarantineRefusals(facts, store.servingId)
+                : facts.quarantine === null
+                  ? ["not_quarantined"]
+                  : [];
+            if (refusals.length > 0 || input.expectDigest === undefined) {
+              return { applied: false, refusals, ...read };
+            }
+            if (input.expectDigest !== read.evidenceDigest) {
+              return { applied: false, refusals: ["evidence_changed"], ...read };
+            }
+            const applied = yield* store.recordQuarantine({
+              reservationId: reservation.reservationId,
+              expected: reservation,
+              change:
+                input.action === "enter"
+                  ? {
+                      type: "enter",
+                      quarantine: {
+                        by: input.by,
+                        reason: input.reason,
+                        evidenceDigest: read.evidenceDigest,
+                        evidence: read.evidence,
+                      },
+                    }
+                  : {
+                      type: "leave",
+                      by: input.by,
+                      reason: input.reason,
+                      evidenceDigest: read.evidenceDigest,
+                    },
+            });
+            return applied
+              ? { applied: true, refusals: [], ...read }
+              : { applied: false, refusals: ["evidence_changed"], ...read };
+          }),
+        );
+        // The capacity it held is free now, or charged again: the next pass weighs that.
+        if (result.applied) {
+          yield* Queue.offer(wakes, { factoryId: input.factoryId, trigger: "owner_decision" });
+        }
+        return result;
+      },
+      (effect, input) =>
+        effect.pipe(
+          Effect.mapError(
+            (cause) =>
+              new FactoryLifecycleError({
+                operation: "quarantine",
                 factoryId: input.factoryId,
                 cause,
               }),

@@ -10,6 +10,12 @@ import {
   ThreadId,
   WorktreeMcpHandoffInput,
 } from "@t3tools/contracts";
+import {
+  CurrentExecutionJoin,
+  ExecutionJoin,
+  type ExecutionJoinShape,
+  JoinRefused,
+} from "@t3tools/shared/ExecutionJoin";
 import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -89,6 +95,7 @@ const project: Project = {
 
 interface HarnessOptions {
   readonly git?: Partial<GitWorkflowService.GitWorkflowService["Service"]>;
+  readonly executionJoin?: ExecutionJoinShape;
   readonly thread?: ThreadFixture | null;
   readonly threadReadError?: "projection" | "dispatch";
   readonly capabilities?: ReadonlySet<McpInvocationContext.McpCapability>;
@@ -318,6 +325,9 @@ const makeHarness = (options: HarnessOptions = {}) => {
         Layer.mock(VcsStatusBroadcaster.VcsStatusBroadcaster)({
           refreshStatus,
         } satisfies Partial<VcsStatusBroadcaster.VcsStatusBroadcaster["Service"]>),
+        options.executionJoin === undefined
+          ? Layer.empty
+          : Layer.succeed(ExecutionJoin, options.executionJoin),
         NodeServices.layer,
       ),
     ),
@@ -370,6 +380,40 @@ const runStatus = (harness: ReturnType<typeof makeHarness>) =>
 const decodeHandoffInput = Schema.decodeUnknownEffect(WorktreeMcpHandoffInput);
 
 describe("t3_worktree_handoff", () => {
+  it.effect("runs a contained thread's Git work inside its container, or not at all", () => {
+    const joined: Array<boolean> = [];
+    const contained = makeHarness({
+      executionJoin: {
+        forThread: () =>
+          Effect.succeedSome(() => Effect.fail(new JoinRefused({ reason: "fixture join" }))),
+        heldForThread: () => Effect.succeedNone,
+      },
+      git: {
+        createWorktree: (input) =>
+          Effect.map(CurrentExecutionJoin, (join) => {
+            joined.push(Option.isSome(join));
+            return {
+              worktree: { path: `/worktrees/project/${input.newRefName}`, refName: "joined" },
+            };
+          }),
+      },
+    });
+    const refused = makeHarness({
+      executionJoin: {
+        forThread: (thread) =>
+          Effect.fail(new JoinRefused({ threadId: thread, reason: "no container" })),
+        heldForThread: () => Effect.succeedNone,
+      },
+    });
+    return Effect.gen(function* () {
+      yield* runHandoff(contained, { branch: "feature/contained" });
+      expect(joined).toEqual([true]);
+      const exit = yield* Effect.exit(runHandoff(refused, { branch: "feature/refused" }));
+      expectTypedFailure(exit, { _tag: "WorktreeMcpFailure", code: "operation_failed" });
+      expect(refused.createWorktree).not.toHaveBeenCalled();
+    });
+  });
+
   it.effect("reports a continuation failure without failing the handoff", () => {
     const harness = makeHarness({ continuation: "fails" });
     return Effect.gen(function* () {
