@@ -16,8 +16,15 @@ import * as NodeHttp from "node:http";
 import { npmReleaseDatabaseMigration } from "@t3tools/shared/cliRelease";
 
 import { buildNpmLauncher } from "./build-npm-launcher.ts";
+import { windowsSystemTar } from "./lib/windows-tar.ts";
 
 const VERSION = "1.2.3";
+// The scripts project cannot list server sources, so load the runtime's head untyped and decode it.
+const SERVER_MIGRATION_HEAD_MODULE = "../apps/server/src/persistence/databaseMigrationHead.ts";
+const serverMigrationHead = Effect.promise(() => import(SERVER_MIGRATION_HEAD_MODULE)).pipe(
+  Effect.flatMap(Schema.decodeUnknownEffect(Schema.Struct({ BUILD_MIGRATION_HEAD: Schema.Int }))),
+  Effect.map((module) => module.BUILD_MIGRATION_HEAD),
+);
 const decodeManifest = Schema.decodeEffect(
   Schema.fromJsonString(Schema.Record(Schema.String, Schema.Unknown)),
 );
@@ -100,6 +107,37 @@ const serveFakeRelease = Effect.fn("test.serveFakeRelease")(function* (root: str
 });
 
 it.layer(NodeServices.layer)("build-npm-launcher", (it) => {
+  it.effect("stamps the server's migration manifest head into the staged and packed package", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-npm-launcher-test-" });
+      const output = yield* buildNpmLauncher({
+        version: VERSION,
+        outputDir: path.join(root, "out"),
+      });
+      const tar = (yield* HostProcess.Platform) === "win32" ? windowsSystemTar() : "tar";
+      const unpack = yield* run(tar, ["-xzf", output.tarball, "-C", root], {
+        cwd: root,
+        env: { PATH: process.env.PATH },
+      });
+      assert.equal(unpack.exitCode, 0, unpack.stderr);
+
+      const head = yield* serverMigrationHead;
+      for (const packageDir of [output.packageDir, path.join(root, "package")]) {
+        const manifest = yield* decodeManifest(
+          yield* fs.readFileString(path.join(packageDir, "package.json")),
+        );
+        assert.equal(manifest.name, "t3");
+        assert.equal(manifest.version, VERSION);
+        assert.deepStrictEqual(manifest.bin, { t3: "./bin/t3.mjs" });
+        assert.isUndefined(manifest.dependencies);
+        assert.isUndefined(manifest.optionalDependencies);
+        assert.equal(npmReleaseDatabaseMigration(manifest), head);
+      }
+    }),
+  );
+
   it.effect.skipIf(HostProcess.Platform.defaultValue() === "win32")(
     "publishes a launcher that downloads, verifies, caches, and runs the release executable",
     () =>
@@ -111,16 +149,6 @@ it.layer(NodeServices.layer)("build-npm-launcher", (it) => {
           version: VERSION,
           outputDir: path.join(root, "out"),
         });
-
-        const manifest = yield* decodeManifest(
-          yield* fs.readFileString(path.join(output.packageDir, "package.json")),
-        );
-        assert.equal(manifest.name, "t3");
-        assert.equal(manifest.version, VERSION);
-        assert.deepStrictEqual(manifest.bin, { t3: "./bin/t3.mjs" });
-        assert.isUndefined(manifest.dependencies);
-        assert.isUndefined(manifest.optionalDependencies);
-        assert.isAbove(npmReleaseDatabaseMigration(manifest) ?? 0, 0);
 
         const installed = path.join(root, "installed");
         yield* fs.makeDirectory(installed);
