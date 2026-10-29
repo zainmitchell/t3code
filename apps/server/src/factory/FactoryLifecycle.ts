@@ -360,6 +360,8 @@ export interface FactoryCollectionInput {
  */
 export type FactoryPolicyOutcome = FactoryOutcomeStore.FactoryOutcome & {
   readonly itemVersion?: string;
+  /** The policy revision its stage was admitted under, so a stale preparation is never adopted. */
+  readonly policyRevision?: string;
 };
 
 /** One item a pass could decide, with every native fact policy may need for it. */
@@ -830,7 +832,11 @@ export const policyOutcomes = Effect.fnUntraced(function* (
         : yield* reads.store.getReservation(reservationId);
     outcomes.push(
       Option.isSome(admitted) && admitted.value.origin === "admitted"
-        ? { ...outcome.value, itemVersion: admitted.value.itemVersion }
+        ? {
+            ...outcome.value,
+            itemVersion: admitted.value.itemVersion,
+            policyRevision: admitted.value.policyRevision,
+          }
         : outcome.value,
     );
   }

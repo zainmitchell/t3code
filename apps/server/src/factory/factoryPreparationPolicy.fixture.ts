@@ -23,6 +23,7 @@ interface Outcome {
   readonly state: string;
   readonly report: Report;
   readonly itemVersion?: string;
+  readonly policyRevision?: string;
 }
 
 interface Issue {
@@ -49,6 +50,7 @@ interface Item {
 
 interface Facts {
   readonly factoryId: string;
+  readonly policyRevision: string;
   readonly items: ReadonlyArray<Item>;
   readonly active: ReadonlyArray<{ readonly item: Issue }>;
 }
@@ -73,12 +75,13 @@ const ownedFiles = (body: string) => {
 
 const nothing = (cls: string, reason: string) => ({ decision: "none", class: cls, reason });
 
-const admit = (entry: Item, brief: string, grantEvidence?: string) => ({
+const admit = (entry: Item, brief: string, grantEvidence?: string, prepared?: string) => ({
   decision: "admit",
   title: `${entry.stage.type} ${entry.item.itemKey}`,
   brief,
   poolId: "builders",
   units: 1,
+  ...(prepared === undefined ? {} : { prepared }),
   ...(grantEvidence === undefined
     ? {}
     : {
@@ -109,6 +112,11 @@ const decide = (facts: Facts, entry: Item): unknown => {
   const profile = PROFILES[facts.factoryId] ?? { adopt: "owner", children: false };
   const labels = new Set(entry.item.labels);
   if (labels.has("hold")) return nothing("held", "an owner hold is on this item");
+  // A policy that names a preparation T3 must refuse, as a stale or buggy one would.
+  const forced = entry.item.labels.find((label) => label.startsWith("adopt:"));
+  if (forced !== undefined) {
+    return admit(entry, "Build the named preparation.", undefined, forced.slice("adopt:".length));
+  }
   if (entry.stage.type !== "implement") {
     return entry.stage.type === "integrate" || entry.stage.type === "close"
       ? { decision: "proceed" }
@@ -128,19 +136,18 @@ const decide = (facts: Facts, entry: Item): unknown => {
       ? admit(entry, `Build ${entry.item.itemKey} as its issue specifies.`)
       : nothing("waiting", waiting);
   }
+  // A preparation counts only for the text and the policy it was made under.
   const triaged = entry.outcomes.filter(
-    (outcome) => outcome.stage === "triage" && outcome.itemVersion === entry.itemVersion,
+    (outcome) =>
+      outcome.stage === "triage" &&
+      outcome.itemVersion === entry.itemVersion &&
+      outcome.policyRevision === facts.policyRevision,
   );
   if (triaged.length === 0) {
     return {
       decision: "triage",
       title: `prepare ${entry.item.itemKey}`,
-      brief: [
-        `Prepare ${entry.item.itemKey} at item version ${entry.itemVersion} into one bounded unit.`,
-        "Read the issue, its blockers, the repository at its integration base, the project rules and prior results; change nothing.",
-        "Report the candidate base as subject.baseCommit, the checks in the unit, and a dependency in the unit, not as a blocker.",
-        "Report not_actionable only for what a person must settle, its failure led by decision:, permission:, private_data:, ownership: or hold:.",
-      ].join("\n"),
+      brief: `Prepare ${entry.item.itemKey} at item version ${entry.itemVersion} into one bounded unit.`,
       poolId: "builders",
       units: 1,
     };
@@ -193,13 +200,14 @@ const decide = (facts: Facts, entry: Item): unknown => {
   const waiting = unmetDependency(entry);
   if (waiting !== undefined) return nothing("waiting", waiting);
   const brief = `Build the prepared unit ${latest.outcomeId} of ${entry.item.itemKey}:\n\n${proposal.unit}`;
-  return profile.adopt === "auto"
-    ? admit(entry, brief)
-    : admit(
-        entry,
-        brief,
-        `adopt ${latest.outcomeId} at ${entry.itemVersion}: ${digest(proposal.unit)}`,
-      );
+  return admit(
+    entry,
+    brief,
+    profile.adopt === "auto"
+      ? undefined
+      : `adopt ${latest.outcomeId} at ${entry.itemVersion}: ${digest(proposal.unit)}`,
+    latest.outcomeId,
+  );
 };
 
 const chunks: Array<Buffer> = [];

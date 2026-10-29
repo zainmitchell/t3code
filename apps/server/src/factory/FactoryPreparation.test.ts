@@ -68,6 +68,7 @@ const outcome = (
     readonly stage?: FactoryLifecycle.FactoryPolicyOutcome["stage"];
     readonly itemVersion?: string;
     readonly itemKey?: FactoryItemKey;
+    readonly policyRevision?: string;
   } = {},
 ): FactoryLifecycle.FactoryPolicyOutcome => {
   const fields = {
@@ -85,6 +86,7 @@ const outcome = (
     reportDigest: sha256(JSON.stringify(report)),
     reportedAt: "2026-10-29T00:00:00.000Z",
     itemVersion: options.itemVersion ?? "v2",
+    policyRevision: options.policyRevision ?? "policy-r1",
   };
   switch (options.state ?? "verified") {
     case "reported":
@@ -225,6 +227,20 @@ it.live(
         assert.include(triage.packet.text, "at item version v2");
         // T3's footer binds the proposal to the exact version the worker read.
         assert.include(triage.packet.text, "Item version: v2. Report it as proposal.basis");
+        // The worker prepares from verified evidence and settles routine gaps, never authority.
+        assert.include(
+          triage.packet.text,
+          "the project's rules and the repository at its integration base",
+        );
+        assert.include(
+          triage.packet.text,
+          "a missing permission, product decision or owner hold is never yours to settle",
+        );
+        assert.include(triage.packet.text, "subject.baseCommit = the commit the unit starts from");
+        assert.include(
+          triage.packet.text,
+          "`decision:` (the one question, its consequence and the exact action that answers it)",
+        );
         assert.include(triage.packet.text, "- unit_proposed with proposal.basis");
       }
 
@@ -401,4 +417,63 @@ it.live("Prepare: a stale, rejected, unverified or contested proposal never star
       { type: "none", class: "waiting", reason: `its owned files are in use by ${other}` },
     );
   }).pipe(Effect.provide(layer)),
+);
+
+it.live(
+  "Prepare: T3 refuses a build that adopts a stale preparation, and a new policy prepares again",
+  () =>
+    Effect.gen(function* () {
+      const adopt = ["adopt:triage-1"];
+      const fresh = outcome("triage-1", proposed());
+      assert.strictEqual(
+        admission(yield* decide("btc", { labels: adopt, outcomes: [fresh] })).taskKind,
+        "implement",
+      );
+      const stale = (reason: string) => ({
+        type: "none",
+        class: "prepared_stale",
+        reason: `prepared unit is stale: ${reason}`,
+      });
+      const cases: ReadonlyArray<readonly [string, ItemInput, string]> = [
+        [
+          "a newer preparation of the same text",
+          { outcomes: [fresh, outcome("triage-2", proposed())] },
+          "triage-1 is not the latest preparation of item version v2",
+        ],
+        [
+          "a proposal for older text",
+          { itemVersion: "v3", outcomes: [fresh] },
+          "triage-1 is not the latest preparation of item version v3",
+        ],
+        [
+          "a rejected proposal",
+          { outcomes: [outcome("triage-1", proposed(), { state: "rejected" })] },
+          "triage-1 is not a verified proposal",
+        ],
+        [
+          "a result that proposed nothing",
+          { outcomes: [outcome("triage-1", notActionable("hold: the owner paused it"))] },
+          "triage-1 is not a verified proposal",
+        ],
+        [
+          "a proposal made under another policy",
+          { outcomes: [outcome("triage-1", proposed(), { policyRevision: "policy-r0" })] },
+          "triage-1 was prepared under policy policy-r0, not policy-r1",
+        ],
+      ];
+      for (const [name, input, reason] of cases) {
+        assert.deepStrictEqual(
+          yield* decide("btc", { ...input, labels: adopt }),
+          stale(reason),
+          name,
+        );
+      }
+      // The project's own policy reads the same fact and prepares the item again instead.
+      const revalidated = admission(
+        yield* decide("btc", {
+          outcomes: [outcome("triage-1", proposed(), { policyRevision: "policy-r0" })],
+        }),
+      );
+      assert.strictEqual(revalidated.taskKind, "triage");
+    }).pipe(Effect.provide(layer)),
 );

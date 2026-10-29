@@ -1585,7 +1585,7 @@ const layerIntegratorFake = Layer.effect(
 const layerGitGraphFake = Layer.effect(
   FactoryGitReadback.FactoryGitReadback,
   Effect.map(GitGraphFake, (graph) => {
-    const resolve = (ref: string) => graph.branches.get(ref) ?? ref;
+    const resolve = (ref: string) => graph.branches.get(ref.replace(/^refs\/heads\//, "")) ?? ref;
     const ancestors = (commit: string) => {
       const seen = new Set<string>();
       const queue = [resolve(commit)];
@@ -18907,7 +18907,13 @@ const decomposingPolicy: ProposeFn = (input) => {
       outcome.report.proposal?.basis === input.observation.itemVersion,
   );
   if (proposed || /^## Owned files/m.test(input.issue.body)) return stageRequest(input);
-  return Effect.map(inOneHour, (deadline) => {
+  return triageRequest(input);
+};
+
+const triageRequest = (
+  input: ProposeInput,
+): Effect.Effect<FactoryLifecycle.FactoryPolicyDecision> =>
+  Effect.map(inOneHour, (deadline) => {
     const text = `triage ${input.observation.itemKey} at ${input.observation.itemVersion}`;
     return admissionFor(
       input.observation.itemKey,
@@ -18920,7 +18926,6 @@ const decomposingPolicy: ProposeFn = (input) => {
       },
     );
   });
-};
 
 const admittedOnly = (admissions: ReadonlyArray<FactoryLifecycle.FactoryAdmissionResult>) =>
   admissions.filter((admission) => admission.type === "admitted");
@@ -19076,6 +19081,77 @@ it.effect(
           const second = admittedBy(yield* advance("tracker_event"));
           assert.deepStrictEqual(stageOf(second), [item, "triage"]);
           assert.notStrictEqual(admittedVersion(second), admittedVersion(triage));
+        }),
+      ),
+    ),
+);
+
+/**
+ * A policy that adopts a preparation only under the policy revision it was made for, from the
+ * input its command receives: after a new revision is adopted, the item is prepared again.
+ */
+const revisionBoundPreparationPolicy: ProposeFn = (input) => {
+  if (input.stage.type !== "implement") return stageRequest(input);
+  const { configuration, ...item } = input;
+  const [sent] = FactoryCommandPolicy.policyInput({
+    configuration,
+    items: [item],
+    active: [],
+  }).items;
+  const latest = sent!.outcomes.findLast(
+    (outcome) => outcome.stage === "triage" && outcome.itemVersion === sent!.itemVersion,
+  );
+  if (latest?.policyRevision !== configuration.policyRevision) return triageRequest(input);
+  return latest.state === "verified" && latest.report.outcome === "unit_proposed"
+    ? stageRequest(input)
+    : Effect.succeed({ type: "none", reason: "preparation pending", class: "triage_pending" });
+};
+
+it.effect(
+  "Decompose/D8: a preparation is adopted only under its policy revision and from a base T3 reads",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* configureLifecycleFactory;
+          yield* usePolicy(revisionBoundPreparationPolicy);
+          yield* seedIssue(7932, { body: "Make the CSV import idempotent." });
+          const item = itemKeyFor(7932);
+          const proposal = (basis: string, baseCommit: string) => ({
+            outcome: "unit_proposed" as const,
+            summary: "One unit: the importer.",
+            proposal: {
+              basis,
+              unit: "## Owned files\n- src/importer.ts",
+              ownedFiles: ["src/importer.ts"],
+            },
+            subject: { repository: claimRepository, baseCommit },
+          });
+          // An invented base is no preparation: nothing is built.
+          const first = admittedBy(yield* advance("tracker_event", 1));
+          yield* workStage(first, proposal(admittedVersion(first), "b0000099"));
+          assert.deepStrictEqual(admittedOnly(yield* advance("outcome", 3)), []);
+          const outcomes = yield* FactoryOutcomeStore.FactoryOutcomeStore;
+          const [invented] = yield* outcomes.listForOrigin(first.reservation.reservationId);
+          assert.strictEqual(
+            invented?.state === "rejected" ? invented.rejection : invented?.state,
+            "base b0000099 does not exist",
+          );
+
+          // A new policy revision prepares the item again, once; its own verified proposal is built.
+          yield* configureFactory(lifecycleConfiguration({ policyRevision: "policy-r2" }));
+          const second = admittedBy(yield* advance("clock", 1));
+          assert.deepStrictEqual(stageOf(second), [item, "triage"]);
+          assert.strictEqual(
+            second.type === "admitted" && second.reservation.origin === "admitted"
+              ? second.reservation.policyRevision
+              : undefined,
+            "policy-r2",
+          );
+          yield* workStage(second, proposal(admittedVersion(second), lifecycleBase));
+          const implement = admittedBy(yield* advance("outcome"));
+          assert.deepStrictEqual(stageOf(implement), [item, "implement"]);
+          assert.deepStrictEqual(admittedOnly(yield* advance("clock", 2)), []);
         }),
       ),
     ),

@@ -38,6 +38,11 @@ const PolicyDecision = Schema.Union([
     grant: Schema.optional(Schema.Struct({ reason: Bounded(2_000), evidence: Bounded(200_000) })),
     /** One of the configuration's named executions, such as a builder effort. */
     execution: Schema.optional(Bounded(200)),
+    /**
+     * The triage outcome whose proposal this build adopts. The build starts only while that
+     * proposal is still the item's current preparation; otherwise nothing starts.
+     */
+    prepared: Schema.optional(Bounded(64)),
   }),
   /**
    * Decomposition for an item at its first stage that has no unit spec yet: a worker proposes
@@ -81,7 +86,7 @@ const PolicyDecision = Schema.Union([
     /**
      * Why nothing starts, as a class the owner can count: `needs_routing` (no unit spec, no
      * triage yet), `triage_pending`, `not_actionable`, `proposal_pending_owner`, `waiting`,
-     * `held`, `excluded` or `other`.
+     * `held`, `excluded` or `other`. T3 itself records `prepared_stale`.
      */
     class: Schema.optional(Bounded(64)),
   }),
@@ -109,9 +114,9 @@ const REPORT_REQUIREMENTS: Record<string, string> = {
     "review_failed with the exact subject.headCommit you reviewed and the findings as failure",
   correction_spec: "correction_spec with the specification as summary",
   unit_proposed:
-    "unit_proposed with proposal.basis = the item version named above, proposal.unit = the exact unit spec text for the issue, proposal.ownedFiles, proposal.resources and proposal.effort, and the reasoning as summary",
+    "unit_proposed with proposal.basis = the item version named above, proposal.unit = the exact unit spec text for the issue with its checks and any dependency, proposal.ownedFiles, proposal.resources and proposal.effort, subject.repository and subject.baseCommit = the commit the unit starts from, and the evidence you relied on as summary",
   not_actionable:
-    "not_actionable with failure = why no bounded unit can be proposed (a missing input, a reserved decision, or a split the owner must choose)",
+    "not_actionable only for what a person must settle, with failure led by its kind: `decision:` (the one question, its consequence and the exact action that answers it), `permission:`, `private_data:`, `ownership:` or `hold:`, then what is missing",
 };
 
 /**
@@ -126,7 +131,8 @@ const evidenceInstructions = (
   if (taskKind === "triage") {
     return [
       `Item version: ${item.observation.itemVersion}. Report it as proposal.basis; a proposal for any other version is rejected.`,
-      "Propose only from the issue's own text, its parent and its verified outcomes; change no file and no tracker record. The proposal is evidence for the policy, not a start.",
+      "Prepare from what you can verify: the issue, its blockers and parent, its verified outcomes, the project's rules and the repository at its integration base. Change no file and no tracker record. Settle routine gaps yourself from that evidence; a missing permission, product decision or owner hold is never yours to settle.",
+      "T3 reads back the base you name; an absent base, or one off the integration branch, rejects the proposal. The proposal is evidence for the policy, not a start or a grant.",
     ];
   }
   const stage = item.stage;
@@ -215,7 +221,33 @@ const outcomeFacts = (outcome: FactoryLifecycle.FactoryPolicyOutcome) => ({
   state: outcome.state,
   report: outcome.report,
   ...(outcome.itemVersion === undefined ? {} : { itemVersion: outcome.itemVersion }),
+  ...(outcome.policyRevision === undefined ? {} : { policyRevision: outcome.policyRevision }),
 });
+
+/**
+ * Why a build may not adopt the proposal it names, if it may not: the proposal must still be the
+ * item's latest verified preparation of its current text, made under the current policy.
+ */
+const preparedStale = (
+  item: FactoryLifecycle.FactoryPolicyItem,
+  policyRevision: string,
+  outcomeId: string,
+) => {
+  const { itemVersion } = item.observation;
+  if (item.stage.type !== "implement") return `the item is past its first build`;
+  const latest = item.outcomes.findLast(
+    (outcome) => outcome.stage === "triage" && outcome.itemVersion === itemVersion,
+  );
+  if (latest?.outcomeId !== outcomeId) {
+    return `${outcomeId} is not the latest preparation of item version ${itemVersion}`;
+  }
+  if (latest.state !== "verified" || latest.report.outcome !== "unit_proposed") {
+    return `${outcomeId} is not a verified proposal`;
+  }
+  return latest.policyRevision === policyRevision
+    ? undefined
+    : `${outcomeId} was prepared under policy ${latest.policyRevision ?? "unknown"}, not ${policyRevision}`;
+};
 
 /** What the policy command reads on stdin: every decidable item, and the work under way. */
 export const policyInput = (
@@ -408,6 +440,18 @@ export const layer = Layer.effect(
           return reservation;
         }
         case "admit": {
+          const stale =
+            decision.prepared === undefined
+              ? undefined
+              : preparedStale(item, configuration.policyRevision, decision.prepared);
+          if (stale !== undefined) {
+            const nothing: FactoryLifecycle.FactoryNothingProposed = {
+              type: "none",
+              reason: `prepared unit is stale: ${stale}`,
+              class: "prepared_stale",
+            };
+            return nothing;
+          }
           const stage = item.stage.type;
           const text = `${decision.brief}\n\n${reportFooter(item, configuration.artifactRoot, pin.executable)}`;
           const request: FactoryLifecycle.FactoryAdmissionRequest = {
