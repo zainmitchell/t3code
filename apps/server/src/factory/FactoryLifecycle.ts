@@ -68,7 +68,12 @@ import * as FactoryTracker from "./FactoryTracker.ts";
 import * as FactoryGitReadback from "./FactoryGitReadback.ts";
 import * as FactoryOutcomeStore from "./FactoryOutcomeStore.ts";
 import { entryView } from "./factoryEntry.ts";
-import { canonical, makeFactoryOutcomes, subjectOf } from "./factoryOutcomes.ts";
+import {
+  canonical,
+  candidateBaseProblem,
+  makeFactoryOutcomes,
+  subjectOf,
+} from "./factoryOutcomes.ts";
 import {
   neverStartedRefusals,
   quarantineRefusals,
@@ -242,6 +247,11 @@ export interface FactoryAdmissionRequest {
   readonly requiresGrant?: { readonly reason: string; readonly evidenceDigest: string };
   /** A configured execution the policy chose by name for this decision. */
   readonly execution?: string;
+  /**
+   * The triage outcome whose proposal this first build adopts. It starts only while that proposal
+   * is the item's current preparation and its base reads back where the build starts.
+   */
+  readonly prepared?: string;
   /** The grant the lifecycle found for it; set by the lifecycle, spent in the admission commit. */
   readonly grant?: {
     readonly grantId: string;
@@ -362,6 +372,8 @@ export type FactoryPolicyOutcome = FactoryOutcomeStore.FactoryOutcome & {
   readonly itemVersion?: string;
   /** The policy revision its stage was admitted under, so a stale preparation is never adopted. */
   readonly policyRevision?: string;
+  /** The decision its stage was admitted as: a triage result counts only for its own inputs. */
+  readonly decisionKey?: FactoryDecisionKey;
 };
 
 /** One item a pass could decide, with every native fact policy may need for it. */
@@ -836,6 +848,7 @@ export const policyOutcomes = Effect.fnUntraced(function* (
             ...outcome.value,
             itemVersion: admitted.value.itemVersion,
             policyRevision: admitted.value.policyRevision,
+            decisionKey: admitted.value.decisionKey,
           }
         : outcome.value,
     );
@@ -950,6 +963,35 @@ export const decisionKeyOf = (
       ]),
     ),
   );
+
+/**
+ * An item's triage decision: its exact text, evidence and policy, and, once, the way its last
+ * preparation on those inputs ended without a result (a rejected report, say), so a worker sees
+ * that failure and may correct it. A failed retry is not retried; new inputs are a new decision.
+ */
+export const triageDecisionOf = (
+  input: Pick<FactoryAdmissionRequest, "factoryId" | "itemKey" | "policyRevision">,
+  observation: FactoryStore.ItemObservation,
+  outcomes: ReadonlyArray<FactoryPolicyOutcome>,
+) => {
+  const keyOf = (basis: string) =>
+    decisionKeyOf({ ...input, taskKind: "triage", stage: { type: "triage", basis } }, observation);
+  const first = triageBasis(observation.itemVersion);
+  const firstKey = keyOf(first);
+  const failed = outcomes.findLast(
+    (outcome) =>
+      outcome.stage === "triage" &&
+      outcome.decisionKey === firstKey &&
+      outcome.state === "verified" &&
+      outcome.report.outcome === "failed" &&
+      outcome.failureDigest !== undefined,
+  );
+  const basis =
+    failed?.failureDigest === undefined
+      ? first
+      : triageBasis(observation.itemVersion, failed.failureDigest);
+  return { basis, key: basis === first ? firstKey : keyOf(basis) };
+};
 
 const make = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
@@ -2510,19 +2552,15 @@ const make = Effect.gen(function* () {
           // Triage decomposes an item only before its first build.
           ...(candidate.stage.type === "implement"
             ? {
-                triageDecisionKey: decisionKeyOf(
+                triageDecisionKey: triageDecisionOf(
                   {
                     factoryId,
                     itemKey: candidate.itemKey,
-                    taskKind: "triage",
                     policyRevision: configuration.policyRevision,
-                    stage: {
-                      type: "triage",
-                      basis: triageBasis(candidate.observation.itemVersion),
-                    },
                   },
                   candidate.observation,
-                ),
+                  outcomes,
+                ).key,
               }
             : {}),
         });
@@ -2654,6 +2692,54 @@ const make = Effect.gen(function* () {
   });
 
   /** Carries out one item's decision for its current stage, beside the custody it was decided on. */
+  /**
+   * Why a first build may not adopt the preparation it names, read at admission: the proposal must
+   * be verified on the item's current triage inputs, the build must start exactly at its base, and
+   * that base must read back now on the line T3 integrates onto. What cannot be read is not ready.
+   */
+  const preparedStale = Effect.fnUntraced(function* (
+    configuration: FactoryStore.FactoryConfiguration,
+    candidate: Candidate,
+    decision: FactoryAdmissionRequest,
+    outcomeId: string,
+  ) {
+    if (candidate.stage.type !== "implement") return "the item is past its first build";
+    const outcomes = yield* policyOutcomes({ outcomeStore, store }, candidate.events);
+    const outcome = outcomes.find((each) => each.outcomeId === outcomeId);
+    if (
+      outcome?.stage !== "triage" ||
+      outcome.state !== "verified" ||
+      outcome.report.outcome !== "unit_proposed"
+    ) {
+      return `${outcomeId} is not a verified proposal`;
+    }
+    const current = triageDecisionOf(
+      {
+        factoryId: configuration.factoryId,
+        itemKey: candidate.itemKey,
+        policyRevision: configuration.policyRevision,
+      },
+      candidate.observation,
+      outcomes,
+    );
+    if (outcome.decisionKey !== current.key) {
+      return `${outcomeId} was prepared on other inputs than the item's current text, evidence and policy`;
+    }
+    const base = outcome.report.subject?.baseCommit;
+    if (base === undefined) return `${outcomeId} names no candidate base`;
+    const workspace = decision.workspaceStrategy;
+    if (
+      workspace?.type !== "worktree" ||
+      workspace.baseRef !== base ||
+      workspace.startFromOrigin === true
+    ) {
+      return `the build would not start at its prepared base ${base}`;
+    }
+    return yield* candidateBaseProblem(gitReadback, configuration, base).pipe(
+      Effect.orElseSucceed(() => `base ${base} cannot be read back now`),
+    );
+  });
+
   const act = Effect.fnUntraced(function* (
     configuration: FactoryStore.FactoryConfiguration,
     candidate: Candidate,
@@ -2815,13 +2901,18 @@ const make = Effect.gen(function* () {
         ...(waiting === undefined ? {} : { detail: `waiting: ${waiting.slice(0, 500)}` }),
       };
     }
-    // Triage decomposes an item before its first build; its basis is the exact item version.
+    // Triage decomposes an item before its first build, on the inputs the policy was shown.
     if (decision.taskKind === "triage") {
       if (stage.type !== "implement") return { disposition: "stage_mismatch" };
+      const triage = triageDecisionOf(
+        { factoryId, itemKey, policyRevision: configuration.policyRevision },
+        candidate.observation,
+        yield* policyOutcomes({ outcomeStore, store }, candidate.events),
+      );
       const admission = yield* admit(
         {
           ...decision,
-          stage: { type: "triage", basis: triageBasis(candidate.observation.itemVersion) },
+          stage: { type: "triage", basis: triage.basis },
           ...(candidate.owner === undefined ? {} : { continues: candidate.owner.reservationId }),
         },
         collected,
@@ -2835,6 +2926,16 @@ const make = Effect.gen(function* () {
     if (isFactoryStage(decision.taskKind)) {
       if (decision.taskKind !== stage.type || !AGENT_STAGES.has(stage.type)) {
         return { disposition: "stage_mismatch" };
+      }
+    }
+    if (decision.prepared !== undefined) {
+      const stale = yield* preparedStale(configuration, candidate, decision, decision.prepared);
+      if (stale !== undefined) {
+        return {
+          disposition: "nothing_proposed",
+          detail: `prepared unit is stale: ${stale}`,
+          reasonClass: "prepared_stale",
+        };
       }
     }
     let grant: FactoryAdmissionRequest["grant"];

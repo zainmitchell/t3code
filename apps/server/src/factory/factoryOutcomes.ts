@@ -60,15 +60,38 @@ export const subjectOf = (itemKey: string) => {
   return match === null ? undefined : { repository: match[1]!, issueNumber: Number(match[2]) };
 };
 
-/** The branch T3 lands work on in the project's own repository; a remote's copy may be stale. */
-const localIntegrationBranch = (configuration: FactoryStore.FactoryConfiguration) => {
+/**
+ * The ref T3 reads the line it integrates onto from: the project's own branch, or its copy of the
+ * remote's branch, as last fetched.
+ */
+const integrationLine = (configuration: FactoryStore.FactoryConfiguration) => {
   const integration = configuration.integration;
-  return integration !== undefined &&
-    integration.mode !== "pull_request" &&
-    integration.remote === null
-    ? integration.branch
-    : undefined;
+  if (integration === undefined) return undefined;
+  return integration.remote === null
+    ? `refs/heads/${integration.branch}`
+    : `refs/remotes/${integration.remote}/${integration.branch}`;
 };
+
+/**
+ * Why prepared work may not start from a candidate base, as read now, or undefined: the base must
+ * exist and lie on the line T3 integrates onto. A line T3 cannot read validates nothing.
+ */
+export const candidateBaseProblem = Effect.fnUntraced(function* (
+  git: FactoryGitReadback.FactoryGitReadbackShape,
+  configuration: FactoryStore.FactoryConfiguration,
+  base: string,
+) {
+  const projectId = configuration.projectId;
+  if (!(yield* git.commitExists({ projectId, commit: base }))) return `base ${base} does not exist`;
+  const line = integrationLine(configuration);
+  if (line === undefined) return `no integration branch is configured to read base ${base} against`;
+  if (!(yield* git.commitExists({ projectId, commit: line }))) {
+    return `the integration line ${line} cannot be read`;
+  }
+  return (yield* git.isAncestor({ projectId, ancestor: base, descendant: line }))
+    ? undefined
+    : `base ${base} is not on the integration line ${line}`;
+});
 
 const TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set([
   "completed",
@@ -321,23 +344,14 @@ export const makeFactoryOutcomes = (deps: FactoryOutcomeDependencies) => {
             rejected: `the proposal names item version ${proposed ?? "none"}, not ${reservation.value.itemVersion}`,
           } as const;
         }
-        // A named candidate base is a claim like any other: the work starts from it only if T3 reads it.
+        // The candidate base is a claim like any other: the work starts from it only if T3 reads it.
         const base = report.subject?.baseCommit;
-        if (base === undefined) return { accepted: true } as const;
-        if (!(yield* git.commitExists({ projectId, commit: base }))) {
-          return { rejected: `base ${base} does not exist` } as const;
-        }
-        const branch = localIntegrationBranch(configuration);
-        if (branch === undefined || !(yield* git.branchExists({ projectId, branch }))) {
-          return { accepted: true } as const;
-        }
-        return (yield* git.isAncestor({
-          projectId,
-          ancestor: base,
-          descendant: `refs/heads/${branch}`,
-        }))
+        if (base === undefined)
+          return { rejected: "the proposal names no candidate base" } as const;
+        const problem = yield* candidateBaseProblem(git, configuration, base);
+        return problem === undefined
           ? ({ accepted: true } as const)
-          : ({ rejected: `base ${base} is not on the integration branch ${branch}` } as const);
+          : ({ rejected: problem } as const);
       }
       case "integrated":
       case "closed":

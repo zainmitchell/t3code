@@ -15,6 +15,7 @@ interface Report {
     readonly ownedFiles: ReadonlyArray<string>;
     readonly splits?: ReadonlyArray<string>;
   };
+  readonly subject?: { readonly baseCommit?: string };
 }
 
 interface Outcome {
@@ -24,6 +25,7 @@ interface Outcome {
   readonly report: Report;
   readonly itemVersion?: string;
   readonly policyRevision?: string;
+  readonly decisionKey?: string;
 }
 
 interface Issue {
@@ -37,6 +39,7 @@ interface Issue {
 
 interface Item {
   readonly decisionKey: string;
+  readonly triageDecisionKey?: string;
   readonly stage: { readonly type: string };
   readonly itemVersion: string;
   readonly item: Issue;
@@ -75,13 +78,24 @@ const ownedFiles = (body: string) => {
 
 const nothing = (cls: string, reason: string) => ({ decision: "none", class: cls, reason });
 
-const admit = (entry: Item, brief: string, grantEvidence?: string, prepared?: string) => ({
+/** A prepared build names its preparation and starts exactly at the base it was verified on. */
+const admit = (
+  entry: Item,
+  brief: string,
+  grantEvidence?: string,
+  prepared?: { readonly outcomeId: string; readonly base: string },
+) => ({
   decision: "admit",
   title: `${entry.stage.type} ${entry.item.itemKey}`,
   brief,
   poolId: "builders",
   units: 1,
-  ...(prepared === undefined ? {} : { prepared }),
+  ...(prepared === undefined
+    ? {}
+    : {
+        prepared: prepared.outcomeId,
+        workspace: { type: "worktree", baseRef: prepared.base, startFromOrigin: false },
+      }),
   ...(grantEvidence === undefined
     ? {}
     : {
@@ -115,7 +129,10 @@ const decide = (facts: Facts, entry: Item): unknown => {
   // A policy that names a preparation T3 must refuse, as a stale or buggy one would.
   const forced = entry.item.labels.find((label) => label.startsWith("adopt:"));
   if (forced !== undefined) {
-    return admit(entry, "Build the named preparation.", undefined, forced.slice("adopt:".length));
+    return admit(entry, "Build the named preparation.", undefined, {
+      outcomeId: forced.slice("adopt:".length),
+      base: "0000000",
+    });
   }
   if (entry.stage.type !== "implement") {
     return entry.stage.type === "integrate" || entry.stage.type === "close"
@@ -136,13 +153,16 @@ const decide = (facts: Facts, entry: Item): unknown => {
       ? admit(entry, `Build ${entry.item.itemKey} as its issue specifies.`)
       : nothing("waiting", waiting);
   }
-  // A preparation counts only for the text and the policy it was made under.
-  const triaged = entry.outcomes.filter(
-    (outcome) =>
-      outcome.stage === "triage" &&
-      outcome.itemVersion === entry.itemVersion &&
-      outcome.policyRevision === facts.policyRevision,
-  );
+  // A preparation counts only for the inputs T3 keyed its triage on: text, evidence and policy.
+  const triaged = entry.outcomes.filter((outcome) => {
+    if (outcome.stage !== "triage") return false;
+    if (entry.triageDecisionKey !== undefined && outcome.decisionKey !== undefined) {
+      return outcome.decisionKey === entry.triageDecisionKey;
+    }
+    return (
+      outcome.itemVersion === entry.itemVersion && outcome.policyRevision === facts.policyRevision
+    );
+  });
   if (triaged.length === 0) {
     return {
       decision: "triage",
@@ -206,7 +226,9 @@ const decide = (facts: Facts, entry: Item): unknown => {
     profile.adopt === "auto"
       ? undefined
       : `adopt ${latest.outcomeId} at ${entry.itemVersion}: ${digest(proposal.unit)}`,
-    latest.outcomeId,
+    latest.report.subject?.baseCommit === undefined
+      ? undefined
+      : { outcomeId: latest.outcomeId, base: latest.report.subject.baseCommit },
   );
 };
 

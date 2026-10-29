@@ -358,5 +358,9 @@ export const expectedOutcomes: Record<FactoryStageType, ReadonlyArray<FactoryOut
   triage: ["unit_proposed", "not_actionable"],
 };
 
-/** The exact basis of a triage decision: the item version it reads. Unchanged text never triages twice. */
-export const triageBasis = (itemVersion: string) => `triage:${itemVersion}`;
+/**
+ * The exact basis of a triage decision: the item version it reads, and the failure it retries, if
+ * any. Unchanged text never triages twice.
+ */
+export const triageBasis = (itemVersion: string, retry?: string) =>
+  `triage:${itemVersion}${retry === undefined ? "" : `:retry:${retry}`}`;

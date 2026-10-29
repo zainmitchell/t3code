@@ -1598,7 +1598,7 @@ const layerGitGraphFake = Layer.effect(
       return seen;
     };
     return FactoryGitReadback.FactoryGitReadback.of({
-      commitExists: (input) => Effect.succeed(graph.parents.has(input.commit)),
+      commitExists: (input) => Effect.succeed(graph.parents.has(resolve(input.commit))),
       isAncestor: (input) => Effect.succeed(ancestors(input.descendant).has(input.ancestor)),
       branchExists: (input) => Effect.succeed(graph.branches.has(input.branch)),
     });
@@ -18950,6 +18950,7 @@ it.effect(
               unit: "## Owned files\n- src/importer.ts",
               ownedFiles: ["src/importer.ts"],
             },
+            subject: { repository: claimRepository, baseCommit: lifecycleBase },
           });
           const implement = admittedBy(yield* advance("outcome"));
           assert.deepStrictEqual(stageOf(implement), [item, "implement"]);
@@ -19003,7 +19004,7 @@ it.effect(
     ),
 );
 
-it.effect("Decompose/D3: a proposal for other text is rejected and starts nothing", () =>
+it.effect("Decompose/D3: a proposal for other text is rejected and builds nothing", () =>
   runIsolated(
     Effect.scoped(
       Effect.gen(function* () {
@@ -19011,11 +19012,16 @@ it.effect("Decompose/D3: a proposal for other text is rejected and starts nothin
         yield* usePolicy(decomposingPolicy);
         yield* seedIssue(7903, { body: "Make the CSV import idempotent." });
         const triage = admittedBy(yield* advance("tracker_event", 1));
-        yield* workStage(triage, {
-          outcome: "unit_proposed",
+        const otherText = {
+          outcome: "unit_proposed" as const,
           summary: "A unit for some other text.",
           proposal: { basis: "0".repeat(32), unit: "## Owned files\n- x.ts", ownedFiles: ["x.ts"] },
-        });
+        };
+        yield* workStage(triage, otherText);
+        // The rejection is the triage's one retry; the same rejection again ends it.
+        const retry = admittedBy(yield* advance("outcome", 3));
+        assert.deepStrictEqual(stageOf(retry), [itemKeyFor(7903), "triage"]);
+        yield* workStage(retry, otherText);
         assert.deepStrictEqual(admittedOnly(yield* advance("outcome", 3)), []);
         const outcomes = yield* FactoryOutcomeStore.FactoryOutcomeStore;
         const [proposed] = yield* outcomes.listForOrigin(triage.reservation.reservationId);
@@ -19152,6 +19158,152 @@ it.effect(
           const implement = admittedBy(yield* advance("outcome"));
           assert.deepStrictEqual(stageOf(implement), [item, "implement"]);
           assert.deepStrictEqual(admittedOnly(yield* advance("clock", 2)), []);
+        }),
+      ),
+    ),
+);
+
+/**
+ * A policy that adopts its preparation as the candidate project policies do, from the input its
+ * command receives: a triage result counts only for the triage decision T3 keyed on, and the build
+ * names that result and starts at `launchAt` of its base.
+ */
+const preparedPolicy =
+  (launchAt: (base: string) => string = (base) => base): ProposeFn =>
+  (input) => {
+    if (input.stage.type !== "implement") return stageRequest(input);
+    const { configuration, ...item } = input;
+    const [sent] = FactoryCommandPolicy.policyInput({
+      configuration,
+      items: [item],
+      active: [],
+    }).items;
+    const current = sent!.outcomes.findLast(
+      (outcome) => outcome.stage === "triage" && outcome.decisionKey === sent!.triageDecisionKey,
+    );
+    if (current === undefined) return triageRequest(input);
+    if (current.state !== "verified" || current.report.outcome !== "unit_proposed") {
+      return Effect.succeed({
+        type: "none",
+        reason: current.report.failure ?? current.report.summary,
+        class: "not_actionable",
+      });
+    }
+    const base = current.report.subject?.baseCommit ?? lifecycleBase;
+    return Effect.map(stageRequest(input), (request) =>
+      request === undefined || "type" in request
+        ? request
+        : {
+            ...request,
+            prepared: current.outcomeId,
+            workspaceStrategy: {
+              type: "worktree",
+              baseRef: launchAt(base),
+              startFromOrigin: false,
+            },
+          },
+    );
+  };
+
+const lastDisposition = (issueNumber: number) =>
+  Effect.gen(function* () {
+    const state = yield* (yield* FactoryLifecycle.FactoryLifecycle).readState({ factoryId });
+    const record = state.lastCollection.find((entry) => entry.itemKey === itemKeyFor(issueNumber));
+    return [record?.disposition, record?.reasonClass, record?.detail];
+  });
+
+const preparedUnit = (basis: string, baseCommit?: string) => ({
+  outcome: "unit_proposed" as const,
+  summary: "One unit: the importer.",
+  proposal: { basis, unit: "## Owned files\n- src/importer.ts", ownedFiles: ["src/importer.ts"] },
+  ...(baseCommit === undefined ? {} : { subject: { repository: claimRepository, baseCommit } }),
+});
+
+it.effect(
+  "Decompose/D9: a prepared build starts only at its verified base, as read back at admission",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* configureLifecycleFactory;
+          yield* recordCommit("b0000002", [lifecycleBase]);
+          yield* recordCommit("c0000001", []);
+          // The policy adopts the preparation but would launch the build somewhere else.
+          yield* usePolicy(preparedPolicy(() => "b0000002"));
+          yield* seedIssue(7933, { body: "Make the CSV import idempotent." });
+          const item = itemKeyFor(7933);
+          const triage = admittedBy(yield* advance("tracker_event", 1));
+          yield* workStage(triage, preparedUnit(admittedVersion(triage), lifecycleBase));
+          assert.deepStrictEqual(admittedOnly(yield* advance("outcome", 3)), []);
+          assert.deepStrictEqual(yield* lastDisposition(7933), [
+            "nothing_proposed",
+            "prepared_stale",
+            `prepared unit is stale: the build would not start at its prepared base ${lifecycleBase}`,
+          ]);
+
+          // Launched at its base, but the integration line was moved off it since it was verified.
+          yield* usePolicy(preparedPolicy());
+          const graph = yield* GitGraphFake;
+          graph.branches.set("main", "c0000001");
+          assert.deepStrictEqual(admittedOnly(yield* advance("clock", 3)), []);
+          assert.deepStrictEqual(yield* lastDisposition(7933), [
+            "nothing_proposed",
+            "prepared_stale",
+            `prepared unit is stale: base ${lifecycleBase} is not on the integration line refs/heads/main`,
+          ]);
+
+          // Back on the line, the build starts at that exact base, once.
+          graph.branches.set("main", "b0000002");
+          const implement = admittedBy(yield* advance("clock", 1));
+          assert.deepStrictEqual(stageOf(implement), [item, "implement"]);
+          assert.deepStrictEqual(admittedOnly(yield* advance("clock", 3)), []);
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Decompose/D10: a rejected preparation is retried once, and new evidence prepares it once more",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* configureLifecycleFactory;
+          yield* usePolicy(preparedPolicy());
+          yield* seedIssue(7934, { body: "Make the CSV import idempotent." });
+          const first = admittedBy(yield* advance("tracker_event", 1));
+          const version = admittedVersion(first);
+          // A proposal that names no base is no preparation: it is rejected.
+          yield* workStage(first, preparedUnit(version));
+          const retry = admittedBy(yield* advance("outcome", 3));
+          const basisOf = (admission: FactoryLifecycle.FactoryAdmissionResult) =>
+            admission.type === "refused" || admission.reservation.origin !== "admitted"
+              ? undefined
+              : admission.reservation.stageBasis;
+          assert.strictEqual(basisOf(first), `triage:${version}`);
+          assert.isTrue(basisOf(retry)?.startsWith(`triage:${version}:retry:`));
+          // The retry fails the same way: that is not retried again, however often a pass runs.
+          yield* workStage(retry, preparedUnit(version));
+          const starts = (yield* startedTurns).length;
+          for (const trigger of ["outcome", "clock", "restart"] as const) {
+            assert.deepStrictEqual(admittedOnly(yield* advance(trigger, 2)), []);
+          }
+          assert.strictEqual((yield* startedTurns).length, starts);
+
+          // A person supplies the missing evidence in a comment: a new decision, prepared once.
+          const fake = yield* GitHubFake;
+          fake.issues.get(issueKey(claimRepository, 7934))!.comments.push({
+            id: fake.nextCommentId++,
+            body: `Start the unit from ${lifecycleBase}, the integration head.`,
+            user: { id: 42, login: "owner" },
+            created_at: "2026-10-29T00:00:00Z",
+          });
+          const again = admittedBy(yield* advance("tracker_event", 1));
+          assert.strictEqual(basisOf(again), `triage:${version}`);
+          yield* workStage(again, preparedUnit(version, lifecycleBase));
+          const implement = admittedBy(yield* advance("outcome"));
+          assert.deepStrictEqual(stageOf(implement), [itemKeyFor(7934), "implement"]);
+          assert.deepStrictEqual(admittedOnly(yield* advance("clock", 3)), []);
         }),
       ),
     ),

@@ -37,6 +37,8 @@ const fixtureSha256 = sha256(NodeFS.readFileSync(fixturePath));
 const repository = "example-org/alpha";
 const itemKey = FactoryItemKey.make(`github:${repository}#12`);
 const decisionKey = FactoryDecisionKey.make("d".repeat(64));
+/** The item's current triage decision; a result admitted as another decision is not current. */
+const triageKey = FactoryDecisionKey.make("t".repeat(64));
 
 type Project = "btc" | "hsa" | "connector";
 
@@ -69,6 +71,7 @@ const outcome = (
     readonly itemVersion?: string;
     readonly itemKey?: FactoryItemKey;
     readonly policyRevision?: string;
+    readonly decisionKey?: FactoryDecisionKey;
   } = {},
 ): FactoryLifecycle.FactoryPolicyOutcome => {
   const fields = {
@@ -87,6 +90,7 @@ const outcome = (
     reportedAt: "2026-10-29T00:00:00.000Z",
     itemVersion: options.itemVersion ?? "v2",
     policyRevision: options.policyRevision ?? "policy-r1",
+    decisionKey: options.decisionKey ?? triageKey,
   };
   switch (options.state ?? "verified") {
     case "reported":
@@ -131,6 +135,7 @@ interface ItemInput {
   readonly subIssueCount?: number;
   readonly outcomes?: ReadonlyArray<FactoryLifecycle.FactoryPolicyOutcome>;
   readonly blockers?: FactoryLifecycle.FactoryPolicyItem["blockers"];
+  readonly triageDecisionKey?: FactoryDecisionKey;
 }
 
 const issueOf = (input: ItemInput): TrackerIssue => ({
@@ -184,6 +189,7 @@ const decide = (
           outcomes: input.outcomes ?? [],
           ...(input.blockers === undefined ? {} : { blockers: input.blockers }),
           decisionKey,
+          triageDecisionKey: input.triageDecisionKey ?? triageKey,
         },
       ],
       active: active.map((work) => ({
@@ -250,6 +256,13 @@ it.live(
       assert.include(auto.packet.text, `Build the prepared unit triage-1 of ${itemKey}`);
       assert.include(auto.packet.text, unit);
       assert.isUndefined(auto.requiresGrant);
+      // The build names its preparation and starts exactly at the base T3 verified for it.
+      assert.strictEqual(auto.prepared, "triage-1");
+      assert.deepStrictEqual(auto.workspaceStrategy, {
+        type: "worktree",
+        baseRef: "1234567",
+        startFromOrigin: false,
+      });
       // An unchanged pass decides the same start, so the engine admits it once.
       const again = admission(yield* decide("btc", { outcomes: prepared }));
       assert.strictEqual(again.packet.sha256, auto.packet.sha256);
@@ -385,7 +398,11 @@ it.live("Prepare: a stale, rejected, unverified or contested proposal never star
   Effect.gen(function* () {
     // A proposal for older text is no unit for the current one: the item is prepared again.
     const stale = admission(
-      yield* decide("btc", { itemVersion: "v3", outcomes: [outcome("triage-1", proposed())] }),
+      yield* decide("btc", {
+        itemVersion: "v3",
+        triageDecisionKey: FactoryDecisionKey.make("3".repeat(64)),
+        outcomes: [outcome("triage-1", proposed())],
+      }),
     );
     assert.strictEqual(stale.taskKind, "triage");
     assert.include(stale.packet.text, "Item version: v3.");
@@ -420,60 +437,44 @@ it.live("Prepare: a stale, rejected, unverified or contested proposal never star
 );
 
 it.live(
-  "Prepare: T3 refuses a build that adopts a stale preparation, and a new policy prepares again",
+  "Prepare: a preparation counts only for its own triage decision; T3 rechecks the rest at admission",
   () =>
     Effect.gen(function* () {
-      const adopt = ["adopt:triage-1"];
-      const fresh = outcome("triage-1", proposed());
-      assert.strictEqual(
-        admission(yield* decide("btc", { labels: adopt, outcomes: [fresh] })).taskKind,
-        "implement",
-      );
-      const stale = (reason: string) => ({
+      // New evidence, such as a person's comment, is a new triage decision: the old result is not current.
+      const blockedOld = outcome("triage-1", notActionable("missing routine check evidence"));
+      assert.deepStrictEqual(yield* decide("btc", { outcomes: [blockedOld] }), {
         type: "none",
-        class: "prepared_stale",
-        reason: `prepared unit is stale: ${reason}`,
+        class: "not_actionable",
+        reason: "missing routine check evidence",
       });
-      const cases: ReadonlyArray<readonly [string, ItemInput, string]> = [
-        [
-          "a newer preparation of the same text",
-          { outcomes: [fresh, outcome("triage-2", proposed())] },
-          "triage-1 is not the latest preparation of item version v2",
-        ],
-        [
-          "a proposal for older text",
-          { itemVersion: "v3", outcomes: [fresh] },
-          "triage-1 is not the latest preparation of item version v3",
-        ],
-        [
-          "a rejected proposal",
-          { outcomes: [outcome("triage-1", proposed(), { state: "rejected" })] },
-          "triage-1 is not a verified proposal",
-        ],
-        [
-          "a result that proposed nothing",
-          { outcomes: [outcome("triage-1", notActionable("hold: the owner paused it"))] },
-          "triage-1 is not a verified proposal",
-        ],
-        [
-          "a proposal made under another policy",
-          { outcomes: [outcome("triage-1", proposed(), { policyRevision: "policy-r0" })] },
-          "triage-1 was prepared under policy policy-r0, not policy-r1",
-        ],
-      ];
-      for (const [name, input, reason] of cases) {
-        assert.deepStrictEqual(
-          yield* decide("btc", { ...input, labels: adopt }),
-          stale(reason),
-          name,
-        );
-      }
-      // The project's own policy reads the same fact and prepares the item again instead.
-      const revalidated = admission(
+      const commented = FactoryDecisionKey.make("c".repeat(64));
+      const again = admission(
+        yield* decide("btc", { outcomes: [blockedOld], triageDecisionKey: commented }),
+      );
+      assert.strictEqual(again.taskKind, "triage");
+
+      // A policy's claim on a preparation is carried to admission, where T3 decides it.
+      const forced = admission(yield* decide("btc", { labels: ["adopt:triage-9"] }));
+      assert.strictEqual(forced.prepared, "triage-9");
+
+      // The retry of a preparation that ended without a result shows the worker what to correct.
+      const failed = outcome("triage-f", {
+        outcome: "failed",
+        summary: "No usable result.",
+        failure: "Its report was rejected: the proposal names no candidate base",
+      });
+      const retry = admission(
         yield* decide("btc", {
-          outcomes: [outcome("triage-1", proposed(), { policyRevision: "policy-r0" })],
+          outcomes: [failed],
+          triageDecisionKey: FactoryDecisionKey.make("r".repeat(64)),
         }),
       );
-      assert.strictEqual(revalidated.taskKind, "triage");
+      assert.strictEqual(retry.taskKind, "triage");
+      assert.include(
+        retry.packet.text,
+        "The last preparation of this item ended without a usable result; correct what it names:",
+      );
+      assert.include(retry.packet.text, "the proposal names no candidate base");
+      assert.include(retry.packet.text, "the build starts exactly there");
     }).pipe(Effect.provide(layer)),
 );

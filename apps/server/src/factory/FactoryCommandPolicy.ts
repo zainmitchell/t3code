@@ -39,8 +39,8 @@ const PolicyDecision = Schema.Union([
     /** One of the configuration's named executions, such as a builder effort. */
     execution: Schema.optional(Bounded(200)),
     /**
-     * The triage outcome whose proposal this build adopts. The build starts only while that
-     * proposal is still the item's current preparation; otherwise nothing starts.
+     * The triage outcome whose proposal this first build adopts. T3 starts it only while that
+     * proposal is the item's current preparation and the build starts exactly at its base.
      */
     prepared: Schema.optional(Bounded(64)),
   }),
@@ -119,6 +119,17 @@ const REPORT_REQUIREMENTS: Record<string, string> = {
     "not_actionable only for what a person must settle, with failure led by its kind: `decision:` (the one question, its consequence and the exact action that answers it), `permission:`, `private_data:`, `ownership:` or `hold:`, then what is missing",
 };
 
+/** The last preparation's failure, so a retry on it can correct what it names. */
+const previousPreparation = (item: FactoryLifecycle.FactoryPolicyItem) => {
+  const last = item.outcomes.findLast((outcome) => outcome.stage === "triage");
+  return last?.state === "verified" && last.report.outcome === "failed"
+    ? [
+        "The last preparation of this item ended without a usable result; correct what it names:",
+        last.report.failure ?? last.report.summary,
+      ]
+    : [];
+};
+
 /**
  * Where verification output has to be for T3 to count it: a head already reviewed is reviewed
  * again only on artifacts T3 reads back inside the artifact root (`factoryOutcomes.ts`).
@@ -132,7 +143,8 @@ const evidenceInstructions = (
     return [
       `Item version: ${item.observation.itemVersion}. Report it as proposal.basis; a proposal for any other version is rejected.`,
       "Prepare from what you can verify: the issue, its blockers and parent, its verified outcomes, the project's rules and the repository at its integration base. Change no file and no tracker record. Settle routine gaps yourself from that evidence; a missing permission, product decision or owner hold is never yours to settle.",
-      "T3 reads back the base you name; an absent base, or one off the integration branch, rejects the proposal. The proposal is evidence for the policy, not a start or a grant.",
+      "Name subject.baseCommit: the build starts exactly there. T3 reads it back now and again when the build is admitted: it must exist and lie on the branch T3 integrates onto, as T3 reads that branch, so a proposal without a base, or with one T3 cannot read there, is rejected. The proposal is evidence for the policy, not a start or a grant.",
+      ...previousPreparation(item),
     ];
   }
   const stage = item.stage;
@@ -222,32 +234,8 @@ const outcomeFacts = (outcome: FactoryLifecycle.FactoryPolicyOutcome) => ({
   report: outcome.report,
   ...(outcome.itemVersion === undefined ? {} : { itemVersion: outcome.itemVersion }),
   ...(outcome.policyRevision === undefined ? {} : { policyRevision: outcome.policyRevision }),
+  ...(outcome.decisionKey === undefined ? {} : { decisionKey: outcome.decisionKey }),
 });
-
-/**
- * Why a build may not adopt the proposal it names, if it may not: the proposal must still be the
- * item's latest verified preparation of its current text, made under the current policy.
- */
-const preparedStale = (
-  item: FactoryLifecycle.FactoryPolicyItem,
-  policyRevision: string,
-  outcomeId: string,
-) => {
-  const { itemVersion } = item.observation;
-  if (item.stage.type !== "implement") return `the item is past its first build`;
-  const latest = item.outcomes.findLast(
-    (outcome) => outcome.stage === "triage" && outcome.itemVersion === itemVersion,
-  );
-  if (latest?.outcomeId !== outcomeId) {
-    return `${outcomeId} is not the latest preparation of item version ${itemVersion}`;
-  }
-  if (latest.state !== "verified" || latest.report.outcome !== "unit_proposed") {
-    return `${outcomeId} is not a verified proposal`;
-  }
-  return latest.policyRevision === policyRevision
-    ? undefined
-    : `${outcomeId} was prepared under policy ${latest.policyRevision ?? "unknown"}, not ${policyRevision}`;
-};
 
 /** What the policy command reads on stdin: every decidable item, and the work under way. */
 export const policyInput = (
@@ -440,18 +428,6 @@ export const layer = Layer.effect(
           return reservation;
         }
         case "admit": {
-          const stale =
-            decision.prepared === undefined
-              ? undefined
-              : preparedStale(item, configuration.policyRevision, decision.prepared);
-          if (stale !== undefined) {
-            const nothing: FactoryLifecycle.FactoryNothingProposed = {
-              type: "none",
-              reason: `prepared unit is stale: ${stale}`,
-              class: "prepared_stale",
-            };
-            return nothing;
-          }
           const stage = item.stage.type;
           const text = `${decision.brief}\n\n${reportFooter(item, configuration.artifactRoot, pin.executable)}`;
           const request: FactoryLifecycle.FactoryAdmissionRequest = {
@@ -475,6 +451,7 @@ export const layer = Layer.effect(
             artifactPaths: [],
             ...(decision.workspace === undefined ? {} : { workspaceStrategy: decision.workspace }),
             ...(decision.execution === undefined ? {} : { execution: decision.execution }),
+            ...(decision.prepared === undefined ? {} : { prepared: decision.prepared }),
             ...(decision.grant === undefined
               ? {}
               : {

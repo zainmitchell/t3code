@@ -109,7 +109,7 @@ interface Repository {
   readonly commits: ReadonlySet<string>;
   /** Descendant to its ancestors. */
   readonly ancestry: ReadonlyMap<string, ReadonlySet<string>>;
-  /** Branch name to the commit it points at. */
+  /** Ref name below `refs/` (`heads/main`, `remotes/origin/main`) to the commit it points at. */
   readonly branches?: ReadonlyMap<string, string>;
   /** Whether a read of the repository fails, as an unreadable workspace does. */
   unreadable: boolean;
@@ -121,17 +121,18 @@ const fakeGit = (
 ): FactoryGitReadback.FactoryGitReadbackShape => {
   const unreadable = (operation: string) =>
     new FactoryGitReadback.FactoryGitReadbackError({ operation, cause: "unreadable" });
+  const resolve = (rev: string) =>
+    rev.startsWith("refs/") ? repository.branches?.get(rev.slice("refs/".length)) : rev;
   return {
-    commitExists: ({ commit }) =>
-      repository.unreadable
-        ? Effect.fail(unreadable("commitExists"))
-        : Effect.succeed(repository.commits.has(commit)),
+    commitExists: ({ commit }) => {
+      if (repository.unreadable) return Effect.fail(unreadable("commitExists"));
+      const resolved = resolve(commit);
+      return Effect.succeed(resolved !== undefined && repository.commits.has(resolved));
+    },
     // Like `git merge-base --is-ancestor`: an unknown object is exit 128, an error, not "no".
     isAncestor: ({ ancestor, descendant }) => {
       ancestryReads.push({ ancestor, descendant });
-      const commit = descendant.startsWith("refs/heads/")
-        ? repository.branches?.get(descendant.slice("refs/heads/".length))
-        : descendant;
+      const commit = resolve(descendant);
       if (
         repository.unreadable ||
         commit === undefined ||
@@ -147,7 +148,7 @@ const fakeGit = (
     branchExists: ({ branch }) =>
       repository.unreadable
         ? Effect.fail(unreadable("branchExists"))
-        : Effect.succeed(repository.branches?.has(branch) ?? false),
+        : Effect.succeed(repository.branches?.has(`heads/${branch}`) ?? false),
   };
 };
 
@@ -464,35 +465,56 @@ const triage: FactoryStore.FactoryReservation = {
   stageBasis: "triage:version:1",
 };
 
-const integratingLocally = (remote: string | null): FactoryStore.FactoryConfiguration => ({
+const integrating = (
+  integration: NonNullable<FactoryStore.FactoryConfiguration["integration"]> | undefined,
+): FactoryStore.FactoryConfiguration => ({
   ...configuration,
-  integration: {
+  ...(integration === undefined ? {} : { integration }),
+});
+const merging = (remote: string | null) =>
+  integrating({
     branch: "main",
     remote,
     mode: "merge",
     identity: { name: "T3", email: "t3@example.invalid" },
-  },
+  });
+const pullRequests = integrating({
+  mode: "pull_request",
+  repository: "example/connector",
+  remote: "origin",
+  branch: "main",
+  method: "merge",
 });
 
 it.effect("verifies a proposal's candidate base only as T3 reads it on the integration line", () =>
   Effect.gen(function* () {
-    // `main` holds realBase; `unrelated` exists but is on no line T3 integrates.
-    const repository = (): Repository => ({
+    // Both lines hold realBase; `unrelated` exists but is on no line T3 integrates.
+    const repository = (
+      refs: ReadonlyArray<string> = ["heads/main", "remotes/origin/main"],
+    ): Repository => ({
       ...btc131(),
-      branches: new Map([["main", head]]),
+      branches: new Map(refs.map((ref) => [ref, head])),
     });
+    const local = { ancestor: realBase, descendant: "refs/heads/main" };
+    const remote = { ancestor: realBase, descendant: "refs/remotes/origin/main" };
     const cases: ReadonlyArray<{
       readonly name: string;
       readonly basis?: string;
       readonly baseCommit?: string;
       readonly configuration?: FactoryStore.FactoryConfiguration;
+      readonly refs?: ReadonlyArray<string>;
       readonly expected: string;
       readonly ancestryReads: ReadonlyArray<{
         readonly ancestor: string;
         readonly descendant: string;
       }>;
     }> = [
-      { name: "no candidate named", expected: "verified", ancestryReads: [] },
+      {
+        name: "no candidate named",
+        configuration: merging(null),
+        expected: "the proposal names no candidate base",
+        ancestryReads: [],
+      },
       {
         name: "another item version",
         basis: "version:0",
@@ -503,36 +525,72 @@ it.effect("verifies a proposal's candidate base only as T3 reads it on the integ
       {
         name: "an invented base",
         baseCommit: inventedBase,
-        configuration: integratingLocally(null),
+        configuration: merging(null),
         expected: `base ${inventedBase} does not exist`,
+        ancestryReads: [],
+      },
+      {
+        name: "no integration line to read it against",
+        baseCommit: realBase,
+        expected: `no integration branch is configured to read base ${realBase} against`,
         ancestryReads: [],
       },
       {
         name: "a base on the local integration branch",
         baseCommit: realBase,
-        configuration: integratingLocally(null),
+        configuration: merging(null),
         expected: "verified",
-        ancestryReads: [{ ancestor: realBase, descendant: "refs/heads/main" }],
+        ancestryReads: [local],
       },
       {
         name: "a base off the local integration branch",
         baseCommit: unrelated,
-        configuration: integratingLocally(null),
-        expected: `base ${unrelated} is not on the integration branch main`,
-        ancestryReads: [{ ancestor: unrelated, descendant: "refs/heads/main" }],
+        configuration: merging(null),
+        expected: `base ${unrelated} is not on the integration line refs/heads/main`,
+        ancestryReads: [{ ...local, ancestor: unrelated }],
       },
       {
-        name: "a remote integration branch, whose local copy may be stale",
-        baseCommit: unrelated,
-        configuration: integratingLocally("origin"),
-        expected: "verified",
+        name: "a local integration branch that is missing",
+        baseCommit: realBase,
+        configuration: merging(null),
+        refs: [],
+        expected: "the integration line refs/heads/main cannot be read",
         ancestryReads: [],
+      },
+      {
+        name: "a base on the fetched remote branch",
+        baseCommit: realBase,
+        configuration: merging("origin"),
+        expected: "verified",
+        ancestryReads: [remote],
+      },
+      {
+        name: "a base off the fetched remote branch",
+        baseCommit: unrelated,
+        configuration: merging("origin"),
+        expected: `base ${unrelated} is not on the integration line refs/remotes/origin/main`,
+        ancestryReads: [{ ...remote, ancestor: unrelated }],
+      },
+      {
+        name: "a pull request target never fetched",
+        baseCommit: realBase,
+        configuration: pullRequests,
+        refs: ["heads/main"],
+        expected: "the integration line refs/remotes/origin/main cannot be read",
+        ancestryReads: [],
+      },
+      {
+        name: "a base on the pull request target",
+        baseCommit: realBase,
+        configuration: pullRequests,
+        expected: "verified",
+        ancestryReads: [remote],
       },
     ];
     // Each row reads in its own store: equal reports are one outcome, whatever row filed it.
     for (const row of cases) {
       yield* Effect.gen(function* () {
-        const fixture = yield* makeFixture(repository(), {
+        const fixture = yield* makeFixture(repository(row.refs), {
           reservation: triage,
           ...(row.configuration === undefined ? {} : { configuration: row.configuration }),
         });
