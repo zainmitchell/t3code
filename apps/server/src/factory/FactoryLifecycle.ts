@@ -965,14 +965,16 @@ export const decisionKeyOf = (
   );
 
 /**
- * An item's triage decision: its exact text, evidence and policy, and, once, the way its last
- * preparation on those inputs ended without a result (a rejected report, say), so a worker sees
- * that failure and may correct it. A failed retry is not retried; new inputs are a new decision.
+ * An item's triage decision: its exact text, evidence and policy. After a preparation on those
+ * inputs ended without a result (a rejected report, say), it is also what T3 reads back for that
+ * failure now (`readback`: its candidate base and the item's blockers). The retry runs once on that
+ * readback; a failed retry is decided again only when the readback changes or new inputs arrive.
  */
 export const triageDecisionOf = (
   input: Pick<FactoryAdmissionRequest, "factoryId" | "itemKey" | "policyRevision">,
   observation: FactoryStore.ItemObservation,
   outcomes: ReadonlyArray<FactoryPolicyOutcome>,
+  readback?: string,
 ) => {
   const keyOf = (basis: string) =>
     decisionKeyOf({ ...input, taskKind: "triage", stage: { type: "triage", basis } }, observation);
@@ -986,11 +988,9 @@ export const triageDecisionOf = (
       outcome.report.outcome === "failed" &&
       outcome.failureDigest !== undefined,
   );
-  const basis =
-    failed?.failureDigest === undefined
-      ? first
-      : triageBasis(observation.itemVersion, failed.failureDigest);
-  return { basis, key: basis === first ? firstKey : keyOf(basis) };
+  if (failed?.failureDigest === undefined) return { basis: first, key: firstKey };
+  const basis = triageBasis(observation.itemVersion, failed.failureDigest, readback);
+  return { basis, key: keyOf(basis), failed };
 };
 
 const make = Effect.gen(function* () {
@@ -2518,6 +2518,11 @@ const make = Effect.gen(function* () {
           issue: candidate.issue,
           read: blockerOutcomes,
         });
+        // Triage decomposes an item only before its first build.
+        const triage =
+          candidate.stage.type === "implement"
+            ? yield* triageDecisionFor(configuration, candidate, outcomes)
+            : undefined;
         const transferred = transferOf.get(candidate.itemKey);
         const legacyWork = transferred?.adopted?.items.find(
           (item) => item.itemKey === candidate.itemKey,
@@ -2549,20 +2554,8 @@ const make = Effect.gen(function* () {
             },
             candidate.observation,
           ),
-          // Triage decomposes an item only before its first build.
-          ...(candidate.stage.type === "implement"
-            ? {
-                triageDecisionKey: triageDecisionOf(
-                  {
-                    factoryId,
-                    itemKey: candidate.itemKey,
-                    policyRevision: configuration.policyRevision,
-                  },
-                  candidate.observation,
-                  outcomes,
-                ).key,
-              }
-            : {}),
+          // No triage is offered while a failed preparation's readback cannot be made.
+          ...(triage === undefined ? {} : { triageDecisionKey: triage.key }),
         });
       }
       const answer = yield* proposer.value.decide({ configuration, items, active });
@@ -2693,6 +2686,57 @@ const make = Effect.gen(function* () {
 
   /** Carries out one item's decision for its current stage, beside the custody it was decided on. */
   /**
+   * The item's triage decision as of this pass. After a failed preparation it includes what T3
+   * reads back for that failure now: whether the base it named is on the integration line, and the
+   * item's blockers. None is offered while that readback cannot be made, so nothing starts on it.
+   */
+  const triageDecisionFor = Effect.fnUntraced(function* (
+    configuration: FactoryStore.FactoryConfiguration,
+    candidate: Candidate,
+    outcomes: ReadonlyArray<FactoryPolicyOutcome>,
+  ) {
+    const input = {
+      factoryId: configuration.factoryId,
+      itemKey: candidate.itemKey,
+      policyRevision: configuration.policyRevision,
+    };
+    const plain = triageDecisionOf(input, candidate.observation, outcomes);
+    const reservationId = plain.failed?.origin.reservationId;
+    if (plain.failed === undefined) return plain;
+    if (reservationId === undefined) return undefined;
+    const filed = yield* outcomeStore.listForOrigin(reservationId);
+    const base = filed.find((outcome) => outcome.report.outcome === "unit_proposed")?.report.subject
+      ?.baseCommit;
+    const read =
+      base === undefined
+        ? Option.some<string | undefined>(undefined)
+        : yield* candidateBaseProblem(gitReadback, configuration, base).pipe(Effect.option);
+    if (Option.isNone(read)) return undefined;
+    const blockers = yield* policyBlockers(
+      { outcomeStore, store },
+      {
+        factoryId: configuration.factoryId,
+        repository: candidate.subject.repository,
+        issue: candidate.issue,
+        read: new Map(),
+      },
+    );
+    const readback = sha256(
+      canonical([
+        base ?? null,
+        read.value ?? "on the integration line",
+        (candidate.issue.blockedBy ?? null)?.map((blocker) => [blocker.number, blocker.state]) ??
+          null,
+        (blockers.blockers ?? []).map((blocker) => [
+          blocker.itemKey,
+          blocker.outcomes.map((outcome) => [outcome.outcomeId, outcome.state]),
+        ]),
+      ]),
+    ).slice(0, 32);
+    return triageDecisionOf(input, candidate.observation, outcomes, readback);
+  });
+
+  /**
    * Why a first build may not adopt the preparation it names, read at admission: the proposal must
    * be verified on the item's current triage inputs, the build must start exactly at its base, and
    * that base must read back now on the line T3 integrates onto. What cannot be read is not ready.
@@ -2713,15 +2757,8 @@ const make = Effect.gen(function* () {
     ) {
       return `${outcomeId} is not a verified proposal`;
     }
-    const current = triageDecisionOf(
-      {
-        factoryId: configuration.factoryId,
-        itemKey: candidate.itemKey,
-        policyRevision: configuration.policyRevision,
-      },
-      candidate.observation,
-      outcomes,
-    );
+    const current = yield* triageDecisionFor(configuration, candidate, outcomes);
+    if (current === undefined) return `${outcomeId}'s preparation cannot be read back now`;
     if (outcome.decisionKey !== current.key) {
       return `${outcomeId} was prepared on other inputs than the item's current text, evidence and policy`;
     }
@@ -2904,11 +2941,18 @@ const make = Effect.gen(function* () {
     // Triage decomposes an item before its first build, on the inputs the policy was shown.
     if (decision.taskKind === "triage") {
       if (stage.type !== "implement") return { disposition: "stage_mismatch" };
-      const triage = triageDecisionOf(
-        { factoryId, itemKey, policyRevision: configuration.policyRevision },
-        candidate.observation,
+      const triage = yield* triageDecisionFor(
+        configuration,
+        candidate,
         yield* policyOutcomes({ outcomeStore, store }, candidate.events),
       );
+      if (triage === undefined) {
+        return {
+          disposition: "nothing_proposed",
+          detail: "its last preparation failed, and what it named cannot be read back now",
+          reasonClass: "waiting",
+        };
+      }
       const admission = yield* admit(
         {
           ...decision,

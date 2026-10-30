@@ -19309,6 +19309,85 @@ it.effect(
     ),
 );
 
+const admittedBasis = (admission: FactoryLifecycle.FactoryAdmissionResult) =>
+  admission.type === "refused" || admission.reservation.origin !== "admitted"
+    ? undefined
+    : admission.reservation.stageBasis;
+
+/** A preparation that names `base` fails twice while it is unavailable; nothing more runs after that. */
+const exhaustPreparation = (issueNumber: number, base: string) =>
+  Effect.gen(function* () {
+    const first = admittedBy(yield* advance("tracker_event", 1));
+    const version = admittedVersion(first);
+    yield* workStage(first, preparedUnit(version, base));
+    const retry = admittedBy(yield* advance("outcome", 3));
+    assert.isTrue(admittedBasis(retry)?.startsWith(`triage:${version}:retry:`));
+    yield* workStage(retry, preparedUnit(version, base));
+    const starts = (yield* startedTurns).length;
+    for (const trigger of ["outcome", "clock", "restart", "clock"] as const) {
+      assert.deepStrictEqual(
+        admittedOnly(yield* advance(trigger, 2)),
+        [],
+        `#${issueNumber} ${trigger}`,
+      );
+    }
+    assert.strictEqual((yield* startedTurns).length, starts);
+    return version;
+  });
+
+it.effect(
+  "Decompose/D11: once its retry failed, a preparation is decided again exactly once when its candidate lands",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* configureLifecycleFactory;
+          yield* usePolicy(preparedPolicy());
+          yield* seedIssue(7935, { body: "Make the CSV import idempotent." });
+          const version = yield* exhaustPreparation(7935, "b0000077");
+          // The candidate lands on the integration line, with no edit to the issue or the policy.
+          yield* recordCommit("b0000077", [lifecycleBase]);
+          (yield* GitGraphFake).branches.set("main", "b0000077");
+          const again = admittedBy(yield* advance("clock", 1));
+          assert.isTrue(admittedBasis(again)?.includes(":after:"), admittedBasis(again));
+          yield* workStage(again, preparedUnit(version, "b0000077"));
+          const implement = admittedBy(yield* advance("outcome"));
+          assert.deepStrictEqual(stageOf(implement), [itemKeyFor(7935), "implement"]);
+          for (const trigger of ["clock", "restart"] as const) {
+            assert.deepStrictEqual(admittedOnly(yield* advance(trigger, 2)), []);
+          }
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Decompose/D12: once its retry failed, a preparation is decided again exactly once when its blocker closes",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* configureLifecycleFactory;
+          yield* usePolicy(preparedPolicy());
+          yield* seedIssue(7937, { labels: [], body: "The importer's schema." });
+          yield* seedIssue(7936, {
+            body: "Make the CSV import idempotent.",
+            blockerNumbers: [7937],
+          });
+          yield* exhaustPreparation(7936, "b0000078");
+          const fake = yield* GitHubFake;
+          fake.issues.get(issueKey(claimRepository, 7937))!.state = "closed";
+          const again = admittedBy(yield* advance("tracker_event", 1));
+          assert.deepStrictEqual(stageOf(again), [itemKeyFor(7936), "triage"]);
+          assert.isTrue(admittedBasis(again)?.includes(":after:"), admittedBasis(again));
+          for (const trigger of ["clock", "restart"] as const) {
+            assert.deepStrictEqual(admittedOnly(yield* advance(trigger, 2)), []);
+          }
+        }),
+      ),
+    ),
+);
+
 /**
  * The HSA policy's hold (connector #50), from the input its command receives: a build that
  * committed nothing and names something outside its worker, after a correction written on the same
