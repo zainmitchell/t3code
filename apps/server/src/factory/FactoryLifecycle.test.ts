@@ -17370,7 +17370,7 @@ const withdrawAfter = (
   meanwhile: (
     input: Parameters<ProposeFn>[0],
     gate: FactoryOutcomeStore.ReservedDecision,
-  ) => Effect.Effect<unknown, unknown, FactoryStore.FactoryStore | FactoryOutcomeStore.FactoryOutcomeStore>,
+  ) => Effect.Effect<unknown, unknown, FactoryStore.FactoryStore | FactoryOutcomeStore.FactoryOutcomeStore | FactoryLifecycle.FactoryLifecycle | FactoryWorkspace | ProjectService.ProjectService>,
 ) =>
   Effect.gen(function* () {
     yield* configureLifecycleFactory;
@@ -17385,6 +17385,9 @@ const withdrawAfter = (
     yield* advance("tracker_event", 2);
     const store = yield* FactoryStore.FactoryStore;
     const outcomes = yield* FactoryOutcomeStore.FactoryOutcomeStore;
+    const lifecycle = yield* FactoryLifecycle.FactoryLifecycle;
+    const workspace = yield* FactoryWorkspace;
+    const projects = yield* ProjectService.ProjectService;
     yield* usePolicy((input) =>
       Effect.gen(function* () {
         const gate = input.reserved[0]!;
@@ -17392,6 +17395,9 @@ const withdrawAfter = (
         yield* meanwhile(input, gate).pipe(
           Effect.provideService(FactoryStore.FactoryStore, store),
           Effect.provideService(FactoryOutcomeStore.FactoryOutcomeStore, outcomes),
+          Effect.provideService(FactoryLifecycle.FactoryLifecycle, lifecycle),
+          Effect.provideService(FactoryWorkspace, workspace),
+          Effect.provideService(ProjectService.ProjectService, projects),
           Effect.orDie,
         );
         // Later passes hold without withdrawing: only the stale decision names the gate.
