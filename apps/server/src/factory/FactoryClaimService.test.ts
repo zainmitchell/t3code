@@ -9,7 +9,7 @@ import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 
-import { bindingLandingUnavailable } from "./FactoryClaimService.ts";
+import { bindingLandingUnavailable, boundVerificationOf } from "./FactoryClaimService.ts";
 import type { FactoryOperationIntent } from "./FactoryOperationStore.ts";
 import { FactoryWorkspaceHead } from "./FactoryRunPreparation.ts";
 
@@ -186,3 +186,36 @@ it.live("Landing/C2: a landing T3 cannot make the exact base refuses before any 
     }),
   ),
 );
+
+it("reads a bound verification's binding by key, and refuses a binding it cannot read exactly", () => {
+  const vb = "a".repeat(32);
+  const out = "b".repeat(32);
+  const ne = "c".repeat(32);
+  const cases: ReadonlyArray<
+    readonly [string | undefined, ReturnType<typeof boundVerificationOf>]
+  > = [
+    [undefined, undefined],
+    ["rework:o1", undefined],
+    ["rework:o1|res:ocr|exe:verifier", undefined],
+    [`rework:o1|vb:${vb}|out:${out}`, { specOutcomeId: "o1", bindingDigest: vb }],
+    // Resources, an execution choice and a no-edit unit sit before the binding.
+    [
+      `rework:o1|res:ocr,gpu|exe:verifier|ne:${ne}|vb:${vb}|out:${out}`,
+      { specOutcomeId: "o1", bindingDigest: vb },
+    ],
+    [`rework:o1|exe:verifier|vb:${vb}|out:${out}`, { specOutcomeId: "o1", bindingDigest: vb }],
+    [`rework:o1|vb:${vb}`, "malformed"],
+    [`rework:o1|out:${out}`, "malformed"],
+    [`rework:o1|vb:${vb}|vb:${vb}|out:${out}`, "malformed"],
+    [`rework:o1|vb:${vb}|out:${out}|out:${out}`, "malformed"],
+    [`rework:o1|out:${out}|vb:${vb}`, "malformed"],
+    [`rework:o1|vb:${vb}|out:${out}|res:ocr`, "malformed"],
+    [`rework:o1|vb:${vb.slice(1)}|out:${out}`, "malformed"],
+    [`rework:o1|vb:${vb}|out:${"B".repeat(32)}`, "malformed"],
+    [`implement:o1|vb:${vb}|out:${out}`, "malformed"],
+    [`rework:|vb:${vb}|out:${out}`, "malformed"],
+  ];
+  for (const [basis, expected] of cases) {
+    assert.deepStrictEqual(boundVerificationOf(basis), expected, basis);
+  }
+});

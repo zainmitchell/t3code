@@ -12555,6 +12555,7 @@ const setUpBoundProof = (
       execution: string;
       baseRef: string;
       grant?: { readonly reason: string; readonly evidenceDigest: string };
+      resources?: ReadonlyArray<string>;
     } = {
       pointer: template,
       execution: "verifier",
@@ -12574,6 +12575,7 @@ const setUpBoundProof = (
                   },
                   verificationBinding: proposal.pointer,
                   ...(proposal.grant === undefined ? {} : { requiresGrant: proposal.grant }),
+                  ...(proposal.resources === undefined ? {} : { resources: proposal.resources }),
                 }
               : request,
           )
@@ -12767,6 +12769,16 @@ const launchFaults: ReadonlyArray<readonly [string, number, LaunchFault, string]
     "provider_identity_mismatch",
   ],
   [
+    "another account, on a basis that also holds a resource and names its execution",
+    7541,
+    (proof) =>
+      Effect.map(LaunchFake, (launch) => {
+        proof.proposal.resources = ["ocr"];
+        launch.auth = { status: "authenticated", email: "someone@example.invalid" };
+      }),
+    "provider_identity_mismatch",
+  ],
+  [
     "an endpoint that reports no account",
     7526,
     () => Effect.map(LaunchFake, (launch) => void (launch.auth = { status: "authenticated" })),
@@ -12838,6 +12850,34 @@ it.effect.each(launchFaults)("Binding/B2: %s starts no provider", ([, issue, fau
       }),
     ),
   ),
+);
+
+it.effect(
+  "Binding/B3: a bound proof that also holds a resource is still checked again, and starts when everything holds",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const proof = yield* setUpBoundProof(7544, 7545, "c0007544");
+          const launch = yield* LaunchFake;
+          launch.head = { commit: proof.landed.mergeCommit, tree: proof.landed.tree };
+          proof.proposal.resources = ["ocr"];
+          const startsBefore = (yield* startedTurns).length;
+          const admitted = admittedBy(yield* advance("clock", 2));
+          const basis =
+            admitted.reservation.origin === "admitted"
+              ? admitted.reservation.stageBasis
+              : undefined;
+          assert.match(
+            basis ?? "",
+            /^rework:.+\|res:ocr\|exe:verifier\|vb:[0-9a-f]{32}\|out:[0-9a-f]{32}$/,
+          );
+          assert.deepStrictEqual(yield* startRefusalOf(admitted), []);
+          assert.strictEqual((yield* startedTurns).length - startsBefore, 1);
+          assert.isAbove(launch.refreshes, 0);
+        }),
+      ),
+    ),
 );
 
 const connectorScope = {

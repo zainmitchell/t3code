@@ -172,6 +172,31 @@ export const bindingLandingUnavailable = Effect.fnUntraced(function* (
   return undefined;
 });
 
+const DIGEST32 = /^[0-9a-f]{32}$/;
+
+/**
+ * A bound verification's binding, read from its stage basis by key, so a resource, execution or
+ * no-edit suffix before it never hides it. A basis naming `vb` or `out` must carry exactly one of
+ * each, last and in that order, both digests, on a rework: otherwise it is malformed and refuses.
+ */
+export const boundVerificationOf = (stageBasis: string | undefined) => {
+  if (stageBasis === undefined) return undefined;
+  const [core = "", ...suffixes] = stageBasis.split("|");
+  const keys = suffixes.map((suffix) => suffix.slice(0, suffix.indexOf(":") + 1));
+  if (!keys.includes("vb:") && !keys.includes("out:")) return undefined;
+  const [binding = "", output = ""] = suffixes.slice(-2);
+  const specOutcomeId = core.startsWith("rework:") ? core.slice("rework:".length) : "";
+  return specOutcomeId === "" ||
+    keys.filter((key) => key === "vb:").length !== 1 ||
+    keys.filter((key) => key === "out:").length !== 1 ||
+    !binding.startsWith("vb:") ||
+    !output.startsWith("out:") ||
+    !DIGEST32.test(binding.slice("vb:".length)) ||
+    !DIGEST32.test(output.slice("out:".length))
+    ? ("malformed" as const)
+    : { specOutcomeId, bindingDigest: binding.slice("vb:".length) };
+};
+
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const fs = yield* FileSystem.FileSystem;
@@ -585,11 +610,10 @@ const make = Effect.gen(function* () {
     prepared: boolean,
   ) {
     if (reservation.origin !== "admitted") return undefined;
-    const basis = /^rework:([^|]+)\|vb:([0-9a-f]{32})\|out:[0-9a-f]{32}$/.exec(
-      reservation.stageBasis ?? "",
-    );
-    if (basis === null) return undefined;
-    const [, specOutcomeId, admittedDigest] = basis;
+    const basis = boundVerificationOf(reservation.stageBasis);
+    if (basis === undefined) return undefined;
+    if (basis === "malformed") return "binding_basis_unreadable";
+    const { specOutcomeId, bindingDigest: admittedDigest } = basis;
     const configuration = yield* store.getConfiguration(reservation.factoryId);
     const subject = subjectOf(reservation.itemKey);
     if (
@@ -648,7 +672,7 @@ const make = Effect.gen(function* () {
           subject,
           issue: read.value,
           events,
-          stage: { type: "rework", specOutcomeId: specOutcomeId!, failureDigest: "" },
+          stage: { type: "rework", specOutcomeId, failureDigest: "" },
         },
         pointer: proposal.value.binding,
         execution: proposal.value.execution,
