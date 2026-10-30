@@ -926,7 +926,8 @@ export const NoEditRequirement = Schema.Struct({
   base: Sha40,
   ownedFiles: Schema.Array(Schema.String).check(Schema.isMaxLength(0)),
   checks: Schema.Array(NoEditText).check(Schema.isMinLength(1), Schema.isMaxLength(50)),
-  execution: Schema.optional(NoEditText),
+  // A policy may name no execution as null.
+  execution: Schema.optional(Schema.NullOr(NoEditText)),
   instructionRevision: NoEditText,
   clauseBinding: NoEditText,
 }).check(

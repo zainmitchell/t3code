@@ -4729,7 +4729,9 @@ const make = Effect.gen(function* () {
               workspace.baseRef !== requirement.candidate ||
               workspace.startFromOrigin === true
             ? `the no-edit unit would not start exactly at its candidate ${requirement.candidate}`
-            : requirement.execution !== undefined && requirement.execution !== decision.execution
+            : requirement.execution !== undefined &&
+                requirement.execution !== null &&
+                requirement.execution !== decision.execution
               ? `the no-edit unit names execution ${requirement.execution}, not the one admitted`
               : undefined;
       if (refused !== undefined) {

@@ -587,6 +587,8 @@ it.live(
       assert.include(triage.packet.text, "Item version: v1.");
       assert.include(triage.packet.text, "unit_proposed");
       assert.notInclude(triage.packet.text, "criteria_proposed");
+      // A routine record gap is named as Main's to make, not left as a person's hold.
+      assert.include(triage.packet.text, "`main:` for a routine record only Main may make");
       assert.strictEqual(triage.packet.sha256, sha256(triage.packet.text));
       // A parent is prepared as criteria on its exact text, never as a unit.
       const parent = only(yield* decide([{ labels: ["policy:triage"], subIssueCount: 2 }]));
@@ -693,6 +695,41 @@ it("Policy answer: a parent closure names adopted or prepared criteria as its po
   });
   assert.isTrue(Option.isSome(decode(reserve("retention-period"))));
   assert.isTrue(Option.isNone(decode(reserve("q".repeat(201)))));
+  // A no-edit admit as the policy emits it: no execution named is null, and its own extra keys
+  // (item, version, unit, criteria) are not the requirement.
+  const noEdit = {
+    schema: "factory-noedit/1",
+    candidate: "c".repeat(40),
+    base: "c".repeat(40),
+    ownedFiles: [],
+    checks: ["vp run typecheck"],
+    execution: null,
+    instructionRevision: "e04d4b92",
+    clauseBinding: "#5/C05",
+    itemKey,
+    itemVersion: "v1",
+    unit: "d".repeat(64),
+    criteria: "e".repeat(64),
+  };
+  const admit = (requirement: unknown) => ({
+    decisions: [
+      {
+        itemKey,
+        decision: {
+          decision: "admit",
+          title: "t",
+          brief: "b",
+          poolId: "builders",
+          units: 1,
+          noEdit: requirement,
+        },
+      },
+    ],
+  });
+  assert.isTrue(Option.isSome(decode(admit(noEdit))));
+  assert.isTrue(Option.isNone(decode(admit({ ...noEdit, base: "b".repeat(40) }))));
+  assert.isTrue(Option.isNone(decode(admit({ ...noEdit, ownedFiles: ["src/a.ts"] }))));
+  assert.isTrue(Option.isNone(decode(admit({ ...noEdit, checks: [] }))));
   assert.isTrue(
     Option.isNone(decode(answer({ prepared: { ...prepared, bytes: "x".repeat(1_000_001) } }))),
   );

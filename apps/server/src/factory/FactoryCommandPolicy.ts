@@ -176,7 +176,7 @@ const REPORT_REQUIREMENTS: Record<string, string> = {
   criteria_proposed:
     "criteria_proposed with criteria.basis = the body sha256 and item version named above, and one clause per acceptance list item, quoted exactly with its offsets and sha256, each in body order",
   not_actionable:
-    "not_actionable only for what a person must settle, with failure led by its kind: `decision:` (the one question, its consequence and the exact action that answers it), `permission:`, `private_data:`, `ownership:` or `hold:`, then what is missing",
+    "not_actionable only for what a person must settle, with failure led by its kind: `decision:` (the one question, its consequence and the exact action that answers it), `permission:`, `private_data:`, `ownership:` or `hold:`, or `main:` for a routine record only Main may make (the exact record: an owned-files declaration, a dependency edge, a child), then what is missing",
 };
 
 /** The last preparation's failure, so a retry on it can correct what it names. */
