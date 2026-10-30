@@ -13862,6 +13862,85 @@ it.effect.each(["prepared", "adopted"] as const)(
     ),
 );
 
+it.effect(
+  "Parent/P4: evidence Root's adoption names is projected and judged from T3's own records, with no tracker relation",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          yield* configureLifecycleFactory;
+          const criteriaRoot = yield* fs.realPath(yield* fs.makeTempDirectoryScoped());
+          yield* configureFactory(
+            lifecycleConfiguration({ parents: { close: "project", criteriaRoot } }),
+          );
+          // A zero-child umbrella: its evidence is related work, never its sub-issues.
+          const body = "Umbrella.\n\n## Acceptance\n- C1: rows are kept\n- C2: names are kept\n";
+          yield* seedIssue(7931, { body });
+          yield* seedIssue(7932, { body: "Keep rows." });
+          yield* seedIssue(7933, { body: "Keep names." });
+          const k32 = `github:${claimRepository}#7932`;
+          const k33 = `github:${claimRepository}#7933`;
+          const adopted = JSON.stringify({
+            schema: "factory-parent-criteria/1",
+            issue: 7931,
+            version: "root-1",
+            bodySha256: sha256(body),
+            clauses: [
+              {
+                id: "C1",
+                required: true,
+                source: { kind: "issue_acceptance", ref: "r" },
+                evidence: [{ itemKey: k32, scope: "rows" }],
+              },
+              {
+                id: "C2",
+                required: true,
+                source: { kind: "issue_acceptance", ref: "r" },
+                evidence: [
+                  { itemKey: k33, scope: "names" },
+                  { itemKey: `github:${claimRepository}#7999`, scope: "never recorded" },
+                  { itemKey: "github:example-org/elsewhere#5", scope: "foreign" },
+                ],
+              },
+            ],
+          });
+          yield* fs.makeDirectory(path.join(criteriaRoot, "adopted"));
+          yield* fs.writeFileString(path.join(criteriaRoot, "adopted", "7931.json"), adopted);
+          const criteria = {
+            root: criteriaRoot,
+            path: "adopted/7931.json",
+            sha256: sha256(adopted),
+          };
+          const ready = { items: new Set([7932]) };
+          const seen: Array<ReadonlyArray<string> | undefined> = [];
+          yield* usePolicy((input) => {
+            const issue = Number(input.observation.itemKey.split("#")[1]);
+            if (issue === 7931) {
+              seen.push(input.criteriaEvidence?.map((facts) => facts.itemKey));
+              return Effect.succeed({ type: "proceed" as const, parentClosure: { criteria } });
+            }
+            return ready.items.has(issue)
+              ? stageRequest(input)
+              : Effect.succeed({ type: "none" as const, reason: "not yet" });
+          });
+          yield* landThroughT3(7932, "c0007932");
+          // 7933 is under way but unlanded; 7999 and the foreign key have no records here.
+          ready.items = new Set([7933]);
+          admittedBy(yield* advance("clock", 1));
+          ready.items = new Set();
+          yield* advance("clock");
+          assert.deepStrictEqual(seen.at(-1), [k32, k33]);
+          yield* parentWaitsOn(
+            7931,
+            `clause C2 is missing: ${k33}: it has no verified implemented head (C1=satisfied, C2=missing)`,
+          );
+        }),
+      ),
+    ),
+);
+
 const pullsFor = (branch: string) =>
   Effect.map(GitHubFake, (fake) => [...fake.pulls.values()].filter((pull) => pull.head === branch));
 

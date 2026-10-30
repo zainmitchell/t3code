@@ -352,6 +352,9 @@ export const policyInput = (
           })),
         }),
     ...(item.childrenUnread === undefined ? {} : { childrenUnread: item.childrenUnread }),
+    ...(item.criteriaEvidence === undefined
+      ? {}
+      : { criteriaEvidence: item.criteriaEvidence.map(itemFacts) }),
     reserved: item.reserved,
     grants: item.grants,
     ...(item.legacy === undefined ? {} : { legacy: item.legacy }),

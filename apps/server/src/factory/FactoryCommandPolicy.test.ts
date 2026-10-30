@@ -466,6 +466,17 @@ it("Policy input: closed blockers carry their outcomes as facts; other items are
   // Unread membership is said, never sent as an empty list.
   assert.isFalse("children" in parent.items[1]!);
   assert.deepStrictEqual(parent.items[1]!.childrenUnread, { reason: "listed 1 of 2", foreign: [] });
+  // Evidence an adoption names reaches the policy as recorded facts, like a child, never as an edge.
+  const named = FactoryCommandPolicy.policyInput({
+    configuration: configuration(),
+    items: [{ ...item, criteriaEvidence: [{ itemKey: refused, outcomes: [], events }] }],
+    active: [],
+  });
+  assert.deepStrictEqual(
+    named.items[0]!.criteriaEvidence?.map((facts) => [facts.itemKey, facts.events?.length]),
+    [[refused, 2]],
+  );
+  assert.isFalse("criteriaEvidence" in parent.items[0]!);
   // An item without blockers serializes exactly as it did before they existed.
   assert.deepStrictEqual(Object.keys(input.items[1]!), [
     "decisionKey",

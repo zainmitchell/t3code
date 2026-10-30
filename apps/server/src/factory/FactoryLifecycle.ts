@@ -100,6 +100,7 @@ import * as FactoryIntegrator from "./FactoryIntegrator.ts";
 import * as FactoryOperationStore from "./FactoryOperationStore.ts";
 import * as FactoryPreparedCriteriaStore from "./FactoryPreparedCriteriaStore.ts";
 import {
+  adoptedClauses,
   bindingBasis,
   criteriaProposalProblems,
   type Criteria,
@@ -451,6 +452,9 @@ export type FactoryReconcileResult =
   | FactoryCollectionResult
   | { readonly type: "idle"; readonly reason: "not_configured" | "no_claim" };
 
+/** The most evidence items one adopted criteria document has projected for the policy. */
+const CRITERIA_EVIDENCE_LIMIT = 200;
+
 /** How long a stranded claim waits after a failed replay before a pass gives it another. */
 const REPLAY_PAUSE = { minutes: 30 } as const;
 
@@ -517,6 +521,12 @@ export interface FactoryPolicyItem {
       readonly body?: string;
     }
   >;
+  /**
+   * The items Root's one adopted criteria document for this item names as evidence, in its own
+   * repository, with this factory's outcomes and validity events: no tracker relation is implied.
+   * An item T3 holds no record of is left out, as is every key past the bound.
+   */
+  readonly criteriaEvidence?: ReadonlyArray<FactoryPolicyItemFacts>;
   /** Why a parent's children are not given: its membership could not be read whole. */
   readonly childrenUnread?: {
     readonly reason: string;
@@ -3500,8 +3510,30 @@ const make = Effect.gen(function* () {
       const reads = { outcomeStore, store, operations: operationStore };
       const itemFacts = new Map<FactoryItemKey, FactoryPolicyItemFacts>();
       const items: Array<FactoryPolicyItem> = [];
+      // One read of the criteria root serves every item of the pass.
+      const criteriaRoot = configuration.parents?.criteriaRoot;
+      const listing =
+        criteriaRoot === undefined ? undefined : yield* Effect.cached(listCriteria(criteriaRoot));
       for (const candidate of candidates) {
         const outcomes = yield* policyOutcomes(reads, candidate.events);
+        const adoption =
+          listing === undefined || criteriaRoot === undefined
+            ? undefined
+            : yield* adoptionsIn(yield* listing, {
+                root: criteriaRoot,
+                issue: candidate.subject.issueNumber,
+                factoryId,
+                itemKey: candidate.itemKey,
+              });
+        const criteriaEvidence =
+          adoption === undefined || "unread" in adoption || adoption.found.length !== 1
+            ? []
+            : yield* evidenceFacts(reads, {
+                factoryId,
+                candidate,
+                document: adoption.found[0]!.document,
+                read: itemFacts,
+              });
         const blockers = yield* policyBlockers(reads, {
           factoryId,
           repository: candidate.subject.repository,
@@ -3542,6 +3574,7 @@ const make = Effect.gen(function* () {
           outcomes,
           ...blockers,
           ...children,
+          ...(criteriaEvidence.length === 0 ? {} : { criteriaEvidence }),
           decisionKey: decisionKeyOf(
             {
               factoryId,
@@ -3933,19 +3966,24 @@ const make = Effect.gen(function* () {
       : prepare(`${outcomeId}'s prepared base ${base} no longer holds: ${problem.value}`);
   });
 
-  /**
-   * Every criteria document for `issue` under the criteria root, by real path.
-   */
-  const adoptedCriteriaOf = Effect.fnUntraced(function* (input: {
-    readonly root: string;
-    readonly issue: number;
-    readonly factoryId: FactoryId;
-    readonly itemKey: FactoryItemKey;
-  }) {
-    const { root, issue } = input;
+  /** Every criteria document under the criteria root, by real path, as read now. */
+  const listCriteria = Effect.fnUntraced(function* (root: string): Effect.fn.Return<
+    | { readonly unread: string }
+    | {
+        readonly documents: ReadonlyArray<{
+          readonly target: string;
+          readonly issue: number;
+          readonly document: unknown;
+        }>;
+      }
+  > {
     const listed = yield* fs.readDirectory(root, { recursive: true }).pipe(Effect.result);
     if (listed._tag === "Failure") return { unread: listed.failure.message };
-    const found: Array<string> = [];
+    const documents: Array<{
+      readonly target: string;
+      readonly issue: number;
+      readonly document: unknown;
+    }> = [];
     for (const entry of listed.success.toSorted()) {
       if (!entry.toLowerCase().endsWith(".json")) continue;
       const read = yield* fs.realPath(path.join(root, entry)).pipe(
@@ -3954,7 +3992,6 @@ const make = Effect.gen(function* () {
       );
       if (read._tag === "Failure") return { unread: `${entry}: ${read.failure.message}` };
       const { target, bytes } = read.success;
-      if (yield* preparedPublication.isKept({ ...input, target })) continue;
       const document = parseJson(new TextDecoder().decode(bytes));
       if (
         typeof document === "object" &&
@@ -3962,12 +3999,87 @@ const make = Effect.gen(function* () {
         "schema" in document &&
         document.schema === "factory-parent-criteria/1" &&
         "issue" in document &&
-        document.issue === issue
+        typeof document.issue === "number"
       ) {
-        found.push(target);
+        documents.push({ target, issue: document.issue, document });
       }
     }
+    return { documents };
+  });
+
+  /** Root's criteria documents for one issue in a listing; T3's own kept copies are not adoptions. */
+  const adoptionsIn = Effect.fnUntraced(function* (
+    listing: Effect.Success<ReturnType<typeof listCriteria>>,
+    input: {
+      readonly root: string;
+      readonly issue: number;
+      readonly factoryId: FactoryId;
+      readonly itemKey: FactoryItemKey;
+    },
+  ) {
+    if ("unread" in listing) return { unread: listing.unread };
+    const found: Array<{ readonly target: string; readonly document: unknown }> = [];
+    for (const each of listing.documents) {
+      if (each.issue !== input.issue) continue;
+      if (yield* preparedPublication.isKept({ ...input, target: each.target })) continue;
+      found.push(each);
+    }
     return { found };
+  });
+
+  /** Every criteria document Root adopted for `issue` under the criteria root, read now. */
+  const adoptedCriteriaOf = Effect.fnUntraced(function* (input: {
+    readonly root: string;
+    readonly issue: number;
+    readonly factoryId: FactoryId;
+    readonly itemKey: FactoryItemKey;
+  }) {
+    const adoptions = yield* adoptionsIn(yield* listCriteria(input.root), input);
+    if ("unread" in adoptions) return { unread: adoptions.unread };
+    return { found: adoptions.found.map((each) => each.target) };
+  });
+
+  /**
+   * The facts of each item the one adopted criteria document for an item names as evidence. Only
+   * same-repository keys T3 holds records of; none at all when the adoption is not exactly one or
+   * names more than the bound.
+   */
+  const evidenceFacts = Effect.fnUntraced(function* (
+    reads: PolicyOutcomeReads,
+    input: {
+      readonly factoryId: FactoryId;
+      readonly candidate: Candidate;
+      readonly document: unknown;
+      readonly read: Map<FactoryItemKey, FactoryPolicyItemFacts>;
+    },
+  ) {
+    const { candidate } = input;
+    const clauses = adoptedClauses(input.document, candidate.subject.issueNumber) ?? [];
+    const own = `github:${candidate.subject.repository}#`;
+    const keys = [
+      ...new Set(
+        clauses.flatMap((clause) =>
+          ((clause.evidence ?? []) as ReadonlyArray<{ readonly itemKey: string }>).map(
+            (evidence) => evidence.itemKey,
+          ),
+        ),
+      ),
+    ].filter(
+      (key) =>
+        key.startsWith(own) && /^\d+$/.test(key.slice(own.length)) && key !== candidate.itemKey,
+    );
+    if (keys.length > CRITERIA_EVIDENCE_LIMIT) return [];
+    const facts: Array<FactoryPolicyItemFacts> = [];
+    for (const key of keys) {
+      const itemKey = FactoryItemKeyFor({
+        repository: candidate.subject.repository,
+        issueNumber: Number(key.slice(own.length)),
+      });
+      const events = yield* reads.outcomeStore.itemEvents({ factoryId: input.factoryId, itemKey });
+      if (events.length === 0) continue;
+      facts.push(yield* policyItemFacts(reads, input.factoryId, itemKey, input.read));
+    }
+    return facts;
   });
 
   /**
@@ -4217,6 +4329,25 @@ const make = Effect.gen(function* () {
       issue: candidate.issue,
       read: records,
     });
+    // Evidence an adopted clause names is judged from T3's own records of it, like a child's.
+    for (const clause of criteria.value.clauses) {
+      for (const evidence of clause.evidence ?? []) {
+        const own = `github:${candidate.subject.repository}#`;
+        const number = evidence.itemKey.slice(own.length);
+        if (!evidence.itemKey.startsWith(own) || !/^\d+$/.test(number)) continue;
+        const itemKey = FactoryItemKeyFor({
+          repository: candidate.subject.repository,
+          issueNumber: Number(number),
+        });
+        if (records.has(itemKey)) continue;
+        const events = yield* outcomeStore.itemEvents({
+          factoryId: configuration.factoryId,
+          itemKey,
+        });
+        if (events.length > 0)
+          yield* policyItemFacts(reads, configuration.factoryId, itemKey, records);
+      }
+    }
     const clauses = reconcileCriteria({
       criteria: criteria.value,
       repository: candidate.subject.repository,
