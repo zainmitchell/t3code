@@ -5,6 +5,8 @@ import {
   FactoryDisposeClaimResult,
   FactoryEnterInput,
   FactoryEnterResult,
+  FactoryHistoricalTerminationInput,
+  FactoryHistoricalTerminationResult,
   FactoryQuarantineInput,
   FactoryQuarantineResult,
   FactoryRejectOutcomeInput,
@@ -190,6 +192,21 @@ const FactoryQuarantineTool = Tool.make("t3_factory_quarantine", {
   .annotate(Tool.Idempotent, true)
   .annotate(McpSchema.EnabledWhen, hiddenFromAgents);
 
+const FactoryHistoricalTerminationTool = Tool.make("t3_factory_historical_termination", {
+  description:
+    "Owner only: prove that a full restart of this server's host ended a held historical stage's processes. `capture` before the restart binds its exact execution and this boot to operationRef; `verify` after it, with the same operationRef, needs a later boot of the same host, every container ended and nothing about the execution changed. A proof lets the stage settle normally; it releases or relaunches nothing. Call without expectDigest to read the evidence and refusals, then again with that digest. Agents are refused.",
+  parameters: FactoryHistoricalTerminationInput,
+  success: FactoryHistoricalTerminationResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+})
+  .annotate(Tool.Title, "Prove a historical factory stage ended by host restart")
+  .annotate(Tool.Readonly, false)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, true)
+  .annotate(McpSchema.EnabledWhen, hiddenFromAgents);
+
 export const FactoryToolkit = Toolkit.make(
   FactoryReportTool,
   FactoryEnterTool,
@@ -197,6 +214,7 @@ export const FactoryToolkit = Toolkit.make(
   FactoryDecideTool,
   FactoryDisposeClaimTool,
   FactoryQuarantineTool,
+  FactoryHistoricalTerminationTool,
   FactoryRejectOutcomeTool,
   FactoryRevokeGrantTool,
   FactoryTransferTool,

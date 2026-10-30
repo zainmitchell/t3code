@@ -36,6 +36,7 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import { PreparationOwnerId } from "../orchestration-v2/preparationOwner.ts";
+import { HostBoot } from "./factoryHistoricalTermination.ts";
 
 export class FactoryStoreError extends Schema.TaggedError<FactoryStoreError>()(
   "FactoryStoreError",
@@ -281,6 +282,47 @@ const EndedQuarantine = Schema.Struct({
   }),
 });
 
+/**
+ * Coverage of a historical execution's processes by a full restart of their host, in two owner
+ * steps. The capture binds the exact execution and the host boot before the named operation; the
+ * proof records a later boot of the same host with that execution unchanged. Only a proof covers
+ * anything, and only the attempts, launches and containers its capture names.
+ */
+const HistoricalTerminationCapture = Schema.Struct({
+  by: Bounded,
+  reason: TrimmedNonEmptyString.check(Schema.isMaxLength(2_000)),
+  operationRef: Bounded,
+  evidenceDigest: Bounded,
+  evidence: Schema.String,
+  executionDigest: Bounded,
+  servingId: Bounded,
+  host: HostBoot,
+  covers: Schema.Struct({
+    attempts: Schema.Array(Schema.String),
+    launches: Schema.Array(
+      Schema.Struct({ runId: Schema.String, status: Schema.String, attemptCount: Schema.Number }),
+    ),
+    generations: Schema.Array(Schema.String),
+  }),
+  capturedAt: Schema.String,
+});
+const HistoricalTerminationProof = Schema.Struct({
+  by: Bounded,
+  reason: TrimmedNonEmptyString.check(Schema.isMaxLength(2_000)),
+  evidenceDigest: Bounded,
+  evidence: Schema.String,
+  servingId: Bounded,
+  host: HostBoot,
+  provedAt: Schema.String,
+});
+const HistoricalTermination = Schema.Struct({
+  capture: HistoricalTerminationCapture,
+  proof: Schema.optional(HistoricalTerminationProof),
+});
+export type HistoricalTermination = typeof HistoricalTermination.Type;
+type HistoricalTerminationCapture = typeof HistoricalTerminationCapture.Type;
+type HistoricalTerminationProof = typeof HistoricalTerminationProof.Type;
+
 /** A factory decision admitted through `factory.execution.start`. */
 const AdmittedReservation = Schema.Struct({
   origin: Schema.Literal("admitted"),
@@ -305,6 +347,7 @@ const AdmittedReservation = Schema.Struct({
   neverStartedAttestation: Schema.optional(NeverStartedAttestation),
   quarantine: Schema.optional(ReservationQuarantine),
   quarantineHistory: Schema.optional(Schema.Array(EndedQuarantine)),
+  historicalTermination: Schema.optional(HistoricalTermination),
 });
 
 /** A counted descendant of a native execution, admitted under the configuration current then. */
@@ -789,6 +832,20 @@ export class FactoryStore extends Context.Service<
             readonly reason: string;
             readonly evidenceDigest: string;
           };
+    }) => Effect.Effect<boolean, FactoryStoreError>;
+    /**
+     * Records a held admitted reservation's restart capture, replacing an unproved one, or the
+     * proof of its capture, only while its stored record is still `expected`. A proof is final.
+     */
+    readonly recordHistoricalTermination: (input: {
+      readonly reservationId: FactoryReservationId;
+      readonly expected: FactoryReservation;
+      readonly change:
+        | {
+            readonly type: "capture";
+            readonly capture: Omit<HistoricalTerminationCapture, "capturedAt">;
+          }
+        | { readonly type: "prove"; readonly proof: Omit<HistoricalTerminationProof, "provedAt"> };
     }) => Effect.Effect<boolean, FactoryStoreError>;
     readonly disposedCarriers: (
       factoryId: FactoryId,
@@ -2036,6 +2093,59 @@ const make = Effect.gen(function* () {
         );
       },
       Effect.mapError(fail("record-quarantine")),
+    ),
+    recordHistoricalTermination: Effect.fn("FactoryStore.recordHistoricalTermination")(
+      function* (input: {
+        readonly reservationId: FactoryReservationId;
+        readonly expected: FactoryReservation;
+        readonly change:
+          | {
+              readonly type: "capture";
+              readonly capture: Omit<HistoricalTerminationCapture, "capturedAt">;
+            }
+          | {
+              readonly type: "prove";
+              readonly proof: Omit<HistoricalTerminationProof, "provedAt">;
+            };
+      }) {
+        const { expected, change } = input;
+        if (expected.origin !== "admitted" || expected.state !== "held") return false;
+        const recorded = expected.historicalTermination;
+        if (recorded?.proof !== undefined) return false;
+        const at = DateTime.formatIso(yield* DateTime.now);
+        let next: FactoryReservation;
+        if (change.type === "capture") {
+          next = {
+            ...expected,
+            historicalTermination: { capture: { ...change.capture, capturedAt: at } },
+          };
+        } else {
+          if (recorded === undefined) return false;
+          next = {
+            ...expected,
+            historicalTermination: { ...recorded, proof: { ...change.proof, provedAt: at } },
+          };
+        }
+        return yield* sql.withTransaction(
+          Effect.gen(function* () {
+            const current = yield* reservationById(input.reservationId);
+            if (
+              Option.isNone(current) ||
+              (yield* encodeReservation(current.value)) !== (yield* encodeReservation(expected))
+            ) {
+              return false;
+            }
+            const updated = yield* sql`
+              UPDATE factory_reservations
+              SET record_json = ${yield* encodeReservation(next)}
+              WHERE reservation_id = ${input.reservationId} AND state = 'held'
+              RETURNING reservation_id
+            `;
+            return updated.length === 1;
+          }),
+        );
+      },
+      Effect.mapError(fail("record-historical-termination")),
     ),
     issueGrant: Effect.fn("FactoryStore.issueGrant")(
       function* (input: {

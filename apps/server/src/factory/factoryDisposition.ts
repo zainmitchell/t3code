@@ -1,3 +1,4 @@
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 
@@ -6,6 +7,11 @@ import * as EffectOutbox from "../orchestration-v2/EffectOutbox.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import { START_REFUSAL_SIGNALS, type FactoryCustody } from "./factoryCustody.ts";
 import * as FactoryExecutionGenerations from "./FactoryExecutionGenerations.ts";
+import {
+  bootBoundaryRefusals,
+  type HostBoot,
+  LOCAL_PROCESS_DRIVERS,
+} from "./factoryHistoricalTermination.ts";
 import type * as FactoryOutcomeStore from "./FactoryOutcomeStore.ts";
 import * as FactoryStore from "./FactoryStore.ts";
 
@@ -271,3 +277,97 @@ export const quarantineRefusals = (
     : []),
   ...(unprovedOnly(evidence.custody) ? [] : ["custody_not_unproved"]),
 ];
+
+/**
+ * Every fact a historical execution's termination by host restart is bound to, read before the
+ * restart and again after it: the quarantine read, the stage's outcomes by report digest, and its
+ * latest recorded activity. `execution` leaves out what a restart itself changes (custody, the
+ * containers' states, any quarantine), so it must read the same on both sides of the restart.
+ */
+export const readTerminationEvidence = Effect.fn("factoryDisposition.readTerminationEvidence")(
+  function* (
+    reservation: AdmittedReservation,
+    custody: FactoryCustody,
+    outcomes: ReadonlyArray<FactoryOutcomeStore.FactoryOutcome>,
+  ) {
+    const facts = yield* readQuarantineEvidence(reservation, custody, outcomes);
+    const projection = yield* (yield* ProjectionStore.ProjectionStoreV2).getThreadProjection(
+      reservation.execution.threadId,
+    );
+    const times = [
+      ...projection.runs.flatMap((run) => [run.requestedAt, run.startedAt, run.completedAt]),
+      ...projection.attempts.flatMap((attempt) => [attempt.startedAt, attempt.completedAt]),
+      ...projection.providerTurns.flatMap((turn) => [turn.startedAt, turn.completedAt]),
+    ].flatMap((time) => (time === null ? [] : [DateTime.toEpochMillis(time)]));
+    return {
+      facts,
+      execution: {
+        reservation: facts.reservation,
+        runs: facts.runs.map((run) => ({
+          ...run,
+          generations: run.generations.map(({ generationId, providerJoins }) => ({
+            generationId,
+            providerJoins,
+          })),
+        })),
+        attempts: facts.attempts,
+        providerTurns: facts.providerTurns,
+        launches: facts.launches,
+        outcomes: outcomes.map((outcome) => ({
+          outcomeId: outcome.outcomeId,
+          state: outcome.state,
+          kind: outcome.report.outcome,
+          reportDigest: outcome.reportDigest,
+          origin: outcome.origin,
+        })),
+        latestActivityAt:
+          times.length === 0 ? null : DateTime.formatIso(DateTime.makeUnsafe(Math.max(...times))),
+      },
+    };
+  },
+);
+
+/**
+ * Why a host restart cannot be bound to (`capture`) or proved for (`verify`) this execution. Both
+ * need what quarantine needs, a local provider and readable boot facts; verifying also needs the
+ * captured operation and execution, every container ended, and a later boot of the same host.
+ */
+export const terminationRefusals = (input: {
+  readonly action: "capture" | "verify";
+  readonly facts: QuarantineEvidence;
+  readonly executionDigest: string;
+  readonly evidenceDigest: string;
+  readonly operationRef: string;
+  readonly servingId: string;
+  readonly host: HostBoot | null;
+  readonly recorded: FactoryStore.HistoricalTermination | undefined;
+}): ReadonlyArray<string> => {
+  const { facts } = input;
+  const eligibility = [
+    ...quarantineRefusals({ ...facts, quarantine: null }, input.servingId),
+    ...(facts.runs.some(
+      (run) => run.started && (run.driver === null || !LOCAL_PROCESS_DRIVERS.has(run.driver)),
+    )
+      ? ["driver_not_local"]
+      : []),
+    ...(input.host === null ? ["host_boot_unreadable"] : []),
+  ];
+  const recorded = input.recorded;
+  if (recorded?.proof !== undefined) return ["already_proved", ...eligibility];
+  if (input.action === "capture") {
+    return recorded?.capture.evidenceDigest === input.evidenceDigest
+      ? ["already_captured", ...eligibility]
+      : eligibility;
+  }
+  if (recorded === undefined) return ["not_captured", ...eligibility];
+  const { capture } = recorded;
+  return [
+    ...eligibility,
+    ...(capture.operationRef === input.operationRef ? [] : ["operation_mismatch"]),
+    ...(capture.executionDigest === input.executionDigest ? [] : ["execution_changed"]),
+    ...(facts.runs.some((run) => run.generations.some((generation) => generation.state !== "ended"))
+      ? ["container_not_ended"]
+      : []),
+    ...(input.host === null ? [] : bootBoundaryRefusals(capture.host, input.host)),
+  ];
+};

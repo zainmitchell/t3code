@@ -513,6 +513,22 @@ export const FactoryQuarantineResult = Schema.Struct({
 });
 
 /**
+ * The owner proves that a full restart of the server's host ended a held historical stage's
+ * processes, on one named operation: `capture` before the restart binds the exact execution and
+ * this boot; `verify` after it records the proof once T3 reads a later boot of the same host and
+ * the same execution. Without `expectDigest` it only reads; with it, only that exact evidence.
+ */
+export const FactoryHistoricalTerminationInput = Schema.Struct({
+  factoryId: FactoryId,
+  reservationId: FactoryReservationId,
+  action: Schema.Literals(["capture", "verify"]),
+  operationRef: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
+  reason: TrimmedNonEmptyString.check(Schema.isMaxLength(2_000)),
+  expectDigest: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(128))),
+});
+export const FactoryHistoricalTerminationResult = FactoryQuarantineResult;
+
+/**
  * The owner hands a legacy command job's work on chosen items to a factory. Asking again with the
  * same transfer id finishes it once the job's last pass has stopped.
  */

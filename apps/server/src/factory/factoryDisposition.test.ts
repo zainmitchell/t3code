@@ -16,9 +16,12 @@ import { GenerationId } from "./FactoryExecutionGenerations.ts";
 import {
   neverStartedRefusals,
   quarantineRefusals,
+  terminationRefusals,
   type NeverStartedEvidence,
   type QuarantineEvidence,
 } from "./factoryDisposition.ts";
+import type { HostBoot } from "./factoryHistoricalTermination.ts";
+import type { HistoricalTermination } from "./FactoryStore.ts";
 
 const runId = RunId.make("run:14");
 const ownerId = PreparationOwnerId.make("owner:1");
@@ -387,5 +390,168 @@ describe("quarantineRefusals", () => {
     ],
   ])("refuses %s", (refusal, evidence) => {
     assert.include(quarantineRefusals(evidence, servingId), refusal);
+  });
+});
+
+// The same historical review, bound to the restart Root will perform: captured on this boot of
+// this host, then read again after a later boot of the same host.
+const capturedBoot: HostBoot = {
+  platform: "win32",
+  machineId: "machine-a",
+  bootId: "20",
+  uptimeMs: 276_517_000,
+};
+const laterBoot: HostBoot = { ...capturedBoot, bootId: "21", uptimeMs: 120_000 };
+const captured: HistoricalTermination = {
+  capture: {
+    by: "mcp-client:owner",
+    reason: "planned full restart",
+    operationRef: "restart:20261030",
+    evidenceDigest: "capture-digest",
+    evidence: "{}",
+    executionDigest: "execution-digest",
+    servingId: "serving:before-restart",
+    host: capturedBoot,
+    covers: { attempts: ["attempt:1"], launches: [], generations: ["generation:1"] },
+    capturedAt: "2026-10-30T03:00:00Z",
+  },
+};
+const proved: HistoricalTermination = {
+  ...captured,
+  proof: {
+    by: "mcp-client:owner",
+    reason: "restarted",
+    evidenceDigest: "verify-digest",
+    evidence: "{}",
+    servingId,
+    host: laterBoot,
+    provedAt: "2026-10-30T04:00:00Z",
+  },
+};
+const capture = {
+  action: "capture",
+  facts: historical,
+  executionDigest: "execution-digest",
+  evidenceDigest: "capture-digest",
+  operationRef: "restart:20261030",
+  servingId: "serving:before-restart",
+  host: capturedBoot,
+  recorded: undefined,
+} satisfies Parameters<typeof terminationRefusals>[0];
+// After the restart every container of the execution reads ended.
+const verify = {
+  ...capture,
+  action: "verify",
+  evidenceDigest: "verify-digest",
+  servingId,
+  host: laterBoot,
+  recorded: captured,
+} satisfies Parameters<typeof terminationRefusals>[0];
+
+describe("terminationRefusals", () => {
+  it("binds a reported historical stage to a restart, and proves it on a later boot", () => {
+    assert.deepStrictEqual(terminationRefusals(capture), []);
+    // An unproved capture may be taken again on fresh evidence.
+    assert.deepStrictEqual(
+      terminationRefusals({ ...capture, recorded: captured, evidenceDigest: "fresh" }),
+      [],
+    );
+    assert.deepStrictEqual(terminationRefusals(verify), []);
+    // A quarantined stage is still the owner's to prove.
+    assert.deepStrictEqual(
+      terminationRefusals({
+        ...verify,
+        facts: {
+          ...historical,
+          quarantine: { by: "owner", evidenceDigest: "q", quarantinedAt: "2026-10-30T00:00:00Z" },
+        },
+      }),
+      [],
+    );
+  });
+
+  it.each<[string, Parameters<typeof terminationRefusals>[0]]>([
+    // Confirming the same capture twice, or anything once proved, records nothing new.
+    ["already_captured", { ...capture, recorded: captured }],
+    ["already_proved", { ...capture, recorded: proved }],
+    ["already_proved", { ...verify, recorded: proved }],
+    ["host_boot_unreadable", { ...capture, host: null }],
+    ["host_boot_unreadable", { ...verify, host: null }],
+    // A provider that may run elsewhere is not ended by this host's restart.
+    [
+      "driver_not_local",
+      {
+        ...capture,
+        facts: {
+          ...historical,
+          runs: [{ ...reviewRun!, driver: ProviderDriverKind.make("cursor") }, wakeRun!],
+        },
+      },
+    ],
+    [
+      "driver_not_local",
+      { ...capture, facts: { ...historical, runs: [{ ...reviewRun!, driver: null }, wakeRun!] } },
+    ],
+    // Live, unread, unreported or ambiguous work never binds, before or after the restart.
+    [
+      "custody_not_unproved",
+      { ...capture, facts: { ...historical, custody: { state: "live", reasons: ["run_queued"] } } },
+    ],
+    [
+      "custody_not_unproved",
+      {
+        ...verify,
+        facts: { ...historical, custody: { state: "live", reasons: ["pending_request"] } },
+      },
+    ],
+    [
+      "launch_pending",
+      {
+        ...verify,
+        facts: { ...historical, launches: [{ runId: wakeRunId, status: "pending", attempts: 0 }] },
+      },
+    ],
+    ["launch_outcome_unproved", { ...capture, facts: laterUnproved }],
+    ["no_verified_report", { ...capture, facts: { ...historical, outcomes: [] } }],
+    [
+      "admitted_by_this_process",
+      {
+        ...verify,
+        facts: { ...historical, reservation: { ...historical.reservation, admittedIn: servingId } },
+      },
+    ],
+    ["not_captured", { ...verify, recorded: undefined }],
+    // The proof is for the operation the capture named, of the very execution it captured.
+    ["operation_mismatch", { ...verify, operationRef: "restart:other" }],
+    ["execution_changed", { ...verify, executionDigest: "later-launch" }],
+    [
+      "container_not_ended",
+      {
+        ...verify,
+        facts: {
+          ...historical,
+          runs: [
+            {
+              ...reviewRun!,
+              generations: [
+                {
+                  generationId: GenerationId.make("generation:1"),
+                  state: "held",
+                  providerJoins: 0,
+                },
+              ],
+            },
+            wakeRun!,
+          ],
+        },
+      },
+    ],
+    // Only a later boot of the same host: not the capture's own boot, a resume, or another host.
+    ["same_boot", { ...verify, host: { ...capturedBoot, uptimeMs: capturedBoot.uptimeMs + 1 } }],
+    ["uptime_not_reset", { ...verify, host: { ...laterBoot, uptimeMs: capturedBoot.uptimeMs } }],
+    ["foreign_host", { ...verify, host: { ...laterBoot, machineId: "machine-b" } }],
+    ["foreign_host", { ...verify, host: { ...laterBoot, platform: "linux" } }],
+  ])("refuses %s", (refusal, input) => {
+    assert.include(terminationRefusals(input), refusal);
   });
 });

@@ -16,6 +16,7 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as EffectOutbox from "../orchestration-v2/EffectOutbox.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as FactoryExecutionGenerations from "./FactoryExecutionGenerations.ts";
+import { coveredAttempts } from "./factoryHistoricalTermination.ts";
 import * as FactoryRunPreparation from "./FactoryRunPreparation.ts";
 import * as FactoryStore from "./FactoryStore.ts";
 import { type FactoryReservation, samePinnedSelection } from "./FactoryStore.ts";
@@ -35,7 +36,9 @@ export type FactoryCustody =
     }
   | {
       readonly state: "quiescent";
-      readonly reasons: ReadonlyArray<"descendants_ended" | "contained_quiet" | "never_started">;
+      readonly reasons: ReadonlyArray<
+        "descendants_ended" | "contained_quiet" | "never_started" | "host_restarted"
+      >;
     }
   | {
       readonly state: "unknown";
@@ -130,6 +133,8 @@ type ExecutionFacts =
         | undefined;
       /** Runs whose start the runtime refused before any provider work, by its own record. */
       readonly refusedBeforeStart: ReadonlySet<RunId>;
+      /** Attempts whose processes the owner's proof of a later host boot covers, exactly. */
+      readonly hostRestarted: ReadonlySet<string>;
       /**
        * Runs whose last workspace preparation failed, by its own failure item, under a settled
        * obligation that this serving process admitted and opened. An open one is still owed to
@@ -306,6 +311,7 @@ function classifyCustody(facts: ExecutionFacts): FactoryCustody {
    * empty and all gone; or the attempt's session joined this execution's containers, all gone.
    */
   const providerProvedGone = (attempt: (typeof attempts)[number]) => {
+    if (facts.hostRestarted.has(attempt.id)) return true;
     const own = facts.processes.get(attempt.runId);
     const ownGone = provedGone(own);
     if (ownGone && own.providerJoined) return true;
@@ -404,10 +410,13 @@ function classifyCustody(facts: ExecutionFacts): FactoryCustody {
   ) {
     return { state: "quiescent", reasons: ["never_started"] };
   }
-  const quiescent = new Set<"descendants_ended" | "contained_quiet">();
+  const quiescent = new Set<"descendants_ended" | "contained_quiet" | "host_restarted">();
   for (const fact of [...judgedFacts, ...facts.siblings]) {
     if (fact?.type === "ended") quiescent.add("descendants_ended");
     if (fact?.type === "quiet") quiescent.add("contained_quiet");
+  }
+  if (attempts.some((attempt) => facts.hostRestarted.has(attempt.id))) {
+    quiescent.add("host_restarted");
   }
   return { state: "quiescent", reasons: [...quiescent] };
 }
@@ -593,6 +602,13 @@ export const readExecutionCustody = Effect.fn("factoryCustody.readExecutionCusto
       ]),
     ),
     refusedBeforeStart: refusedBeforeStartRuns(projection),
+    hostRestarted:
+      reservation.origin === "admitted" && reservation.historicalTermination?.proof !== undefined
+        ? coveredAttempts(reservation.historicalTermination.capture.covers, {
+            launches,
+            generations: executionGenerations.map((entry) => entry.generation.generationId),
+          })
+        : new Set(),
     preparationFailed: new Set(
       [...preparationFailures(projection).keys()].filter((runId) => settledHere.has(runId)),
     ),

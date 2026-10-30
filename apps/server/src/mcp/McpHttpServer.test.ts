@@ -1176,6 +1176,7 @@ it.effect("lists owner factory tools only to clients and binds a report to its t
       const ownerOnly = [
         "t3_factory_decide",
         "t3_factory_dispose_claim",
+        "t3_factory_historical_termination",
         "t3_factory_quarantine",
         "t3_factory_reject_outcome",
         "t3_factory_revoke_grant",

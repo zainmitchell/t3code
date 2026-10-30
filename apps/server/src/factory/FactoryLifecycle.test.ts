@@ -131,6 +131,11 @@ import type { FactoryCustody } from "./factoryCustody.ts";
 import * as FactoryRunPreparation from "./FactoryRunPreparation.ts";
 import * as FactoryStore from "./FactoryStore.ts";
 import * as FactoryExecutionGenerations from "./FactoryExecutionGenerations.ts";
+import {
+  type HostBoot,
+  HostBootReader,
+  HostBootUnreadable,
+} from "./factoryHistoricalTermination.ts";
 import * as FactoryTracker from "./FactoryTracker.ts";
 import * as FactoryTransferStore from "./FactoryTransferStore.ts";
 import type { FactoryTransferInput } from "./factoryTransfers.ts";
@@ -11201,6 +11206,353 @@ it.effect(
           assert.strictEqual(yield* runCount(execution.threadId), runsBefore);
           assert.deepStrictEqual(yield* itemHistory(7831), ["implement", "implemented"]);
           assert.strictEqual((yield* reservationOf(reservationId))?.state, "held");
+        }),
+      ),
+    ),
+);
+
+/**
+ * A historical stage at `stage` of its item: the stages before it ran contained and settled; this
+ * one ran on the deployed build outside its container, reported, and is held unknown. BTC145 was an
+ * implement stage, BTC142 a passing review and HSA137 a correction.
+ */
+const historicalAt = (issueNumber: number, stage: "implement" | "review" | "correct") =>
+  Effect.gen(function* () {
+    yield* configureLifecycleFactory;
+    yield* seedIssue(issueNumber);
+    const target = yield* ScriptedJoinTarget;
+    const commit = `c${String(issueNumber).padStart(7, "0")}`;
+    yield* recordCommit(commit, [lifecycleBase]);
+    target.skip = stage === "implement";
+    let execution = yield* workStage(admittedBy(yield* advance("tracker_event", 1)), {
+      outcome: "implemented",
+      subject: { ...subjectFor(commit, lifecycleBase), branch: `t3-factory/${issueNumber}` },
+      summary: `Implemented ${issueNumber}.`,
+    });
+    if (stage !== "implement") {
+      target.skip = stage === "review";
+      execution = yield* workStage(
+        admittedBy(yield* advance("outcome")),
+        stage === "review"
+          ? { outcome: "review_passed", subject: subjectFor(commit), summary: "Passes." }
+          : {
+              outcome: "review_failed",
+              subject: subjectFor(commit),
+              failure: "test_settlement fails",
+              summary: "One failing check.",
+            },
+      );
+    }
+    if (stage === "correct") {
+      target.skip = true;
+      execution = yield* workStage(admittedBy(yield* advance("outcome")), {
+        outcome: "correction_spec",
+        summary: "Round the settlement total before comparing.",
+      });
+    }
+    target.skip = false;
+    assert.deepStrictEqual(
+      (yield* advance("outcome")).filter((admission) => admission.type === "admitted"),
+      [],
+    );
+    const reservationId = FactoryReservationId.make(`reservation:${execution.commandId}`);
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`UPDATE factory_reservations SET record_json = json_set(record_json, '$.admittedIn', 'serving:deployed') WHERE reservation_id = ${reservationId}`;
+    const held = yield* reservationOf(reservationId);
+    assert.deepStrictEqual(
+      [held?.state, held?.custody],
+      ["held", { state: "unknown", reasons: ["process_containment_unsupported"] }],
+    );
+    return { execution, reservationId };
+  });
+
+// The OS facts the server reads before and after Root's planned full restart. Synthetic: no test
+// restarts anything; the fake OS is what that boundary would look like.
+const hostBoot = (bootId: string, uptimeMs: number): HostBoot => ({
+  platform: "win32",
+  machineId: "machine:test-host",
+  bootId,
+  uptimeMs,
+});
+const beforeRestart = hostBoot("20", 276_517_000);
+const afterRestart = hostBoot("21", 120_000);
+const operationRef = "restart:historical-recovery";
+
+const terminate = (
+  reservationId: FactoryReservationId,
+  action: "capture" | "verify",
+  host: HostBoot | null,
+  expectDigest?: string,
+  ref = operationRef,
+) =>
+  Effect.flatMap(FactoryLifecycle.FactoryLifecycle, (factory) =>
+    factory.historicalTermination({
+      factoryId,
+      reservationId,
+      action,
+      operationRef: ref,
+      by: "owner",
+      reason: "planned full host restart",
+      ...(expectDigest === undefined ? {} : { expectDigest }),
+    }),
+  ).pipe(
+    Effect.provideService(HostBootReader, {
+      read:
+        host === null
+          ? Effect.fail(new HostBootUnreadable({ reason: "registry unreadable" }))
+          : Effect.succeed(host),
+    }),
+  );
+
+const captureTermination = (reservationId: FactoryReservationId) =>
+  Effect.gen(function* () {
+    const read = yield* terminate(reservationId, "capture", beforeRestart);
+    assert.deepStrictEqual(read.refusals, []);
+    assert.isTrue(
+      (yield* terminate(reservationId, "capture", beforeRestart, read.evidenceDigest)).applied,
+    );
+  });
+
+/** The host's full restart: every container ends with the OS, and T3 starts again. */
+const restartHost = Effect.gen(function* () {
+  (yield* ContainmentFake).members.clear();
+  yield* (yield* ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService).recover;
+});
+
+const proveTermination = (reservationId: FactoryReservationId) =>
+  Effect.gen(function* () {
+    const read = yield* terminate(reservationId, "verify", afterRestart);
+    assert.deepStrictEqual(read.refusals, []);
+    assert.isTrue(
+      (yield* terminate(reservationId, "verify", afterRestart, read.evidenceDigest)).applied,
+    );
+  });
+
+const admissionsOnly = (admissions: ReadonlyArray<FactoryLifecycle.FactoryAdmissionResult>) =>
+  admissions.filter((admission) => admission.type === "admitted");
+
+it.effect(
+  "Termination/T1: an implement stage proved ended by a later boot settles once and goes to its independent review",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const { execution, reservationId } = yield* historicalAt(7861, "implement");
+
+          // Before the restart: a read binds nothing, a stale digest refuses, and two owners
+          // confirming at once record one capture.
+          const read = yield* terminate(reservationId, "capture", beforeRestart);
+          assert.deepStrictEqual([read.applied, read.refusals], [false, []]);
+          assert.deepStrictEqual(
+            (yield* terminate(reservationId, "capture", beforeRestart, "0".repeat(64))).refusals,
+            ["evidence_changed"],
+          );
+          const [first, second] = yield* Effect.all(
+            [
+              terminate(reservationId, "capture", beforeRestart, read.evidenceDigest),
+              terminate(reservationId, "capture", beforeRestart, read.evidenceDigest),
+            ],
+            { concurrency: 2 },
+          );
+          assert.deepStrictEqual([first.applied, second.applied].toSorted(), [false, true]);
+          assert.include((first.applied ? second : first).refusals, "already_captured");
+
+          // A capture proves nothing: the stage stays held and unknown, owning its item.
+          assert.deepStrictEqual(admissionsOnly(yield* advance("clock")), []);
+          const captured = yield* reservationOf(reservationId);
+          assert.deepStrictEqual(
+            [captured?.state, captured?.custody],
+            ["held", { state: "unknown", reasons: ["process_containment_unsupported"] }],
+          );
+          // Its own boot read later, as after a resume or a T3 restart alone, proves nothing.
+          yield* (yield* ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService).recover;
+          const sameBoot = yield* terminate(
+            reservationId,
+            "verify",
+            hostBoot("20", beforeRestart.uptimeMs + 3_600_000),
+          );
+          assert.includeMembers(
+            [...sameBoot.refusals],
+            ["same_boot", "uptime_not_reset", "container_not_ended"],
+          );
+          assert.isFalse(
+            (yield* terminate(reservationId, "verify", afterRestart, sameBoot.evidenceDigest))
+              .applied,
+          );
+          // Nor does another host, or a proof named for another operation.
+          yield* restartHost;
+          assert.include(
+            (yield* terminate(reservationId, "verify", {
+              ...afterRestart,
+              machineId: "machine:copy",
+            })).refusals,
+            "foreign_host",
+          );
+          assert.include(
+            (yield* terminate(reservationId, "verify", afterRestart, undefined, "restart:other"))
+              .refusals,
+            "operation_mismatch",
+          );
+
+          // A later boot of the same host: the proof is recorded once, however often confirmed.
+          const runsBefore = yield* runCount(execution.threadId);
+          const proof = yield* terminate(reservationId, "verify", afterRestart);
+          assert.deepStrictEqual(proof.refusals, []);
+          const [left, right] = yield* Effect.all(
+            [
+              terminate(reservationId, "verify", afterRestart, proof.evidenceDigest),
+              terminate(reservationId, "verify", afterRestart, proof.evidenceDigest),
+            ],
+            { concurrency: 2 },
+          );
+          assert.deepStrictEqual([left.applied, right.applied].toSorted(), [false, true]);
+          assert.include((left.applied ? right : left).refusals, "already_proved");
+          assert.deepStrictEqual((yield* reservationOf(reservationId))?.custody, {
+            state: "quiescent",
+            reasons: ["descendants_ended", "host_restarted"],
+          });
+
+          // Normal settlement releases it and admits its next stage: an independent review, never
+          // a claim that it was reviewed, and no relaunch of the implement stage.
+          const review = admittedBy(yield* advance("owner_decision"));
+          assert.deepStrictEqual(stageOf(review), [itemKeyFor(7861), "review"]);
+          const released = yield* reservationOf(reservationId);
+          assert.deepStrictEqual(
+            [released?.state, released?.releasedReason],
+            ["released", "outcome_verified"],
+          );
+          assert.deepStrictEqual(yield* itemHistory(7861), ["implement", "implemented", "review"]);
+          assert.strictEqual(yield* runCount(execution.threadId), runsBefore);
+
+          // Later passes and a restart never relaunch the implement stage or its thread.
+          yield* (yield* ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService).recover;
+          for (const trigger of ["restart", "clock", "owner_decision"] as const) {
+            assert.deepStrictEqual(
+              admissionsOnly(yield* advance(trigger))
+                .map(stageOf)
+                .filter((stage) => stage?.[1] !== "review"),
+              [],
+            );
+          }
+          const history = yield* itemHistory(7861);
+          assert.deepStrictEqual(history.slice(0, 2), ["implement", "implemented"]);
+          assert.notInclude(history.slice(2), "implement");
+          assert.notInclude(history, "review_passed");
+          assert.strictEqual(yield* runCount(execution.threadId), runsBefore);
+          assert.deepStrictEqual(
+            (yield* terminate(reservationId, "verify", afterRestart, proof.evidenceDigest))
+              .refusals,
+            ["not_held_admitted"],
+          );
+        }),
+      ),
+    ),
+);
+
+it.effect("Termination/T2: a passing review proved ended is integrated and closed, once", () =>
+  runIsolated(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { reservationId } = yield* historicalAt(7871, "review");
+        const graph = yield* GitGraphFake;
+        // Its accepted review is not integrated while its writer is unproved.
+        assert.strictEqual(graph.writes.length, 0);
+        yield* captureTermination(reservationId);
+        yield* restartHost;
+        yield* proveTermination(reservationId);
+        yield* advance("owner_decision");
+        assert.strictEqual(graph.writes.length, 1);
+        assert.strictEqual(yield* dispositionOf(7871), "done");
+        assert.deepStrictEqual((yield* itemHistory(7871)).slice(-4), [
+          "review",
+          "review_passed",
+          "integrated",
+          "closed",
+        ]);
+        yield* advance("clock");
+        assert.strictEqual(graph.writes.length, 1);
+      }),
+    ),
+  ),
+);
+
+it.effect("Termination/T3: a correction proved ended goes on to its rework", () =>
+  runIsolated(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { reservationId } = yield* historicalAt(7881, "correct");
+        yield* captureTermination(reservationId);
+        yield* restartHost;
+        yield* proveTermination(reservationId);
+        const rework = admittedBy(yield* advance("owner_decision"));
+        assert.deepStrictEqual(stageOf(rework), [itemKeyFor(7881), "rework"]);
+        assert.deepStrictEqual((yield* itemHistory(7881)).slice(-3), [
+          "correct",
+          "correction_spec",
+          "rework",
+        ]);
+      }),
+    ),
+  ),
+);
+
+it.effect(
+  "Termination/T4: a later launch, an unread host, or live and unreported work is never covered",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const { execution, reservationId } = yield* historicalAt(7891, "implement");
+          assert.include(
+            (yield* terminate(reservationId, "capture", null)).refusals,
+            "host_boot_unreadable",
+          );
+          yield* captureTermination(reservationId);
+          // A wake after the capture: the fence refuses it, but its launch was claimed after the
+          // capture, so that capture covers nothing now.
+          yield* dispatchProviderContinuation(execution.threadId, "after-capture");
+          yield* runEffects;
+          yield* restartHost;
+          const stale = yield* terminate(reservationId, "verify", afterRestart);
+          assert.include(stale.refusals, "execution_changed");
+          assert.isFalse(
+            (yield* terminate(reservationId, "verify", afterRestart, stale.evidenceDigest)).applied,
+          );
+          assert.deepStrictEqual((yield* reservationOf(reservationId))?.custody, {
+            state: "unknown",
+            reasons: ["process_containment_unsupported"],
+          });
+
+          // A stage running now, under the process that admitted it, has nothing to capture.
+          yield* seedIssue(7893);
+          const quarantined = yield* quarantine(reservationId, "enter");
+          assert.isTrue(
+            (yield* quarantine(reservationId, "enter", quarantined.evidenceDigest)).applied,
+          );
+          const running = yield* startStage(admittedBy(yield* advance("clock")));
+          const live = FactoryReservationId.make(`reservation:${running.commandId}`);
+          assert.includeMembers(
+            [...(yield* terminate(live, "capture", beforeRestart)).refusals],
+            ["run_not_terminal", "custody_not_unproved", "admitted_by_this_process"],
+          );
+          // Ended without a report, under an earlier process: an ambiguous writer.
+          (yield* ScriptedJoinTarget).skip = true;
+          yield* completeLatestRun(running.threadId);
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`UPDATE factory_reservations SET record_json = json_set(record_json, '$.admittedIn', 'serving:deployed') WHERE reservation_id = ${live}`;
+          const unreported = yield* terminate(live, "capture", beforeRestart);
+          assert.include(unreported.refusals, "no_verified_report");
+          assert.isFalse(
+            (yield* terminate(live, "capture", beforeRestart, unreported.evidenceDigest)).applied,
+          );
+          assert.deepStrictEqual(
+            (yield* terminate(
+              FactoryReservationId.make("reservation:missing"),
+              "capture",
+              beforeRestart,
+            )).refusals,
+            ["unknown_reservation"],
+          );
         }),
       ),
     ),

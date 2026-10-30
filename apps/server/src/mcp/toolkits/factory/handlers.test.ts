@@ -93,6 +93,10 @@ const handle = <E, R>(
             Effect.sync(() => asked.push(input)).pipe(
               Effect.as({ applied: false, refusals: [], evidenceDigest: "digest" }),
             ),
+          historicalTermination: (input) =>
+            Effect.sync(() => asked.push(input)).pipe(
+              Effect.as({ applied: false, refusals: [], evidenceDigest: "digest" }),
+            ),
           rejectOutcome: (input) => Effect.sync(() => asked.push(input)).pipe(Effect.as(true)),
           revokeGrant: (input) => Effect.sync(() => asked.push(input)).pipe(Effect.as(true)),
           transferLegacy: (input) =>
@@ -138,6 +142,16 @@ const ownerTools = {
         reservationId: FactoryReservationId.make("reservation-1"),
         action: "enter",
         reason: "historical execution",
+      })
+      .pipe(Stream.unwrap, lastResult),
+  t3_factory_historical_termination: (toolkit: Toolkit) =>
+    toolkit
+      .handle("t3_factory_historical_termination", {
+        factoryId,
+        reservationId: FactoryReservationId.make("reservation-1"),
+        action: "capture",
+        operationRef: "restart:1",
+        reason: "planned full host restart",
       })
       .pipe(Stream.unwrap, lastResult),
   t3_factory_reject_outcome: (toolkit: Toolkit) =>

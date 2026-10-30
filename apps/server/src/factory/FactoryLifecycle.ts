@@ -74,7 +74,10 @@ import {
   quarantineRefusals,
   readNeverStartedEvidence,
   readQuarantineEvidence,
+  readTerminationEvidence,
+  terminationRefusals,
 } from "./factoryDisposition.ts";
+import { HostBootReader } from "./factoryHistoricalTermination.ts";
 import { makeNativeStages, TICKET_DECISION_STAGE } from "./factoryNativeStages.ts";
 import { makeBookkeeping } from "./factoryBookkeeping.ts";
 import { makeSwitchProvider } from "./factoryProviderSwitch.ts";
@@ -701,6 +704,29 @@ export class FactoryLifecycle extends Context.Service<
       readonly factoryId: FactoryId;
       readonly reservationId: FactoryReservationId;
       readonly action: "enter" | "leave";
+      readonly by: string;
+      readonly reason: string;
+      readonly expectDigest?: string | undefined;
+    }) => Effect.Effect<
+      {
+        readonly applied: boolean;
+        readonly refusals: ReadonlyArray<string>;
+        readonly evidence?: string;
+        readonly evidenceDigest?: string;
+      },
+      FactoryLifecycleError
+    >;
+    /**
+     * The owner's proof that a full restart of this host ended a historical execution: `capture`
+     * binds it and this boot to an operation, `verify` reads a later boot with it unchanged. Only
+     * an exact digest records; custody then counts those attempts as ended and normal settlement
+     * proceeds. It releases nothing itself.
+     */
+    readonly historicalTermination: (input: {
+      readonly factoryId: FactoryId;
+      readonly reservationId: FactoryReservationId;
+      readonly action: "capture" | "verify";
+      readonly operationRef: string;
       readonly by: string;
       readonly reason: string;
       readonly expectDigest?: string | undefined;
@@ -4050,6 +4076,129 @@ const make = Effect.gen(function* () {
             (cause) =>
               new FactoryLifecycleError({
                 operation: "quarantine",
+                factoryId: input.factoryId,
+                cause,
+              }),
+          ),
+        ),
+    ),
+    historicalTermination: Effect.fn("FactoryLifecycle.historicalTermination")(
+      function* (input: {
+        readonly factoryId: FactoryId;
+        readonly reservationId: FactoryReservationId;
+        readonly action: "capture" | "verify";
+        readonly operationRef: string;
+        readonly by: string;
+        readonly reason: string;
+        readonly expectDigest?: string | undefined;
+      }) {
+        // Read from the OS before the transaction; never from the caller.
+        const host = Option.getOrNull(yield* Effect.option((yield* HostBootReader).read));
+        const result = yield* sql.withTransaction(
+          Effect.gen(function* () {
+            const found = yield* store.getReservation(input.reservationId);
+            if (Option.isNone(found) || found.value.factoryId !== input.factoryId) {
+              return { applied: false, refusals: ["unknown_reservation"] };
+            }
+            const reservation = found.value;
+            if (reservation.origin !== "admitted" || reservation.state !== "held") {
+              return { applied: false, refusals: ["not_held_admitted"] };
+            }
+            const termination = yield* readTerminationEvidence(
+              reservation,
+              yield* custodyOf(reservation),
+              yield* outcomeStore.listForOrigin(reservation.reservationId),
+            ).pipe(Effect.provide(custodyContext));
+            const executionDigest = sha256(canonical(termination.execution));
+            const recorded = reservation.historicalTermination;
+            const evidence = canonical({
+              action: input.action,
+              operationRef: input.operationRef,
+              execution: termination.execution,
+              host:
+                host === null
+                  ? null
+                  : { platform: host.platform, machineId: host.machineId, bootId: host.bootId },
+              servingId: store.servingId,
+              ...(input.action === "verify" && recorded !== undefined
+                ? {
+                    capture: {
+                      evidenceDigest: recorded.capture.evidenceDigest,
+                      host: recorded.capture.host,
+                      servingId: recorded.capture.servingId,
+                    },
+                  }
+                : {}),
+            });
+            const read = { evidence, evidenceDigest: sha256(evidence) };
+            const refusals = terminationRefusals({
+              action: input.action,
+              facts: termination.facts,
+              executionDigest,
+              evidenceDigest: read.evidenceDigest,
+              operationRef: input.operationRef,
+              servingId: store.servingId,
+              host,
+              recorded,
+            });
+            if (refusals.length > 0 || input.expectDigest === undefined || host === null) {
+              return { applied: false, refusals, ...read };
+            }
+            if (input.expectDigest !== read.evidenceDigest) {
+              return { applied: false, refusals: ["evidence_changed"], ...read };
+            }
+            const signed = {
+              by: input.by,
+              reason: input.reason,
+              evidenceDigest: read.evidenceDigest,
+              evidence: read.evidence,
+              servingId: store.servingId,
+              host,
+            };
+            const { facts } = termination;
+            const applied = yield* store.recordHistoricalTermination({
+              reservationId: reservation.reservationId,
+              expected: reservation,
+              change:
+                input.action === "capture"
+                  ? {
+                      type: "capture",
+                      capture: {
+                        ...signed,
+                        operationRef: input.operationRef,
+                        executionDigest,
+                        covers: {
+                          attempts: facts.attempts.map((attempt) => attempt.attemptId),
+                          launches: facts.launches.map((launch) => ({
+                            runId: launch.runId,
+                            status: launch.status,
+                            attemptCount: launch.attempts,
+                          })),
+                          generations: facts.runs.flatMap((run) =>
+                            run.generations.map((generation) => generation.generationId),
+                          ),
+                        },
+                      },
+                    }
+                  : { type: "prove", proof: signed },
+            });
+            return applied
+              ? { applied: true, refusals: [], ...read }
+              : { applied: false, refusals: ["evidence_changed"], ...read };
+          }),
+        );
+        // Its custody may be quiet now: the next pass settles it like any other stage.
+        if (result.applied && input.action === "verify") {
+          yield* Queue.offer(wakes, { factoryId: input.factoryId, trigger: "owner_decision" });
+        }
+        return result;
+      },
+      (effect, input) =>
+        effect.pipe(
+          Effect.mapError(
+            (cause) =>
+              new FactoryLifecycleError({
+                operation: "historical-termination",
                 factoryId: input.factoryId,
                 cause,
               }),
