@@ -913,3 +913,98 @@ export const preparedCriteriaProblems = (input: {
   });
   return problems;
 };
+
+// No-edit verification units (factory-noedit/1): an exact existing commit, checked and reviewed,
+// changing no file.
+const Sha40 = Schema.String.check(Schema.isPattern(/^[0-9a-f]{40}$/));
+const NoEditText = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(2_000));
+
+/** What a no-edit unit is admitted to verify, exactly as the policy and Root adopted it. */
+export const NoEditRequirement = Schema.Struct({
+  schema: Schema.Literal("factory-noedit/1"),
+  candidate: Sha40,
+  base: Sha40,
+  ownedFiles: Schema.Array(Schema.String).check(Schema.isMaxLength(0)),
+  checks: Schema.Array(NoEditText).check(Schema.isMinLength(1), Schema.isMaxLength(50)),
+  execution: Schema.optional(NoEditText),
+  instructionRevision: NoEditText,
+  clauseBinding: NoEditText,
+}).check(
+  Schema.makeFilter((requirement) => requirement.candidate === requirement.base, {
+    expected: "a candidate that is its own base",
+  }),
+);
+export type NoEditRequirement = typeof NoEditRequirement.Type;
+
+/** The stage-basis suffix binding an admitted no-edit unit to its exact requirement. */
+export const noEditBasis = (requirement: NoEditRequirement) =>
+  `|ne:${sha256(canonical(requirement)).slice(0, 32)}`;
+
+const NoEditReceipt = Schema.Struct({
+  schema: Schema.Literal("factory-noedit-receipt/1"),
+  requirement: NoEditRequirement,
+  itemKey: Schema.String,
+  itemVersion: Schema.String,
+  results: Schema.Array(
+    Schema.Struct({
+      check: Schema.String,
+      exitCode: Schema.Int,
+      log: Schema.Struct({ path: Schema.String, sha256: Schema.String }),
+    }),
+  ),
+});
+const decodeNoEditReceipt = Schema.decodeUnknownOption(Schema.fromJsonString(NoEditReceipt));
+
+/**
+ * Why an implemented report does not prove the no-edit unit its stage was admitted for, or
+ * undefined. The receipt is read back from the report's own verified artifacts: it must name the
+ * admitted requirement exactly, its candidate must be both reported commits, and every required
+ * check must have passed with its log among the verified artifacts.
+ */
+export const noEditReceiptProblem = (input: {
+  readonly basis: string;
+  readonly itemKey: string;
+  readonly itemVersion: string;
+  readonly baseCommit: string;
+  readonly headCommit: string;
+  readonly artifacts: ReadonlyArray<{
+    readonly path: string;
+    readonly sha256: string;
+    readonly text: string | undefined;
+  }>;
+}): string | undefined => {
+  const receipts = input.artifacts.flatMap((artifact) => {
+    const receipt = artifact.text === undefined ? undefined : decodeNoEditReceipt(artifact.text);
+    return receipt === undefined || receipt._tag === "None" ? [] : [receipt.value];
+  });
+  if (receipts.length !== 1) return `the report lists ${receipts.length} no-edit receipts, not one`;
+  const receipt = receipts[0]!;
+  const { requirement } = receipt;
+  if (noEditBasis(requirement) !== input.basis) {
+    return "its receipt names another requirement than the one admitted";
+  }
+  if (input.baseCommit !== requirement.candidate || input.headCommit !== requirement.candidate) {
+    return `a no-edit unit reports base and head ${requirement.candidate}, unchanged`;
+  }
+  if (receipt.itemKey !== input.itemKey || receipt.itemVersion !== input.itemVersion) {
+    return "its receipt is for another item or item version";
+  }
+  const listed = new Set(
+    input.artifacts.map((artifact) => `${artifact.path}\n${artifact.sha256.toLowerCase()}`),
+  );
+  for (const check of requirement.checks) {
+    const results = receipt.results.filter((result) => result.check === check);
+    const [result] = results;
+    if (results.length !== 1 || result === undefined) {
+      return `check ${check} has ${results.length} results, not one`;
+    }
+    if (result.exitCode !== 0) return `check ${check} failed with exit code ${result.exitCode}`;
+    if (!listed.has(`${result.log.path}\n${result.log.sha256.toLowerCase()}`)) {
+      return `check ${check}'s log is not among the report's verified artifacts`;
+    }
+  }
+  if (receipt.results.length !== requirement.checks.length) {
+    return "its receipt reports checks the requirement does not name";
+  }
+  return undefined;
+};

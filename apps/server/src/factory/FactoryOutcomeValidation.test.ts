@@ -34,13 +34,13 @@ import type * as ProviderSessionManager from "../orchestration-v2/ProviderSessio
 import * as ProjectService from "../project/ProjectService.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
-import { parentAcceptance } from "./factoryCoordination.ts";
+import { type NoEditRequirement, noEditBasis, parentAcceptance } from "./factoryCoordination.ts";
 import type { FactoryCustody } from "./factoryCustody.ts";
 import type * as FactoryExecutionGenerations from "./FactoryExecutionGenerations.ts";
 import * as FactoryGitReadback from "./FactoryGitReadback.ts";
 import { encodeItemEvent } from "./factoryItemEvents.ts";
 import * as FactoryOutcomeStore from "./FactoryOutcomeStore.ts";
-import { makeFactoryOutcomes } from "./factoryOutcomes.ts";
+import { type FactoryOutcomeDependencies, makeFactoryOutcomes } from "./factoryOutcomes.ts";
 import type * as FactoryStore from "./FactoryStore.ts";
 
 const layerTest = FactoryOutcomeStore.layer.pipe(
@@ -168,6 +168,8 @@ const makeFixture = (
   options: {
     readonly reservation?: FactoryStore.FactoryReservation;
     readonly configuration?: FactoryStore.FactoryConfiguration;
+    readonly verifyEvidence?: FactoryOutcomeDependencies["verifyEvidence"];
+    readonly readArtifact?: FactoryOutcomeDependencies["readArtifact"];
   } = {},
 ) =>
   Effect.gen(function* () {
@@ -208,7 +210,8 @@ const makeFixture = (
       generations,
       custodyOf: () => Effect.sync(() => custody),
       settleThread: () => Effect.void,
-      verifyEvidence: () => Effect.undefined,
+      verifyEvidence: options.verifyEvidence ?? (() => Effect.undefined),
+      readArtifact: options.readArtifact ?? (() => Effect.undefined),
       onReported: () => Effect.void,
       ensureOperation: () => Effect.die("no tracker claim is configured"),
       getOperation: () => Effect.succeedNone,
@@ -765,5 +768,117 @@ it.effect("verifies a parent's criteria only as exact quotes of the text its tri
         ["subject_missing", "outcome_not_expected"],
       );
     }).pipe(Effect.provide(layerTest));
+  }),
+);
+
+it.effect("verifies a no-edit unit only by its exact receipt among the artifacts T3 verified", () =>
+  Effect.gen(function* () {
+    const requirement: NoEditRequirement = {
+      schema: "factory-noedit/1",
+      candidate: head,
+      base: head,
+      ownedFiles: [],
+      checks: ["vp test run src/a.test.ts", "vp run typecheck"],
+      instructionRevision: "e04d4b92",
+      clauseBinding: "parent 5 clause C05",
+    };
+    const reservation = { ...admitted, stageBasis: `implement:none${noEditBasis(requirement)}` };
+    const logOf = (check: string) => ({
+      path: `/artifacts/${check.length}.log`,
+      sha256: "a".repeat(64),
+    });
+    const receiptPath = "/artifacts/receipt.json";
+    const receipt = (change: Record<string, unknown> = {}) =>
+      JSON.stringify({
+        schema: "factory-noedit-receipt/1",
+        requirement,
+        itemKey: admitted.itemKey,
+        itemVersion: admitted.itemVersion,
+        results: requirement.checks.map((check) => ({ check, exitCode: 0, log: logOf(check) })),
+        ...change,
+      });
+    const cases: ReadonlyArray<{
+      readonly name: string;
+      readonly receipt?: string | undefined;
+      readonly verified?: boolean;
+      readonly baseCommit?: string;
+      readonly logs?: ReadonlyArray<{ readonly path: string; readonly sha256: string }>;
+      readonly expected: string;
+    }> = [
+      { name: "the exact receipt", receipt: receipt(), expected: "verified" },
+      {
+        name: "artifacts T3 could not verify",
+        receipt: receipt(),
+        verified: false,
+        expected: "a no-edit unit's artifacts are missing or unverified",
+      },
+      { name: "no receipt", receipt: undefined, expected: "the report lists 0 no-edit receipts" },
+      {
+        name: "a receipt for another requirement",
+        receipt: receipt({ requirement: { ...requirement, checks: ["vp run typecheck"] } }),
+        expected: "its receipt names another requirement",
+      },
+      {
+        name: "a failed check",
+        receipt: receipt({
+          results: requirement.checks.map((check, at) => ({
+            check,
+            exitCode: at,
+            log: logOf(check),
+          })),
+        }),
+        expected: "check vp run typecheck failed with exit code 1",
+      },
+      {
+        name: "a log T3 did not verify",
+        receipt: receipt(),
+        logs: [logOf(requirement.checks[0]!)],
+        expected: "check vp run typecheck's log is not among the report's verified artifacts",
+      },
+      {
+        name: "a changed head",
+        receipt: receipt(),
+        baseCommit: realBase,
+        expected: `a no-edit unit reports base and head ${head}, unchanged`,
+      },
+      {
+        name: "another item version",
+        receipt: receipt({ itemVersion: "version:0" }),
+        expected: "its receipt is for another item or item version",
+      },
+    ];
+    for (const row of cases) {
+      yield* Effect.gen(function* () {
+        const fixture = yield* makeFixture(btc131(), {
+          reservation,
+          verifyEvidence: () => Effect.succeed(row.verified === false ? undefined : "digest"),
+          readArtifact: (_root, path) =>
+            Effect.succeed(path === receiptPath ? row.receipt : undefined),
+        });
+        const { outcomeId } = yield* fixture.ops.report({
+          threadId,
+          report: {
+            outcome: "implemented",
+            summary: "Verified as it is.",
+            subject: {
+              repository: "example/connector",
+              baseCommit: row.baseCommit ?? head,
+              headCommit: head,
+            },
+            artifacts: [
+              { path: receiptPath, sha256: "b".repeat(64) },
+              ...(row.logs ?? requirement.checks.map(logOf)),
+            ],
+          },
+        });
+        yield* fixture.ops.reconcile(factoryId);
+        const outcome = Option.getOrThrow(yield* fixture.outcomes.get(outcomeId));
+        assert.include(
+          outcome.state === "rejected" ? outcome.rejection : outcome.state,
+          row.expected,
+          row.name,
+        );
+      }).pipe(Effect.provide(layerTest));
+    }
   }),
 );

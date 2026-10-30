@@ -17,6 +17,7 @@ import * as Schema from "effect/Schema";
 import * as ProcessRunner from "../processRunner.ts";
 import * as FactoryLifecycle from "./FactoryLifecycle.ts";
 import type { TrackerIssue } from "./factoryClaimPolicy.ts";
+import { NoEditRequirement } from "./factoryCoordination.ts";
 import { subjectOf } from "./factoryOutcomes.ts";
 import { expectedOutcomes, type FactoryStageType } from "./factoryStages.ts";
 
@@ -53,6 +54,11 @@ const PolicyDecision = Schema.Union([
      * rereads it and checks it against its own configuration and records before it admits.
      */
     verificationBinding: Schema.optional(PinnedFile),
+    /**
+     * An adopted no-edit unit: it verifies this exact existing commit with these scoped checks and
+     * changes no file. T3 admits it only at its candidate and accepts only its exact receipt.
+     */
+    noEdit: Schema.optional(NoEditRequirement),
   }),
   /**
    * Decomposition for an item at its first stage that has no unit spec yet: a worker proposes
@@ -549,6 +555,7 @@ export const layer = Layer.effect(
             ...(decision.verificationBinding === undefined
               ? {}
               : { verificationBinding: decision.verificationBinding }),
+            ...(decision.noEdit === undefined ? {} : { noEdit: decision.noEdit }),
             ...(decision.grant === undefined
               ? {}
               : {

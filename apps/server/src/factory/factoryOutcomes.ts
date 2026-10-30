@@ -28,7 +28,7 @@ import {
   owedWakes,
   preparationFailures,
 } from "./factoryCustody.ts";
-import { criteriaProposalProblems } from "./factoryCoordination.ts";
+import { criteriaProposalProblems, noEditReceiptProblem } from "./factoryCoordination.ts";
 import type * as FactoryExecutionGenerations from "./FactoryExecutionGenerations.ts";
 import type * as FactoryGitReadback from "./FactoryGitReadback.ts";
 import type * as FactoryOperationStore from "./FactoryOperationStore.ts";
@@ -152,6 +152,8 @@ export interface FactoryOutcomeDependencies {
     artifactRoot: string,
     artifacts: ReadonlyArray<{ readonly path: string; readonly sha256: string }>,
   ) => Effect.Effect<string | undefined>;
+  /** An artifact's text when it lies inside the artifact root, else undefined. */
+  readonly readArtifact: (artifactRoot: string, path: string) => Effect.Effect<string | undefined>;
   /** Asks for the pass that verifies a new report; a lost request leaves it for the next pass. */
   readonly onReported: (item: {
     readonly factoryId: FactoryId;
@@ -330,6 +332,29 @@ export const makeFactoryOutcomes = (deps: FactoryOutcomeDependencies) => {
           report.artifacts === undefined || report.artifacts.length === 0
             ? undefined
             : yield* deps.verifyEvidence(configuration.artifactRoot, report.artifacts);
+        // A no-edit unit proves itself only by its receipt among artifacts T3 verified.
+        const noEdit = /\|ne:[0-9a-f]{32}/.exec(basis)?.[0];
+        if (noEdit !== undefined) {
+          if (evidenceDigest === undefined) {
+            return { rejected: "a no-edit unit's artifacts are missing or unverified" } as const;
+          }
+          const artifacts = [];
+          for (const artifact of report.artifacts ?? []) {
+            artifacts.push({
+              ...artifact,
+              text: yield* deps.readArtifact(configuration.artifactRoot, artifact.path),
+            });
+          }
+          const problem = noEditReceiptProblem({
+            basis: noEdit,
+            itemKey: outcome.itemKey,
+            itemVersion: reservation.value.itemVersion,
+            baseCommit: base,
+            headCommit: head,
+            artifacts,
+          });
+          if (problem !== undefined) return { rejected: problem } as const;
+        }
         return { accepted: true, evidenceDigest } as const;
       }
       case "review_passed":

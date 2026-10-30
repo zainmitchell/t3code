@@ -141,6 +141,8 @@ import {
 } from "./factoryHistoricalTermination.ts";
 import {
   criterionToken,
+  type NoEditRequirement,
+  noEditBasis,
   outputRootName,
   parentAcceptance,
   type PinnedFile,
@@ -22172,6 +22174,56 @@ it.effect(
             itemKeyFor(7905),
             "triage",
           ]);
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "NoEdit/N1: a no-edit unit is admitted only at its candidate and bound to its exact requirement",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* configureLifecycleFactory;
+          const candidate = "c".repeat(40);
+          yield* recordCommit(candidate, [lifecycleBase]);
+          const requirement: NoEditRequirement = {
+            schema: "factory-noedit/1",
+            candidate,
+            base: candidate,
+            ownedFiles: [],
+            checks: ["vp test run src/a.test.ts"],
+            instructionRevision: "e04d4b92",
+            clauseBinding: "parent 5 clause C05",
+          };
+          const at = { baseRef: "main" };
+          yield* usePolicy((input) =>
+            Effect.map(stageRequest(input), (decision) =>
+              decision !== undefined && "taskKind" in decision
+                ? {
+                    ...decision,
+                    noEdit: requirement,
+                    workspaceStrategy: { type: "worktree" as const, baseRef: at.baseRef },
+                  }
+                : decision,
+            ),
+          );
+          yield* seedIssue(7906, {
+            body: "Verify the importer as landed.\n\n## Owned files\n\nNone\n",
+          });
+          // From another base it never starts, and says why.
+          assert.deepStrictEqual(admittedOnly(yield* advance("tracker_event", 1)), []);
+          assert.include(
+            (yield* recordOf(7906))?.detail ?? "",
+            `the no-edit unit would not start exactly at its candidate ${candidate}`,
+          );
+          at.baseRef = candidate;
+          const admission = admittedBy(yield* advance("clock", 1));
+          if (admission.reservation.origin !== "admitted") {
+            return assert.fail("expected an admitted no-edit unit");
+          }
+          assert.isTrue(admission.reservation.stageBasis?.endsWith(noEditBasis(requirement)));
         }),
       ),
     ),

@@ -112,6 +112,8 @@ import {
   landingOf,
   landingOrigin,
   namesPolicy,
+  type NoEditRequirement,
+  noEditBasis,
   outputRootName,
   parseJson,
   type PinnedFile,
@@ -352,6 +354,8 @@ export interface FactoryAdmissionRequest {
   readonly prepared?: string;
   /** The policy's pointer to the Root-adopted binding a bound verification runs under. */
   readonly verificationBinding?: PinnedFile;
+  /** An adopted no-edit unit: it verifies an exact existing commit and changes no file. */
+  readonly noEdit?: NoEditRequirement;
   /** The grant the lifecycle found for it; set by the lifecycle, spent in the admission commit. */
   readonly grant?: {
     readonly grantId: string;
@@ -2187,6 +2191,10 @@ const make = Effect.gen(function* () {
         .map((artifact) => [artifact.path, artifact.sha256.toLowerCase()] as const)
         .toSorted(([a], [b]) => a.localeCompare(b));
       return sha256(canonical(sorted));
+    }),
+    readArtifact: Effect.fnUntraced(function* (artifactRoot, artifactPath) {
+      if (!(yield* insideArtifactRoot(artifactRoot, artifactPath))) return undefined;
+      return Option.getOrUndefined(yield* fs.readFileString(artifactPath).pipe(Effect.option));
     }),
     settleThread: (reservation) =>
       orchestrator.dispatch({
@@ -4709,6 +4717,48 @@ const make = Effect.gen(function* () {
       }
       bound = checked;
     }
+    // A no-edit unit starts exactly at its candidate and is bound to its exact requirement.
+    let noEdit: { readonly basis: string; readonly note: string } | undefined;
+    if (decision.noEdit !== undefined) {
+      const requirement = decision.noEdit;
+      const workspace = decision.workspaceStrategy;
+      const refused =
+        stage.type !== "implement"
+          ? `a no-edit unit was proposed at the item's ${stage.type} stage`
+          : workspace?.type !== "worktree" ||
+              workspace.baseRef !== requirement.candidate ||
+              workspace.startFromOrigin === true
+            ? `the no-edit unit would not start exactly at its candidate ${requirement.candidate}`
+            : requirement.execution !== undefined && requirement.execution !== decision.execution
+              ? `the no-edit unit names execution ${requirement.execution}, not the one admitted`
+              : undefined;
+      if (refused !== undefined) {
+        return {
+          disposition: "nothing_proposed",
+          detail: waitText({
+            issue: subject.issueNumber,
+            what: refused,
+            actor: "project policy",
+            action:
+              "admit the no-edit unit at its candidate, at its first build, with its execution",
+            consequence: "the no-edit unit does not start",
+            resume: "an admission that matches its adopted requirement",
+          }),
+          reasonClass: "waiting",
+        };
+      }
+      noEdit = {
+        basis: noEditBasis(requirement),
+        note: [
+          `This is a no-edit unit: verify commit ${requirement.candidate} as it is and change no file.`,
+          "Run each required check exactly, writing each one's log under the artifact root:",
+          ...requirement.checks.map((check) => `- ${check}`),
+          `Then write a receipt JSON under ${configuration.artifactRoot}: {"schema":"factory-noedit-receipt/1","requirement":<the requirement below, exactly>,"itemKey":"${itemKey}","itemVersion":"${candidate.observation.itemVersion}","results":[{"check":<check>,"exitCode":<its exit code>,"log":{"path":<its log>,"sha256":<its sha256>}}]}.`,
+          `Report implemented with subject.baseCommit and subject.headCommit both ${requirement.candidate}, listing the receipt and every log in artifacts with their sha256.`,
+          `Requirement: ${canonical(requirement)}`,
+        ].join("\n"),
+      };
+    }
     let grant: FactoryAdmissionRequest["grant"];
     if (decision.requiresGrant !== undefined) {
       // A grant answers one exact binding: the same evidence text for another binding is another
@@ -4746,20 +4796,19 @@ const make = Effect.gen(function* () {
       };
     }
     // The binding and its output root are part of the decision: a changed one is another decision.
+    const notes = [bound?.note, noEdit?.note].filter((note) => note !== undefined);
+    const text = [decision.packet.text, ...notes].join("\n\n");
     const packet =
-      bound === undefined
-        ? decision.packet
-        : {
-            ...decision.packet,
-            text: `${decision.packet.text}\n\n${bound.note}`,
-            sha256: sha256(`${decision.packet.text}\n\n${bound.note}`),
-          };
+      notes.length === 0 ? decision.packet : { ...decision.packet, text, sha256: sha256(text) };
     const admission = yield* admit(
       isFactoryStage(decision.taskKind)
         ? {
             ...decision,
             packet,
-            stage: { type: stage.type, basis: `${stageBasis(stage)}${bound?.basis ?? ""}` },
+            stage: {
+              type: stage.type,
+              basis: `${stageBasis(stage)}${bound?.basis ?? ""}${noEdit?.basis ?? ""}`,
+            },
             ...(candidate.owner === undefined ? {} : { continues: candidate.owner.reservationId }),
             ...(grant === undefined ? {} : { grant }),
           }
