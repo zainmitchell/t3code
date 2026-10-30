@@ -482,10 +482,7 @@ export const parentAcceptance = (body: string) => {
     depth += lowered.split("<details").length - lowered.split("</details>").length;
     if (depth > 0 || lowered.includes("</details>")) {
       depth = Math.max(depth, 0);
-      if (current !== undefined) {
-        closeItem();
-        current = undefined;
-      }
+      if (current !== undefined) closeItem();
       continue;
     }
     const heading = HEADING.exec(line);

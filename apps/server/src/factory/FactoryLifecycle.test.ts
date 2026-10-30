@@ -13147,6 +13147,15 @@ it.effect(
           yield* advance("clock");
           yield* parentWaitsOn(7701, `clause E2 is missing: ${k3}`);
 
+          // A matching file alone does not prove T3 created it, even when its bytes match a preparation.
+          const ambiguous = path.join(criteriaRoot, `parent-7701-${current.sha256}.json`);
+          yield* fs.writeFileString(ambiguous, current.bytes);
+          yield* advance("clock");
+          yield* parentWaitsOn(
+            7701,
+            "the prepared closure does not carry #7701's adopted criteria",
+          );
+          yield* fs.remove(ambiguous);
           // E2's carrier lands: T3 keeps the exact bytes under the criteria root and closes once.
           state.ready = new Set([7701, 7703]);
           yield* landThroughT3(7703, "c0007703");
@@ -13214,10 +13223,13 @@ it.effect(
             clauses: [wholeParent],
           });
           yield* fs.makeDirectory(path.join(criteriaRoot, "adopted"));
-          yield* fs.writeFileString(path.join(criteriaRoot, "adopted", "7711.json"), adoptedText);
+          yield* fs.writeFileString(
+            path.join(criteriaRoot, "adopted", `parent-7711-${sha256(adoptedText)}.json`),
+            adoptedText,
+          );
           const adopted = {
             root: criteriaRoot,
-            path: "adopted/7711.json",
+            path: `adopted/parent-7711-${sha256(adoptedText)}.json`,
             sha256: sha256(adoptedText),
           };
           const state = {

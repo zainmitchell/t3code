@@ -289,6 +289,16 @@ describe("reconcileCriteria", () => {
   });
 });
 
+describe("acceptance with historical details", () => {
+  it("retains current items after nested historical details", () => {
+    const body =
+      "## Acceptance\n- A: ship safely\n\n<details><summary>Historical note</summary>\n<details>old</details>\n</details>\n\n- B: preserve required payment hold\n";
+    assert.deepStrictEqual(
+      parentAcceptance(body).items.map((item) => item.excerpt),
+      ["A: ship safely", "B: preserve required payment hold"],
+    );
+  });
+});
 describe("parent criteria preparation", () => {
   const sha = (text: string) => NodeCrypto.createHash("sha256").update(text).digest("hex");
   const b1 = "**B1:** the importer keeps one row per source line.";

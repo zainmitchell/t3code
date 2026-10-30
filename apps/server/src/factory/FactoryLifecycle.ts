@@ -3725,8 +3725,7 @@ const make = Effect.gen(function* () {
   });
 
   /**
-   * Every Root-adopted criteria document for `issue` under the criteria root, by real path. T3's
-   * own kept copies (`parent-<n>-<sha256>.json` with those bytes) are not adoptions.
+   * Every criteria document for `issue` under the criteria root, by real path.
    */
   const adoptedCriteriaOf = Effect.fnUntraced(function* (root: string, issue: number) {
     const listed = yield* fs.readDirectory(root, { recursive: true }).pipe(Effect.result);
@@ -3740,7 +3739,6 @@ const make = Effect.gen(function* () {
       );
       if (read._tag === "Failure") return { unread: `${entry}: ${read.failure.message}` };
       const { target, bytes } = read.success;
-      if (path.basename(entry) === `parent-${issue}-${sha256(bytes)}.json`) continue;
       const document = parseJson(new TextDecoder().decode(bytes));
       if (
         typeof document === "object" &&
