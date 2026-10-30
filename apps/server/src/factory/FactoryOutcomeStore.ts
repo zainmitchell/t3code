@@ -37,6 +37,7 @@ export const FactoryOutcomeReport = Schema.Struct({
     "integrated",
     "closed",
     "unit_proposed",
+    "criteria_proposed",
     "not_actionable",
     "ticket_opened",
   ]),

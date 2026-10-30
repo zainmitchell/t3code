@@ -1,6 +1,12 @@
 import * as Schema from "effect/Schema";
 
-import { PositiveInt, RunId, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import {
+  NonNegativeInt,
+  PositiveInt,
+  RunId,
+  ThreadId,
+  TrimmedNonEmptyString,
+} from "./baseSchemas.ts";
 import { FactoryId, FactoryItemKey, FactoryReservationId } from "./orchestrationV2.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 
@@ -32,6 +38,65 @@ export const FactoryUnitProposal = Schema.Struct({
 });
 export type FactoryUnitProposal = typeof FactoryUnitProposal.Type;
 
+const Sha256Hex = Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/));
+/** An exact slice of a text: Unicode code point offsets, end exclusive, and the slice itself. */
+const Quote = { start: NonNegativeInt, end: NonNegativeInt, excerpt: Bounded(8_000) };
+const isSpan = Schema.makeFilter(
+  (quote: { readonly start: number; readonly end: number; readonly excerpt: string }) =>
+    quote.end > quote.start && [...quote.excerpt].length === quote.end - quote.start,
+  { expected: "end after start, and an excerpt exactly end - start code points long" },
+);
+
+const FactoryCriteriaClause = Schema.Struct({
+  id: FactoryKey,
+  /** The acceptance list item, quoted exactly from the body the brief named. */
+  source: Schema.Struct({ ...Quote, sha256: Sha256Hex }).check(isSpan),
+  /** Each comment the item cites by complete receipt; sha256 is of the whole comment. */
+  comments: Schema.optional(
+    Schema.Array(
+      Schema.Struct({
+        id: Schema.String.check(Schema.isPattern(/^[0-9]{1,20}$/)),
+        ...Quote,
+        sha256: Sha256Hex,
+      }).check(isSpan),
+    ).check(Schema.isMaxLength(20)),
+  ),
+  /** Only ever stricter: reserves the clause for the person who must settle it. */
+  needs: Schema.optional(
+    Schema.Struct({
+      kind: Schema.Literals(["product_meaning", "qualification"]),
+      what: TrimmedNonEmptyString.check(Schema.isMaxLength(300)),
+    }),
+  ),
+});
+
+const quotedLength = (clauses: ReadonlyArray<typeof FactoryCriteriaClause.Type>) =>
+  clauses.reduce(
+    (total, clause) =>
+      total +
+      clause.source.excerpt.length +
+      (clause.comments ?? []).reduce((sum, comment) => sum + comment.excerpt.length, 0),
+    0,
+  );
+
+/**
+ * A parent triage's proposal: one clause per acceptance list item of the exact body the brief
+ * named. Untrusted: T3 checks every quote against its own read, and nothing here is evidence.
+ */
+export const FactoryCriteriaProposal = Schema.Struct({
+  schema: Schema.Literal("factory-parent-criteria-proposal/1"),
+  issue: PositiveInt,
+  basis: Schema.Struct({ bodySha256: Sha256Hex, itemVersion: FactoryKey }),
+  clauses: Schema.Array(FactoryCriteriaClause).check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(200),
+    Schema.makeFilter((clauses) => quotedLength(clauses) <= 65_536, {
+      expected: "at most 65536 quoted characters in all",
+    }),
+  ),
+});
+export type FactoryCriteriaProposal = typeof FactoryCriteriaProposal.Type;
+
 export const FactoryReportInput = Schema.Struct({
   outcome: Schema.Literals([
     "implemented",
@@ -40,10 +105,13 @@ export const FactoryReportInput = Schema.Struct({
     "review_failed",
     "correction_spec",
     "unit_proposed",
+    "criteria_proposed",
     "not_actionable",
   ]),
   /** A triage stage's proposed unit; required with `unit_proposed`. */
   proposal: Schema.optional(FactoryUnitProposal),
+  /** A parent triage's proposed criteria; required with `criteria_proposed`. */
+  criteria: Schema.optional(FactoryCriteriaProposal),
   /** What the work produced or examined. A review names the exact head it reviewed. */
   subject: Schema.optional(
     Schema.Struct({

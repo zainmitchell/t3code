@@ -11,6 +11,7 @@ const OutcomeKind = Schema.Literals([
   "integrated",
   "closed",
   "unit_proposed",
+  "criteria_proposed",
   "not_actionable",
   "ticket_opened",
 ]);
