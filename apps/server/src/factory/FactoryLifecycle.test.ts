@@ -22430,6 +22430,20 @@ it.effect(
             [["pending", undefined]],
           );
           assert.strictEqual((yield* commentsWith(7953, "t3-factory-decision")).length, 1);
+          // Its id is the published gate identity of the question the policy named.
+          assert.strictEqual(
+            cards[0]!.decisionId,
+            sha256(
+              [
+                factoryId,
+                itemKeyFor(7953),
+                "implement",
+                "gate",
+                `question:settlement-currency:${itemKeyFor(7953)}`,
+                "0",
+              ].join("\n"),
+            ).slice(0, 40),
+          );
           assert.deepStrictEqual(yield* itemHistory(7953), ["triage", "not_actionable"]);
           // The permission stays a person's: no further work, no question answered for them.
           assert.deepStrictEqual(yield* itemHistory(7952), ["triage", "not_actionable"]);
