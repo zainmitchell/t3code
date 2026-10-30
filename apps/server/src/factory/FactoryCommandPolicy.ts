@@ -110,6 +110,11 @@ const PolicyDecision = Schema.Union([
     reason: Bounded(2_000),
     /** The exact evidence the owner decides on; changed evidence is another decision. */
     evidence: Bounded(200_000),
+    /**
+     * The question's stable identity, when the policy names one: then reworded evidence is the
+     * same decision, and a question withdrawn or answered is not asked again under it.
+     */
+    question: Schema.optional(Bounded(200)),
   }),
   Schema.Struct({
     decision: Schema.Literal("none"),
@@ -509,6 +514,7 @@ export const layer = Layer.effect(
             type: "reserve",
             reason: decision.reason,
             evidenceDigest: sha256(decision.evidence),
+            ...(decision.question === undefined ? {} : { question: decision.question }),
           };
           return reservation;
         }

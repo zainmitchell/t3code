@@ -674,6 +674,14 @@ it("Policy answer: a parent closure names adopted or prepared criteria as its po
   const decided: unknown = Option.getOrThrow(decode(answer({ prepared }))).decisions[0]!.decision;
   assert.deepStrictEqual(decided, { decision: "proceed", parentClosure: { prepared } });
   assert.isTrue(Option.isSome(decode(answer({ criteria: pinned }))));
+  // A reservation may name its question; the name is bounded like other identities.
+  const reserve = (question: string) => ({
+    decisions: [
+      { itemKey, decision: { decision: "reserve", reason: "r", evidence: "e", question } },
+    ],
+  });
+  assert.isTrue(Option.isSome(decode(reserve("retention-period"))));
+  assert.isTrue(Option.isNone(decode(reserve("q".repeat(201)))));
   assert.isTrue(
     Option.isNone(decode(answer({ prepared: { ...prepared, bytes: "x".repeat(1_000_001) } }))),
   );

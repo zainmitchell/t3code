@@ -176,6 +176,19 @@ const isPolicyFailure = (
 ): proposal is FactoryPolicyFailure =>
   !Array.isArray(proposal) && "type" in proposal && proposal.type === "policy_failed";
 
+/** The identity of an owner gate the policy names by its question rather than its evidence. */
+const gateDecisionId = (input: {
+  readonly factoryId: string;
+  readonly itemKey: string;
+  readonly stage: string;
+  readonly question: string;
+}) =>
+  sha256(
+    [input.factoryId, input.itemKey, input.stage, "gate", `question:${input.question}`, "0"].join(
+      "\n",
+    ),
+  ).slice(0, 40);
+
 /**
  * Why a pending owner decision no longer stands once a pass decided its item on fresh facts: the
  * item moved to another stage, or the policy now asks about other evidence or not at all. A pass
@@ -192,6 +205,13 @@ const overtakenBy = (
   }
   // A parent closure waiting on its owner's answer still asks that question.
   if (isProceed(decision) && decision.parentClosure?.ownerDecisionId === pending.decisionId) {
+    return undefined;
+  }
+  if (
+    isReservationRequest(decision) &&
+    decision.question !== undefined &&
+    pending.decisionId === gateDecisionId({ ...pending, question: decision.question })
+  ) {
     return undefined;
   }
   const asks = isReservationRequest(decision)
@@ -642,6 +662,11 @@ export interface FactoryReservation {
   readonly type: "reserve";
   readonly reason: string;
   readonly evidenceDigest: string;
+  /**
+   * The question's own identity, when the policy names one: the same question on reworded
+   * evidence is still that one decision, and once withdrawn or answered it is not asked again.
+   */
+  readonly question?: string | undefined;
 }
 
 /**
@@ -1776,12 +1801,20 @@ const isGrantAnswer = (answer: string) =>
   ["grant", "approve"].includes(answer.trim().toLowerCase());
 
 /** Same item, task kind, policy and evidence is the same decision, whoever triggers it. */
+/**
+ * The policy a preparation is decided under: its revision without a trailing configuration pin,
+ * so a configuration change alone never makes the same item's preparation another decision.
+ */
+export const policyIdentityOf = (policyRevision: string) =>
+  /^(.+:[0-9a-f]{16}):[0-9a-f]{16}$/.exec(policyRevision)?.[1] ?? policyRevision;
+
 export const decisionKeyOf = (
   input: Pick<
     FactoryAdmissionRequest,
     "factoryId" | "itemKey" | "taskKind" | "policyRevision" | "stage"
   >,
   observation: FactoryStore.ItemObservation,
+  options: { readonly exactPolicy?: boolean } = {},
 ) =>
   makeDecisionKey(
     sha256(
@@ -1789,7 +1822,9 @@ export const decisionKeyOf = (
         input.factoryId,
         input.itemKey,
         input.taskKind,
-        input.policyRevision,
+        input.taskKind === "triage" && options.exactPolicy !== true
+          ? policyIdentityOf(input.policyRevision)
+          : input.policyRevision,
         FactoryStore.canonicalEvidence(observation.evidence),
         // A stage decision is also its exact basis: the same review of another head differs.
         ...(input.stage === undefined ? [] : [input.stage.basis]),
@@ -1809,21 +1844,28 @@ const triageDecisionOf = (
   outcomes: ReadonlyArray<FactoryPolicyOutcome>,
   readback?: string,
 ) => {
-  const keyOf = (basis: string) =>
-    decisionKeyOf({ ...input, taskKind: "triage", stage: { type: "triage", basis } }, observation);
+  const keyOf = (basis: string, exactPolicy = false) =>
+    decisionKeyOf({ ...input, taskKind: "triage", stage: { type: "triage", basis } }, observation, {
+      exactPolicy,
+    });
   const first = triageBasis(observation.itemVersion);
   const firstKey = keyOf(first);
+  // Preparations recorded while keys still named the configuration pin count as this one.
+  const firstKeys = new Set([firstKey, keyOf(first, true)]);
   const failed = outcomes.findLast(
     (outcome) =>
       outcome.stage === "triage" &&
-      outcome.decisionKey === firstKey &&
+      outcome.decisionKey !== undefined &&
+      firstKeys.has(outcome.decisionKey) &&
       outcome.state === "verified" &&
       outcome.report.outcome === "failed" &&
       outcome.failureDigest !== undefined,
   );
-  if (failed?.failureDigest === undefined) return { basis: first, key: firstKey };
+  if (failed?.failureDigest === undefined) {
+    return { basis: first, key: firstKey, exactKey: keyOf(first, true) };
+  }
   const basis = triageBasis(observation.itemVersion, failed.failureDigest, readback);
-  return { basis, key: keyOf(basis), failed };
+  return { basis, key: keyOf(basis), exactKey: keyOf(basis, true), failed };
 };
 
 const make = Effect.gen(function* () {
@@ -3857,7 +3899,7 @@ const make = Effect.gen(function* () {
     const current = yield* triageDecisionFor(configuration, candidate, outcomes);
     if (current === undefined) return prepare(`${outcomeId}'s preparation cannot be read back now`);
     if ("unread" in current) return current.unread;
-    if (outcome.decisionKey !== current.key) {
+    if (outcome.decisionKey !== current.key && outcome.decisionKey !== current.exactKey) {
       return prepare(
         `${outcomeId} was prepared on other inputs than the item's current text, evidence and policy`,
       );
@@ -4091,7 +4133,9 @@ const make = Effect.gen(function* () {
           outcome.report.outcome === "criteria_proposed" &&
           outcome.report.criteria?.basis.itemVersion === candidate.observation.itemVersion &&
           outcome.report.criteria.basis.bodySha256 === bodySha256 &&
-          outcome.policyRevision === configuration.policyRevision,
+          outcome.policyRevision !== undefined &&
+          policyIdentityOf(outcome.policyRevision) ===
+            policyIdentityOf(configuration.policyRevision),
       );
       const proposal = proposalOutcome?.report.criteria;
       if (proposal === undefined || proposalOutcome === undefined) {
@@ -4306,6 +4350,7 @@ const make = Effect.gen(function* () {
       kind: "gate" | "grant",
       reason: string,
       evidenceDigest: string,
+      question?: string,
     ) {
       // A grant request after an earlier grant for the same subject was spent or revoked is a new
       // request, not the one the owner already answered.
@@ -4321,10 +4366,14 @@ const make = Effect.gen(function* () {
             ).length
           : 0;
       const reservedDecision = yield* outcomeStore.reserveDecision({
-        // Its exact evidence identifies it: the same question reworded is not asked again.
-        decisionId: sha256(
-          [factoryId, itemKey, stage.type, kind, evidenceDigest, String(issued)].join("\n"),
-        ).slice(0, 40),
+        // Its exact evidence identifies it, or the question the policy names: the same question
+        // reworded is not asked again.
+        decisionId:
+          question !== undefined && kind === "gate"
+            ? gateDecisionId({ factoryId, itemKey, stage: stage.type, question })
+            : sha256(
+                [factoryId, itemKey, stage.type, kind, evidenceDigest, String(issued)].join("\n"),
+              ).slice(0, 40),
         factoryId,
         itemKey,
         stage: stage.type,
@@ -4337,7 +4386,7 @@ const make = Effect.gen(function* () {
       }
     });
     if (isReservationRequest(decision)) {
-      yield* reserve("gate", decision.reason, decision.evidenceDigest);
+      yield* reserve("gate", decision.reason, decision.evidenceDigest, decision.question);
       return { disposition: "reserved_decision" };
     }
     if (isGateFailure(decision)) {
@@ -4427,7 +4476,9 @@ const make = Effect.gen(function* () {
           outcome.state === "verified" &&
           outcome.report.outcome === "criteria_proposed" &&
           outcome.report.criteria?.basis.itemVersion === candidate.observation.itemVersion &&
-          outcome.policyRevision === configuration.policyRevision,
+          outcome.policyRevision !== undefined &&
+          policyIdentityOf(outcome.policyRevision) ===
+            policyIdentityOf(configuration.policyRevision),
       );
       if (
         (candidate.issue.subIssueCount ?? 0) > 0 &&

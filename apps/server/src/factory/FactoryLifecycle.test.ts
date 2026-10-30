@@ -18037,6 +18037,60 @@ it.effect(
     ),
 );
 
+it.effect(
+  "Gates/Q1: a question the policy names is one decision across rewording, and once withdrawn is never asked again",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* configureLifecycleFactory;
+          yield* seedIssue(7895);
+          const ask = (evidence: string, question = "retention-period") =>
+            usePolicy(() =>
+              Effect.succeed({
+                type: "reserve" as const,
+                reason: `Which retention period applies? (${evidence})`,
+                evidenceDigest: sha256(evidence),
+                question,
+              }),
+            );
+          const cards = Effect.map(commentsWith(7895, "t3-factory-decision"), (all) => all.length);
+          yield* ask("first wording");
+          yield* advance("tracker_event", 2);
+          const [first] = yield* decisionsOf(7895);
+          assert.strictEqual(first?.state, "pending");
+          assert.strictEqual(yield* cards, 1);
+          // The policy rewords its evidence, as after a configuration repair: still that decision.
+          yield* ask("reworded after a configuration repair");
+          yield* advance("clock", 2);
+          assert.deepStrictEqual(yield* decisionsOf(7895), [first]);
+          assert.strictEqual(yield* cards, 1);
+          // The owner deferred it, so the policy withdraws it exactly.
+          yield* usePolicy((input) =>
+            Effect.succeed(heldWithdrawing(withdrawalFor(input, input.reserved[0]!))),
+          );
+          yield* advance("clock", 2);
+          const [withdrawn] = yield* decisionsOf(7895);
+          assert.strictEqual(withdrawn?.state, "superseded");
+          // Asked again under the same question, however worded, it is not asked again.
+          yield* ask("a third wording");
+          for (const trigger of ["clock", "restart"] as const) yield* advance(trigger, 2);
+          assert.deepStrictEqual(yield* decisionsOf(7895), [withdrawn]);
+          assert.strictEqual(yield* cards, 1);
+          // Another question is another decision.
+          yield* ask("a third wording", "archive-location");
+          yield* advance("clock", 2);
+          const decisions = yield* decisionsOf(7895);
+          assert.deepStrictEqual(
+            decisions.map((decision) => decision.state),
+            ["superseded", "pending"],
+          );
+          assert.strictEqual(yield* cards, 2);
+        }),
+      ),
+    ),
+);
+
 const legacyJob = "alpha_supervised";
 const legacyTask = ScheduledTaskId.make(
   "scheduled-task:command:mcp:45f4b96b:schedule-task:alpha-native-supervised-probe",
@@ -22002,6 +22056,43 @@ it.effect(
           assert.deepStrictEqual(stageOf(second), [item, "triage"]);
           assert.notStrictEqual(admittedVersion(second), admittedVersion(triage));
           assert.strictEqual((yield* claimComments(7902)).length, 1);
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Decompose/F4: a configuration-only change never re-keys a preparation; a new policy script does",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const revision = (script: string, pin: string) =>
+            `test-policy:${script.repeat(16)}:${pin.repeat(16)}`;
+          yield* configureLifecycleFactory;
+          yield* configureFactory(lifecycleConfiguration({ policyRevision: revision("a", "1") }));
+          yield* usePolicy(triageRequest);
+          yield* seedIssue(7905, { body: "Make the importer resumable." });
+          const triage = admittedBy(yield* advance("tracker_event", 1));
+          yield* workStage(triage, {
+            outcome: "not_actionable",
+            summary: "No bounded unit.",
+            failure: "decision: resume from the last row or the last file.",
+          });
+          assert.deepStrictEqual(admittedOnly(yield* advance("outcome", 3)), []);
+          // Root repairs requirements only: the configuration pin changes, the script does not.
+          yield* configureFactory(lifecycleConfiguration({ policyRevision: revision("a", "2") }));
+          assert.deepStrictEqual(admittedOnly(yield* advance("clock", 3)), []);
+          assert.strictEqual(
+            (yield* itemHistory(7905)).filter((entry) => entry === "triage").length,
+            1,
+          );
+          // A new policy script is a new preparation decision.
+          yield* configureFactory(lifecycleConfiguration({ policyRevision: revision("b", "2") }));
+          assert.deepStrictEqual(stageOf(admittedBy(yield* advance("clock"))), [
+            itemKeyFor(7905),
+            "triage",
+          ]);
         }),
       ),
     ),
