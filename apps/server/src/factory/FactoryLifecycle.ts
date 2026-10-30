@@ -996,7 +996,7 @@ export const decisionKeyOf = (
  * failure now (`readback`: its candidate base and the item's blockers). The retry runs once on that
  * readback; a failed retry is decided again only when the readback changes or new inputs arrive.
  */
-export const triageDecisionOf = (
+const triageDecisionOf = (
   input: Pick<FactoryAdmissionRequest, "factoryId" | "itemKey" | "policyRevision">,
   observation: FactoryStore.ItemObservation,
   outcomes: ReadonlyArray<FactoryPolicyOutcome>,
