@@ -124,7 +124,7 @@ export const pullRequestStep = (
         actor: "GitHub",
         action: `show ${name} at ${reviewedHead}, which its branch was published at`,
         resume: `${name} reads at ${reviewedHead}; checks and approvals of another head never count`,
-        facts,
+        facts: ["head_not_reviewed", ...facts],
       }),
     };
   }
@@ -136,7 +136,7 @@ export const pullRequestStep = (
         actor: "the pull request's author",
         action: `mark ${name} ready for review`,
         resume: `${name} is no longer a draft`,
-        facts,
+        facts: ["draft", ...facts],
       }),
     };
   }
@@ -162,9 +162,9 @@ export const pullRequestStep = (
           reason: `${name} awaits checks: ${checks.pending.join(", ")}`,
           wait: dependency({
             actor: "the required checks",
-            action: `finish ${checks.pending.join(", ")} on ${reviewedHead}`,
+            action: `finish ${checks.pending.length} ${checks.pending.length === 1 ? "check" : "checks"} on ${reviewedHead}: ${checks.pending.join(", ")}`,
             resume: `the checks on ${reviewedHead} finish; a failure goes back to the work`,
-            facts: [...facts, ...checks.pending.toSorted()],
+            facts: ["checks_pending", ...facts, ...checks.pending.toSorted()],
           }),
         };
       }
@@ -179,7 +179,7 @@ export const pullRequestStep = (
           actor: "the repository's required reviewers",
           action: `approve ${name} at ${reviewedHead} or resolve its required conversations`,
           resume: `GitHub's protection lets ${name} merge at ${reviewedHead}; changes requested on it go back to the work`,
-          facts,
+          facts: ["review_required", ...facts],
         }),
       };
     default:
@@ -190,7 +190,7 @@ export const pullRequestStep = (
           actor: "GitHub",
           action: `decide whether ${name} can merge at ${reviewedHead}`,
           resume: `GitHub reports a merge state for ${name}`,
-          facts,
+          facts: ["merge_state_unknown", ...facts],
         }),
       };
   }
@@ -285,7 +285,7 @@ export const attemptPullRequestMerge = Effect.fnUntraced(function* (
   if (intent.marker.startsWith(ACKNOWLEDGEMENT_MARKER)) {
     return Option.getOrElse(yield* inBase, () => ({
       state: "waiting" as const,
-      reason: `${intent.base} on ${intent.remote} does not contain the reviewed head ${intent.reviewedHead}; nothing was published`,
+      reason: `${intent.base} on ${redact(intent.remote)} does not contain the reviewed head ${intent.reviewedHead}; nothing was published`,
       wait: dependency({
         actor: `the maintainers of ${intent.base} on ${intent.remote}`,
         action: `land ${intent.reviewedHead} on ${intent.base}; this attempt only acknowledges it`,
@@ -306,12 +306,12 @@ export const attemptPullRequestMerge = Effect.fnUntraced(function* (
     if (tip === null) {
       return {
         state: "waiting",
-        reason: `integration target ${intent.base} does not exist on ${intent.remote}; nothing was published`,
+        reason: `integration target ${intent.base} does not exist on ${redact(intent.remote)}; nothing was published`,
         wait: dependency({
           actor: `the owner of ${repository}`,
           action: `create ${intent.base} on ${intent.remote}, or configure an integration branch that exists`,
           resume: `${intent.base} exists on ${intent.remote}`,
-          facts: ["base_missing", intent.base],
+          facts: ["base_missing", intent.remote, intent.base],
         }),
       };
     }
@@ -332,12 +332,18 @@ export const attemptPullRequestMerge = Effect.fnUntraced(function* (
     if (published.type === "refused") {
       return {
         state: "waiting",
-        reason: `${intent.remote} refused the push of ${intent.reviewedHead} to ${intent.head}, which still holds ${published.tip ?? "nothing"}: ${redact(published.detail)}`,
+        reason: `${redact(intent.remote)} refused the push of ${intent.reviewedHead} to ${intent.head}, which still holds ${published.tip ?? "nothing"}: ${redact(published.detail)}`,
         wait: dependency({
           actor: `whoever controls push access to ${intent.head} on ${intent.remote}`,
           action: `let this account create or fast-forward ${intent.head}, or lift the rule that refused it`,
           resume: `${intent.remote} accepts the push; each attempt reads ${intent.head} first and never forces it`,
-          facts: ["publish_refused", intent.head, published.tip ?? "", intent.reviewedHead],
+          facts: [
+            "publish_refused",
+            intent.remote,
+            intent.head,
+            published.tip ?? "",
+            intent.reviewedHead,
+          ],
         }),
       };
     }

@@ -14,7 +14,7 @@ import {
   type PullRequestFacts,
   type PullRequestStep,
 } from "./factoryPullRequests.ts";
-import { waitBasis } from "./factoryOperationWait.ts";
+import { renderWait, waitBasis } from "./factoryOperationWait.ts";
 import type * as FactoryTracker from "./FactoryTracker.ts";
 
 const reviewed = "c0000002";
@@ -121,7 +121,63 @@ it("PR integration: a wait's basis is the facts it stands on, never their order 
     basis(pullRequestStep({ ...blocked, headSha: "c0000003" }, "c0000003", noChecks)),
     approvals,
   );
+  // A draft made ready at the same head and merge state now waits on someone else.
+  const draft = basis(pullRequestStep({ ...blocked, draft: true }, reviewed, noChecks));
+  assert.notStrictEqual(draft, approvals);
+  assert.strictEqual(
+    basis(pullRequestStep({ ...blocked, draft: true }, reviewed, noChecks)),
+    draft,
+  );
 });
+
+it("PR integration: a long list of checks never pushes who acts or the resume out of view", () => {
+  const head = "a".repeat(40);
+  const pending = Array.from({ length: 8 }, (_, i) => `required-ci-build-linux-x86_64-${i}`);
+  const step = pullRequestStep(
+    open({ number: 143, headSha: head, mergeableState: "blocked" }),
+    head,
+    { pending, failed: [] },
+  );
+  assert.strictEqual(step.type, "wait");
+  if (step.type !== "wait") return;
+  // FactoryLifecycle shows the first 500 characters of a waiting operation.
+  const shown = renderWait(step.reason, step.wait).slice(0, 500);
+  assert.include(shown, "who acts: the required checks");
+  assert.match(shown, new RegExp(`action: finish 8 checks on ${head}`));
+  assert.match(shown, new RegExp(`resumes when: the checks on ${head} finish`));
+});
+
+const credentialRemote = "https://x-access-token:SYNTHETIC_ONLY@example.invalid/repo.git";
+
+it.effect(
+  "PR integration: a credential in the remote's URL never reaches a recorded or shown wait",
+  () =>
+    Effect.gen(function* () {
+      for (const tip of [null, "b".repeat(40)]) {
+        const session = {
+          findPullRequest: () => Effect.succeedNone,
+        } as unknown as FactoryTracker.TrackerSession;
+        const integrator = {
+          landed: () => Effect.succeedNone,
+          tip: () => Effect.succeed(tip),
+          publish: () =>
+            Effect.succeed({ type: "refused" as const, tip: null, detail: "remote: forbidden" }),
+        } as unknown as FactoryIntegrator.FactoryIntegratorShape;
+        const completion = yield* attemptPullRequestMerge(session, integrator, {
+          cwd: "/unused",
+          intent: { ...intent("a".repeat(40)), remote: credentialRemote },
+        });
+        assert.strictEqual(completion.state, "waiting");
+        if (completion.state !== "waiting") return;
+        const recorded = JSON.stringify(completion);
+        const shown = renderWait(completion.reason, completion.wait);
+        for (const text of [recorded, shown]) {
+          assert.notInclude(text, "SYNTHETIC_ONLY");
+          assert.include(text, "https://***@example.invalid/repo.git");
+        }
+      }
+    }),
+);
 
 it("PR integration: only the reviewed head merged by its pull request counts as landed", () => {
   assert.deepStrictEqual(
