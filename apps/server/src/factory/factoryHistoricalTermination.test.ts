@@ -1,9 +1,12 @@
 import { assert, describe, it } from "@effect/vitest";
+import * as Option from "effect/Option";
 
 import {
   bootBoundaryRefusals,
   coveredAttempts,
+  decodeHistoricalProvenance,
   type HostBoot,
+  provedCoverage,
   registryValue,
   type TerminationCoverage,
 } from "./factoryHistoricalTermination.ts";
@@ -115,6 +118,44 @@ describe("coveredAttempts", () => {
     ],
   ])("covers nothing after %s", (_name, current) => {
     assert.strictEqual(coveredAttempts(covers, current).size, 0);
+  });
+});
+
+describe("provedCoverage", () => {
+  const bound = { covers, provenance: { digest: "d", source: "synthetic" } };
+  it("covers only a proof whose capture bound retained provenance", () => {
+    assert.strictEqual(provedCoverage({ capture: bound, proof: {} }), covers);
+    // Unproved, or proved by a build that bound no provenance (R1): nothing is covered.
+    assert.strictEqual(provedCoverage({ capture: bound }), undefined);
+    assert.strictEqual(provedCoverage({ capture: { covers }, proof: {} }), undefined);
+    assert.strictEqual(provedCoverage(undefined), undefined);
+  });
+});
+
+describe("decodeHistoricalProvenance", () => {
+  const valid = {
+    reservationId: "reservation:1",
+    operationRef: "restart:1",
+    source: "synthetic",
+    host: { platform: "win32", machineId: "machine-a" },
+    runs: ["run:1"],
+    attempts: ["attempt:1"],
+    launches: [{ runId: "run:1", status: "succeeded", attemptCount: 1 }],
+    providerSessions: [],
+    executors: [{ kind: "local_process", machineId: "machine-a" }],
+  };
+  it("decodes only a complete record; anything else is not provenance", () => {
+    assert.isTrue(Option.isSome(decodeHistoricalProvenance(valid)));
+    for (const value of [
+      null,
+      "restart:1",
+      JSON.stringify(valid),
+      { ...valid, executors: undefined },
+      { ...valid, host: { platform: "darwin", machineId: "machine-a" } },
+      { ...valid, executors: [{ kind: "container", machineId: "machine-a" }] },
+    ]) {
+      assert.isTrue(Option.isNone(decodeHistoricalProvenance(value)));
+    }
   });
 });
 

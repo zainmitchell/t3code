@@ -132,6 +132,8 @@ import * as FactoryRunPreparation from "./FactoryRunPreparation.ts";
 import * as FactoryStore from "./FactoryStore.ts";
 import * as FactoryExecutionGenerations from "./FactoryExecutionGenerations.ts";
 import {
+  type HistoricalProvenance,
+  HistoricalProvenanceSource,
   type HostBoot,
   HostBootReader,
   HostBootUnreadable,
@@ -11278,31 +11280,90 @@ const beforeRestart = hostBoot("20", 276_517_000);
 const afterRestart = hostBoot("21", 120_000);
 const operationRef = "restart:historical-recovery";
 
+/**
+ * TEST-ONLY trusted provenance: what a producer would have retained for this execution, read from
+ * its own records, on the test host, with one local executor. Synthetic; it stands for no real
+ * reservation. `change` alters it the way a foreign, delegated or incomplete record would.
+ */
+const syntheticProvenance = (
+  reservationId: FactoryReservationId,
+  change: Partial<HistoricalProvenance>,
+) =>
+  Effect.gen(function* () {
+    const found = yield* (yield* FactoryStore.FactoryStore).getReservation(reservationId);
+    if (Option.isNone(found) || found.value.origin !== "admitted") return Option.none();
+    const { threadId } = found.value.execution;
+    const projection = yield* (yield* ProjectionStore.ProjectionStoreV2).getThreadProjection(
+      threadId,
+    );
+    const launches = (yield* (yield* EffectOutbox.EffectOutboxV2).listLaunchesForThread(
+      threadId,
+    )).flatMap((effect) =>
+      effect.request.type === "provider-turn.start" ||
+      effect.request.type === "provider-turn.restart"
+        ? [
+            {
+              runId: effect.request.runId,
+              status: effect.status,
+              attemptCount: effect.attemptCount,
+            },
+          ]
+        : [],
+    );
+    const provenance: HistoricalProvenance = {
+      reservationId,
+      operationRef,
+      source: "synthetic-test-producer",
+      host: { platform: "win32", machineId: "machine:test-host" },
+      runs: projection.runs.map((run) => run.id),
+      attempts: projection.attempts.map((attempt) => attempt.id),
+      launches,
+      providerSessions: projection.providerThreads.flatMap((providerThread) =>
+        providerThread.providerSessionId === null ? [] : [providerThread.providerSessionId],
+      ),
+      executors: [{ kind: "local_process", machineId: "machine:test-host" }],
+      ...change,
+    };
+    return Option.some<unknown>(provenance);
+  });
+
 const terminate = (
   reservationId: FactoryReservationId,
   action: "capture" | "verify",
   host: HostBoot | null,
   expectDigest?: string,
   ref = operationRef,
+  // "none": the production source, which retained nothing.
+  retained: "none" | Partial<HistoricalProvenance> = {},
 ) =>
-  Effect.flatMap(FactoryLifecycle.FactoryLifecycle, (factory) =>
-    factory.historicalTermination({
-      factoryId,
-      reservationId,
-      action,
-      operationRef: ref,
-      by: "owner",
-      reason: "planned full host restart",
-      ...(expectDigest === undefined ? {} : { expectDigest }),
-    }),
-  ).pipe(
-    Effect.provideService(HostBootReader, {
-      read:
-        host === null
-          ? Effect.fail(new HostBootUnreadable({ reason: "registry unreadable" }))
-          : Effect.succeed(host),
-    }),
-  );
+  Effect.gen(function* () {
+    const provenance =
+      retained === "none" ? Option.none() : yield* syntheticProvenance(reservationId, retained);
+    return yield* Effect.flatMap(FactoryLifecycle.FactoryLifecycle, (factory) =>
+      factory.historicalTermination({
+        factoryId,
+        reservationId,
+        action,
+        operationRef: ref,
+        by: "owner",
+        reason: "planned full host restart",
+        ...(expectDigest === undefined ? {} : { expectDigest }),
+      }),
+    ).pipe(
+      Effect.provideService(HostBootReader, {
+        read:
+          host === null
+            ? Effect.fail(new HostBootUnreadable({ reason: "registry unreadable" }))
+            : Effect.succeed(host),
+      }),
+      Effect.provideService(
+        HistoricalProvenanceSource,
+        retained === "none"
+          ? HistoricalProvenanceSource.defaultValue()
+          : { read: () => Effect.succeed(provenance) },
+      ),
+    );
+  });
 
 const captureTermination = (reservationId: FactoryReservationId) =>
   Effect.gen(function* () {
@@ -11556,6 +11617,164 @@ it.effect(
         }),
       ),
     ),
+);
+
+it.effect(
+  "Termination/T5: a local restart never proves a historical writer no retained provenance places on that host",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const { execution, reservationId } = yield* historicalAt(7901, "implement");
+          const unknown = { state: "unknown", reasons: ["process_containment_unsupported"] };
+          // The reviewer's R1 order on the production source: a local driver, capture on boot 20
+          // and verify on boot 21 of one host, any operationRef. Nothing retained says where its
+          // writers ran, so neither binds, whatever the caller writes in its own strings.
+          const forged = JSON.stringify({ host: { machineId: "machine:test-host" } });
+          for (const ref of [operationRef, forged]) {
+            const read = yield* terminate(
+              reservationId,
+              "capture",
+              beforeRestart,
+              undefined,
+              ref,
+              "none",
+            );
+            assert.include(read.refusals, "historical_provenance_missing");
+            assert.isFalse(
+              (yield* terminate(
+                reservationId,
+                "capture",
+                beforeRestart,
+                read.evidenceDigest,
+                ref,
+                "none",
+              )).applied,
+            );
+          }
+          // A database copied from another host, a delegated or persistent writer, or a record
+          // missing a provider session: capture and verify on this host agree, and still refuse.
+          for (const [change, refusal] of [
+            [
+              { host: { platform: "win32", machineId: "machine:origin" } },
+              "historical_host_foreign",
+            ],
+            [
+              { executors: [{ kind: "delegated", machineId: "machine:test-host" }] },
+              "executor_not_local",
+            ],
+            [
+              { executors: [{ kind: "persistent", machineId: "machine:test-host" }] },
+              "executor_not_local",
+            ],
+            [{ providerSessions: ["session:unlisted"] }, "provenance_sessions_incomplete"],
+            [{ operationRef: "restart:other" }, "provenance_operation_mismatch"],
+          ] as const) {
+            const read = yield* terminate(
+              reservationId,
+              "capture",
+              beforeRestart,
+              undefined,
+              operationRef,
+              change,
+            );
+            assert.include(read.refusals, refusal);
+            assert.isFalse(
+              (yield* terminate(
+                reservationId,
+                "capture",
+                beforeRestart,
+                read.evidenceDigest,
+                operationRef,
+                change,
+              )).applied,
+            );
+          }
+          const refused = yield* reservationOf(reservationId);
+          assert.isFalse(refused !== undefined && "historicalTermination" in refused);
+
+          // A capture and proof an earlier build recorded with no provenance cover nothing: the
+          // stage stays held and unknown, and its item does not move on.
+          const sql = yield* SqlClient.SqlClient;
+          const unbound = {
+            capture: {
+              by: "owner",
+              reason: "earlier build",
+              operationRef,
+              evidenceDigest: "e",
+              evidence: "{}",
+              executionDigest: "x",
+              servingId: "serving:deployed",
+              host: beforeRestart,
+              covers: {
+                attempts: (yield* (yield* ProjectionStore.ProjectionStoreV2).getThreadProjection(
+                  execution.threadId,
+                )).attempts.map((attempt) => attempt.id),
+                launches: [],
+                generations: [],
+              },
+              capturedAt: "2026-10-30T03:00:00Z",
+            },
+            proof: {
+              by: "owner",
+              reason: "earlier build",
+              evidenceDigest: "v",
+              evidence: "{}",
+              servingId: "serving:deployed",
+              host: afterRestart,
+              provedAt: "2026-10-30T04:00:00Z",
+            },
+          };
+          yield* sql`UPDATE factory_reservations SET record_json = json_set(record_json, '$.historicalTermination', json(${JSON.stringify(unbound)})) WHERE reservation_id = ${reservationId}`;
+          yield* restartHost;
+          const runsBefore = yield* runCount(execution.threadId);
+          assert.deepStrictEqual(admissionsOnly(yield* advance("owner_decision")), []);
+          const held = yield* reservationOf(reservationId);
+          assert.deepStrictEqual([held?.state, held?.custody], ["held", unknown]);
+          assert.deepStrictEqual(yield* itemHistory(7901), ["implement", "implemented"]);
+          assert.strictEqual(yield* runCount(execution.threadId), runsBefore);
+        }),
+      ),
+    ),
+);
+
+it.effect("Termination/T6: provenance read at verify must be the one its capture bound", () =>
+  runIsolated(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { reservationId } = yield* historicalAt(7911, "implement");
+        yield* captureTermination(reservationId);
+        yield* restartHost;
+        const moved = yield* terminate(
+          reservationId,
+          "verify",
+          afterRestart,
+          undefined,
+          operationRef,
+          { source: "another-producer" },
+        );
+        assert.include(moved.refusals, "provenance_changed");
+        const missing = yield* terminate(
+          reservationId,
+          "verify",
+          afterRestart,
+          undefined,
+          operationRef,
+          "none",
+        );
+        assert.includeMembers(
+          [...missing.refusals],
+          ["historical_provenance_missing", "provenance_changed"],
+        );
+        assert.deepStrictEqual((yield* reservationOf(reservationId))?.custody, {
+          state: "unknown",
+          reasons: ["process_containment_unsupported"],
+        });
+        // The bound provenance, unchanged: proved once, as T1 shows.
+        yield* proveTermination(reservationId);
+      }),
+    ),
+  ),
 );
 
 const pullsFor = (branch: string) =>

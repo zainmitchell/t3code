@@ -20,7 +20,7 @@ import {
   type NeverStartedEvidence,
   type QuarantineEvidence,
 } from "./factoryDisposition.ts";
-import type { HostBoot } from "./factoryHistoricalTermination.ts";
+import type { HistoricalProvenance, HostBoot } from "./factoryHistoricalTermination.ts";
 import type { HistoricalTermination } from "./FactoryStore.ts";
 
 const runId = RunId.make("run:14");
@@ -413,6 +413,7 @@ const captured: HistoricalTermination = {
     servingId: "serving:before-restart",
     host: capturedBoot,
     covers: { attempts: ["attempt:1"], launches: [], generations: ["generation:1"] },
+    provenance: { digest: "provenance-digest", source: "synthetic-test-producer" },
     capturedAt: "2026-10-30T03:00:00Z",
   },
 };
@@ -428,6 +429,22 @@ const proved: HistoricalTermination = {
     provedAt: "2026-10-30T04:00:00Z",
   },
 };
+// SYNTHETIC retained provenance, as a trusted producer would have recorded it for this exact
+// execution and operation. No test here claims such a record exists for any real reservation.
+const provenance: HistoricalProvenance = {
+  reservationId: historical.reservation.reservationId,
+  operationRef: "restart:20261030",
+  source: "synthetic-test-producer",
+  host: { platform: "win32", machineId: "machine-a" },
+  runs: [runId, wakeRunId],
+  attempts: ["attempt:1"],
+  launches: [
+    { runId, status: "succeeded", attemptCount: 1 },
+    { runId: wakeRunId, status: "succeeded", attemptCount: 1 },
+  ],
+  providerSessions: ["session:142"],
+  executors: [{ kind: "local_process", machineId: "machine-a" }],
+};
 const capture = {
   action: "capture",
   facts: historical,
@@ -437,6 +454,9 @@ const capture = {
   servingId: "serving:before-restart",
   host: capturedBoot,
   recorded: undefined,
+  provenance,
+  provenanceDigest: "provenance-digest",
+  providerSessions: ["session:142"],
 } satisfies Parameters<typeof terminationRefusals>[0];
 // After the restart every container of the execution reads ended.
 const verify = {
@@ -447,6 +467,9 @@ const verify = {
   host: laterBoot,
   recorded: captured,
 } satisfies Parameters<typeof terminationRefusals>[0];
+
+// A capture an earlier build recorded, with no provenance bound.
+const { provenance: _unbound, ...unboundCapture } = captured.capture;
 
 describe("terminationRefusals", () => {
   it("binds a reported historical stage to a restart, and proves it on a later boot", () => {
@@ -551,6 +574,69 @@ describe("terminationRefusals", () => {
     ["uptime_not_reset", { ...verify, host: { ...laterBoot, uptimeMs: capturedBoot.uptimeMs } }],
     ["foreign_host", { ...verify, host: { ...laterBoot, machineId: "machine-b" } }],
     ["foreign_host", { ...verify, host: { ...laterBoot, platform: "linux" } }],
+    // R1: a local driver captured and verified on one host, with nothing retained about where its
+    // writers ran, proves nothing; nor does a value the source could not decode.
+    [
+      "historical_provenance_missing",
+      { ...capture, provenance: "missing", provenanceDigest: null },
+    ],
+    ["historical_provenance_missing", { ...verify, provenance: "missing", provenanceDigest: null }],
+    ["historical_provenance_malformed", { ...capture, provenance: "malformed" }],
+    // A database copied from another host: capture and verify agree, the writers ran elsewhere.
+    [
+      "historical_host_foreign",
+      {
+        ...verify,
+        provenance: { ...provenance, host: { platform: "win32", machineId: "machine-b" } },
+      },
+    ],
+    // A local provider that handed work to a remote, persistent or delegated writer.
+    ...(["remote", "persistent", "delegated"] as const).map(
+      (kind) =>
+        [
+          "executor_not_local",
+          {
+            ...capture,
+            provenance: {
+              ...provenance,
+              executors: [...provenance.executors, { kind, machineId: "machine-a" }],
+            },
+          },
+        ] as [string, Parameters<typeof terminationRefusals>[0]],
+    ),
+    [
+      "executor_foreign_host",
+      {
+        ...capture,
+        provenance: {
+          ...provenance,
+          executors: [{ kind: "local_process", machineId: "machine-b" }],
+        },
+      },
+    ],
+    ["provenance_executors_missing", { ...capture, provenance: { ...provenance, executors: [] } }],
+    // Incomplete coverage: a provider session, launch, attempt or run it does not name.
+    ["provenance_sessions_incomplete", { ...capture, providerSessions: ["session:142", "s:2"] }],
+    [
+      "provenance_launches_incomplete",
+      { ...capture, provenance: { ...provenance, launches: provenance.launches.slice(0, 1) } },
+    ],
+    ["provenance_attempts_incomplete", { ...capture, provenance: { ...provenance, attempts: [] } }],
+    ["provenance_runs_incomplete", { ...capture, provenance: { ...provenance, runs: [runId] } }],
+    // A later launch than the provenance covers.
+    ["provenance_launches_incomplete", { ...verify, facts: laterUnproved }],
+    // Retained for another operation or execution: an owner's operationRef is not authorization.
+    [
+      "provenance_operation_mismatch",
+      { ...verify, provenance: { ...provenance, operationRef: "restart:other" } },
+    ],
+    [
+      "provenance_other_execution",
+      { ...capture, provenance: { ...provenance, reservationId: "reservation:other" } },
+    ],
+    // The provenance read at verify is not the one the capture bound, or the capture bound none.
+    ["provenance_changed", { ...verify, provenanceDigest: "other-digest" }],
+    ["provenance_changed", { ...verify, recorded: { capture: unboundCapture } }],
   ])("refuses %s", (refusal, input) => {
     assert.include(terminationRefusals(input), refusal);
   });

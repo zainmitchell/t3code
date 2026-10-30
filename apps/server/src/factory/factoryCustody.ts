@@ -16,7 +16,7 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as EffectOutbox from "../orchestration-v2/EffectOutbox.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as FactoryExecutionGenerations from "./FactoryExecutionGenerations.ts";
-import { coveredAttempts } from "./factoryHistoricalTermination.ts";
+import { coveredAttempts, provedCoverage } from "./factoryHistoricalTermination.ts";
 import * as FactoryRunPreparation from "./FactoryRunPreparation.ts";
 import * as FactoryStore from "./FactoryStore.ts";
 import { type FactoryReservation, samePinnedSelection } from "./FactoryStore.ts";
@@ -602,13 +602,15 @@ export const readExecutionCustody = Effect.fn("factoryCustody.readExecutionCusto
       ]),
     ),
     refusedBeforeStart: refusedBeforeStartRuns(projection),
-    hostRestarted:
-      reservation.origin === "admitted" && reservation.historicalTermination?.proof !== undefined
-        ? coveredAttempts(reservation.historicalTermination.capture.covers, {
-            launches,
-            generations: executionGenerations.map((entry) => entry.generation.generationId),
-          })
-        : new Set(),
+    hostRestarted: coveredAttempts(
+      reservation.origin === "admitted"
+        ? provedCoverage(reservation.historicalTermination)
+        : undefined,
+      {
+        launches,
+        generations: executionGenerations.map((entry) => entry.generation.generationId),
+      },
+    ),
     preparationFailed: new Set(
       [...preparationFailures(projection).keys()].filter((runId) => settledHere.has(runId)),
     ),

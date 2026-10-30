@@ -9,6 +9,7 @@ import { START_REFUSAL_SIGNALS, type FactoryCustody } from "./factoryCustody.ts"
 import * as FactoryExecutionGenerations from "./FactoryExecutionGenerations.ts";
 import {
   bootBoundaryRefusals,
+  type HistoricalProvenance,
   type HostBoot,
   LOCAL_PROCESS_DRIVERS,
 } from "./factoryHistoricalTermination.ts";
@@ -312,6 +313,13 @@ export const readTerminationEvidence = Effect.fn("factoryDisposition.readTermina
         })),
         attempts: facts.attempts,
         providerTurns: facts.providerTurns,
+        providerSessions: [
+          ...new Set(
+            projection.providerThreads.flatMap((providerThread) =>
+              providerThread.providerSessionId === null ? [] : [providerThread.providerSessionId],
+            ),
+          ),
+        ].toSorted(),
         launches: facts.launches,
         outcomes: outcomes.map((outcome) => ({
           outcomeId: outcome.outcomeId,
@@ -327,10 +335,76 @@ export const readTerminationEvidence = Effect.fn("factoryDisposition.readTermina
   },
 );
 
+const sameSet = (left: ReadonlyArray<string>, right: ReadonlyArray<string>) => {
+  const a = left.toSorted();
+  const b = right.toSorted();
+  return a.length === b.length && a.every((value, index) => value === b[index]);
+};
+
+/**
+ * Why retained provenance does not show that restarting `host` ends every writer of this exact
+ * execution and operation: it must name exactly the recorded runs, attempts, launches and sessions
+ * on `host`, with only local processes there as executors. A remote, persistent or delegated writer
+ * outlives the restart; absent or undecodable provenance proves nothing.
+ */
+export const provenanceRefusals = (input: {
+  readonly provenance: HistoricalProvenance | "missing" | "malformed";
+  readonly reservationId: string;
+  readonly operationRef: string;
+  readonly facts: Pick<QuarantineEvidence, "runs" | "attempts" | "launches">;
+  readonly providerSessions: ReadonlyArray<string>;
+  readonly host: Pick<HostBoot, "platform" | "machineId">;
+}): ReadonlyArray<string> => {
+  const { provenance, facts } = input;
+  if (provenance === "missing") return ["historical_provenance_missing"];
+  if (provenance === "malformed") return ["historical_provenance_malformed"];
+  const launchKey = (runId: string, status: string, attempts: number) =>
+    `${runId}\u0000${status}\u0000${attempts}`;
+  return [
+    ...(provenance.reservationId === input.reservationId ? [] : ["provenance_other_execution"]),
+    ...(provenance.operationRef === input.operationRef ? [] : ["provenance_operation_mismatch"]),
+    ...(sameSet(
+      provenance.runs,
+      facts.runs.map((run) => run.runId),
+    )
+      ? []
+      : ["provenance_runs_incomplete"]),
+    ...(sameSet(
+      provenance.attempts,
+      facts.attempts.map((attempt) => attempt.attemptId),
+    )
+      ? []
+      : ["provenance_attempts_incomplete"]),
+    ...(sameSet(
+      provenance.launches.map((launch) =>
+        launchKey(launch.runId, launch.status, launch.attemptCount),
+      ),
+      facts.launches.map((launch) => launchKey(launch.runId, launch.status, launch.attempts)),
+    )
+      ? []
+      : ["provenance_launches_incomplete"]),
+    ...(sameSet(provenance.providerSessions, input.providerSessions)
+      ? []
+      : ["provenance_sessions_incomplete"]),
+    ...(provenance.host.platform === input.host.platform &&
+    provenance.host.machineId === input.host.machineId
+      ? []
+      : ["historical_host_foreign"]),
+    ...(provenance.executors.length === 0 ? ["provenance_executors_missing"] : []),
+    ...(provenance.executors.some((executor) => executor.kind !== "local_process")
+      ? ["executor_not_local"]
+      : []),
+    ...(provenance.executors.some((executor) => executor.machineId !== provenance.host.machineId)
+      ? ["executor_foreign_host"]
+      : []),
+  ];
+};
+
 /**
  * Why a host restart cannot be bound to (`capture`) or proved for (`verify`) this execution. Both
- * need what quarantine needs, a local provider and readable boot facts; verifying also needs the
- * captured operation and execution, every container ended, and a later boot of the same host.
+ * need what quarantine needs, readable boot facts, and retained provenance placing every writer of
+ * the execution on the captured host for this operation; verifying also needs that same provenance,
+ * the captured operation and execution, every container ended, and a later boot of the same host.
  */
 export const terminationRefusals = (input: {
   readonly action: "capture" | "verify";
@@ -341,8 +415,13 @@ export const terminationRefusals = (input: {
   readonly servingId: string;
   readonly host: HostBoot | null;
   readonly recorded: FactoryStore.HistoricalTermination | undefined;
+  readonly provenance: HistoricalProvenance | "missing" | "malformed";
+  readonly provenanceDigest: string | null;
+  readonly providerSessions: ReadonlyArray<string>;
 }): ReadonlyArray<string> => {
   const { facts } = input;
+  // Provenance places the historical writers on the host the capture read, never the one now.
+  const boundHost = input.recorded?.capture.host ?? input.host;
   const eligibility = [
     ...quarantineRefusals({ ...facts, quarantine: null }, input.servingId),
     ...(facts.runs.some(
@@ -351,6 +430,16 @@ export const terminationRefusals = (input: {
       ? ["driver_not_local"]
       : []),
     ...(input.host === null ? ["host_boot_unreadable"] : []),
+    ...(boundHost === null
+      ? []
+      : provenanceRefusals({
+          provenance: input.provenance,
+          reservationId: facts.reservation.reservationId,
+          operationRef: input.operationRef,
+          facts,
+          providerSessions: input.providerSessions,
+          host: boundHost,
+        })),
   ];
   const recorded = input.recorded;
   if (recorded?.proof !== undefined) return ["already_proved", ...eligibility];
@@ -365,6 +454,10 @@ export const terminationRefusals = (input: {
     ...eligibility,
     ...(capture.operationRef === input.operationRef ? [] : ["operation_mismatch"]),
     ...(capture.executionDigest === input.executionDigest ? [] : ["execution_changed"]),
+    // The very provenance the capture bound; one read only since may describe other writers.
+    ...(capture.provenance !== undefined && capture.provenance.digest === input.provenanceDigest
+      ? []
+      : ["provenance_changed"]),
     ...(facts.runs.some((run) => run.generations.some((generation) => generation.state !== "ended"))
       ? ["container_not_ended"]
       : []),

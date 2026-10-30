@@ -8,6 +8,7 @@ import * as NodePath from "node:path";
 import { ProviderDriverKind } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import type * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import * as HostProcess from "@t3tools/shared/HostProcess";
@@ -118,8 +119,49 @@ export const HostBootReader = Context.Reference<{
 }>("t3/factory/HostBootReader", { defaultValue: () => ({ read: readLocalHostBoot }) });
 
 /**
- * Drivers whose provider runs only as processes on the server's own host, so that host's restart
- * ends all of them. A provider that may work elsewhere is not covered by any restart here.
+ * What a producer retained while a historical execution ran: its exact runs, attempts, launches and
+ * provider sessions, their host and every executor, for one restart operation. Only this places the
+ * historical writers; a driver name or today's boot host says nothing about where they ran.
+ */
+export const HistoricalProvenance = Schema.Struct({
+  reservationId: Schema.String,
+  operationRef: Schema.String,
+  /** Who retained it; recorded with the proof, never itself a reason to trust it. */
+  source: Schema.String,
+  host: Schema.Struct({ platform: Schema.Literals(["win32", "linux"]), machineId: Schema.String }),
+  runs: Schema.Array(Schema.String),
+  attempts: Schema.Array(Schema.String),
+  launches: Schema.Array(
+    Schema.Struct({ runId: Schema.String, status: Schema.String, attemptCount: Schema.Number }),
+  ),
+  providerSessions: Schema.Array(Schema.String),
+  executors: Schema.Array(
+    Schema.Struct({
+      kind: Schema.Literals(["local_process", "remote", "persistent", "delegated"]),
+      machineId: Schema.String,
+    }),
+  ),
+});
+export type HistoricalProvenance = typeof HistoricalProvenance.Type;
+export const decodeHistoricalProvenance = Schema.decodeUnknownOption(HistoricalProvenance);
+
+/**
+ * The retained provenance of a historical execution, for one restart operation. No producer of
+ * this server retained any, so production reads none and every restart proof is refused; only a
+ * test substitutes it. What it answers is decoded and checked like any other untrusted value.
+ */
+export const HistoricalProvenanceSource = Context.Reference<{
+  readonly read: (input: {
+    readonly reservationId: string;
+    readonly operationRef: string;
+  }) => Effect.Effect<Option.Option<unknown>>;
+}>("t3/factory/HistoricalProvenanceSource", {
+  defaultValue: () => ({ read: () => Effect.succeedNone }),
+});
+
+/**
+ * Drivers whose provider runs only as processes on the server's own host. Necessary, never
+ * sufficient: a name says nothing about where a historical run's writers ran or what they started.
  */
 export const LOCAL_PROCESS_DRIVERS: ReadonlySet<ProviderDriverKind> = new Set([
   ProviderDriverKind.make("claudeAgent"),
@@ -162,6 +204,22 @@ export interface TerminationCoverage {
 
 const launchKey = (launch: TerminationCoverage["launches"][number]) =>
   `${launch.runId}\u0000${launch.status}\u0000${launch.attemptCount}`;
+
+/**
+ * What a recorded restart covers: only a proved one whose capture bound retained provenance of
+ * every writer. An unproved capture, or a proof from a build that bound none, covers nothing.
+ */
+export const provedCoverage = (
+  termination:
+    | {
+        readonly capture: { readonly covers: TerminationCoverage; readonly provenance?: unknown };
+        readonly proof?: unknown;
+      }
+    | undefined,
+): TerminationCoverage | undefined =>
+  termination?.proof === undefined || termination.capture.provenance === undefined
+    ? undefined
+    : termination.capture.covers;
 
 /**
  * The attempts a proved restart still covers. Any launch or container it did not name, or a

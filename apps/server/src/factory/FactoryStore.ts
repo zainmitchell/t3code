@@ -304,6 +304,11 @@ const HistoricalTerminationCapture = Schema.Struct({
     ),
     generations: Schema.Array(Schema.String),
   }),
+  /**
+   * The retained provenance that placed every writer of the execution on `host` for this
+   * operation. A capture without it, from earlier builds, proves nothing however it is verified.
+   */
+  provenance: Schema.optional(Schema.Struct({ digest: Bounded, source: Schema.String })),
   capturedAt: Schema.String,
 });
 const HistoricalTerminationProof = Schema.Struct({

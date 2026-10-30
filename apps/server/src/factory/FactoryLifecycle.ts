@@ -82,7 +82,11 @@ import {
   readTerminationEvidence,
   terminationRefusals,
 } from "./factoryDisposition.ts";
-import { HostBootReader } from "./factoryHistoricalTermination.ts";
+import {
+  decodeHistoricalProvenance,
+  HistoricalProvenanceSource,
+  HostBootReader,
+} from "./factoryHistoricalTermination.ts";
 import { makeNativeStages, TICKET_DECISION_STAGE } from "./factoryNativeStages.ts";
 import { makeBookkeeping } from "./factoryBookkeeping.ts";
 import { makeSwitchProvider } from "./factoryProviderSwitch.ts";
@@ -4295,6 +4299,19 @@ const make = Effect.gen(function* () {
       }) {
         // Read from the OS before the transaction; never from the caller.
         const host = Option.getOrNull(yield* Effect.option((yield* HostBootReader).read));
+        // From the retained source only, decoded like any untrusted value; never caller JSON.
+        const retained = yield* (yield* HistoricalProvenanceSource).read({
+          reservationId: input.reservationId,
+          operationRef: input.operationRef,
+        });
+        const decoded = Option.flatMap(retained, decodeHistoricalProvenance);
+        const provenance = Option.isSome(decoded)
+          ? decoded.value
+          : Option.isSome(retained)
+            ? ("malformed" as const)
+            : ("missing" as const);
+        const provenanceDigest =
+          typeof provenance === "string" ? null : sha256(canonical(provenance));
         const result = yield* sql.withTransaction(
           Effect.gen(function* () {
             const found = yield* store.getReservation(input.reservationId);
@@ -4321,6 +4338,7 @@ const make = Effect.gen(function* () {
                   ? null
                   : { platform: host.platform, machineId: host.machineId, bootId: host.bootId },
               servingId: store.servingId,
+              provenance: provenanceDigest,
               ...(input.action === "verify" && recorded !== undefined
                 ? {
                     capture: {
@@ -4341,8 +4359,17 @@ const make = Effect.gen(function* () {
               servingId: store.servingId,
               host,
               recorded,
+              provenance,
+              provenanceDigest,
+              providerSessions: termination.execution.providerSessions,
             });
-            if (refusals.length > 0 || input.expectDigest === undefined || host === null) {
+            if (
+              refusals.length > 0 ||
+              input.expectDigest === undefined ||
+              host === null ||
+              typeof provenance === "string" ||
+              provenanceDigest === null
+            ) {
               return { applied: false, refusals, ...read };
             }
             if (input.expectDigest !== read.evidenceDigest) {
@@ -4368,6 +4395,7 @@ const make = Effect.gen(function* () {
                         ...signed,
                         operationRef: input.operationRef,
                         executionDigest,
+                        provenance: { digest: provenanceDigest, source: provenance.source },
                         covers: {
                           attempts: facts.attempts.map((attempt) => attempt.attemptId),
                           launches: facts.launches.map((launch) => ({
