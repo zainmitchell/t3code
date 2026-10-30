@@ -184,6 +184,32 @@ export const FactoryConfigurationInput = Schema.Struct({
   ),
   /** How long one item's tracker read may take before the pass records it unread. */
   readDeadlineSeconds: Schema.optional(PositiveInt),
+  /**
+   * What a bound verification may run as, read and write, as Root adopted it. A policy's binding
+   * pointer is checked against this; absent, no bound verification starts.
+   */
+  verification: Schema.optional(
+    Schema.Struct({
+      /** The only directory binding templates and their inputs are read from. */
+      templateRoot: TrimmedNonEmptyString,
+      /** Each bound verification writes only to a new directory directly under this one. */
+      outputBase: TrimmedNonEmptyString,
+      consumers: Schema.Array(Schema.Struct({ contract: Bounded, version: Bounded })),
+      /** The non-secret account identity each named execution runs as. */
+      identities: Schema.Record(Bounded, Bounded),
+    }),
+  ),
+  /**
+   * Who may close a parent once T3 finds every required clause of its adopted criteria proved:
+   * the project itself, or only after the owner approved. Absent, no parent is closed.
+   */
+  parents: Schema.optional(
+    Schema.Struct({
+      close: Schema.Literals(["project", "owner"]),
+      /** The only directory adopted criteria documents are read from. */
+      criteriaRoot: TrimmedNonEmptyString,
+    }),
+  ),
 });
 export type FactoryConfigurationInput = typeof FactoryConfigurationInput.Type;
 
@@ -513,6 +539,8 @@ export const FactoryReservationRefusal = Schema.Literals([
   "legacy_custody",
   /** Custody was taken after the decision was made, so the decision did not weigh it. */
   "custody_changed",
+  /** Another admitted decision already reserved this verification output directory. */
+  "output_root_reserved",
 ]);
 export type FactoryReservationRefusal = typeof FactoryReservationRefusal.Type;
 
@@ -1325,6 +1353,18 @@ const make = Effect.gen(function* () {
     `;
     if (duplicate.length > 0) {
       return { type: "refused", refusal: "decision_already_admitted" } as const;
+    }
+    // A verification output directory is any one decision's, ever: released or not, so a later
+    // or changed binding never writes over an earlier attempt's output.
+    const outputRoot = /\|out:([0-9a-f]{32})$/.exec(admission.stageBasis ?? "")?.[1];
+    if (outputRoot !== undefined) {
+      const taken = yield* sql`
+        SELECT 1 FROM factory_reservations
+        WHERE factory_id = ${admission.factoryId} AND origin = 'admitted'
+          AND json_extract(record_json, '$.stageBasis') LIKE ${`%|out:${outputRoot}`}
+        LIMIT 1
+      `;
+      if (taken.length > 0) return { type: "refused", refusal: "output_root_reserved" } as const;
     }
     const owner = yield* sql`
       SELECT 1 FROM factory_reservations

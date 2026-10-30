@@ -138,6 +138,7 @@ import {
   HostBootReader,
   HostBootUnreadable,
 } from "./factoryHistoricalTermination.ts";
+import { criterionToken, outputRootName } from "./factoryCoordination.ts";
 import * as FactoryTracker from "./FactoryTracker.ts";
 import * as FactoryTransferStore from "./FactoryTransferStore.ts";
 import type { FactoryTransferInput } from "./factoryTransfers.ts";
@@ -531,6 +532,8 @@ interface GitHubFakeState {
   /** While set, the factory account's identity read fails with it before any request. */
   identityFailure: GitHubPullRequestApi.GitHubPullRequestApiError | undefined;
   identityReads: number;
+  /** Parents whose sub-issue listing fails before GitHub answers. */
+  unlistedSubIssues?: Set<number>;
 }
 
 class GitHubFake extends Context.Service<GitHubFake, GitHubFakeState>()(
@@ -937,6 +940,13 @@ const layerGitHubRestFake = Layer.effect(
             state: fake.issues.get(issueKey(repository, number))?.state ?? "open",
             repository_url: `https://api.github.com/repos/${repository}`,
           });
+          // GitHub counts a parent's sub-issues on its own read; seeded issues without any say none.
+          const subIssueSummary = (repository: string, number: number) => {
+            const total = [...fake.issues.entries()].filter(
+              ([key, issue]) => key.startsWith(`${repository}#`) && issue.parentNumber === number,
+            ).length;
+            return total === 0 ? {} : { sub_issues_summary: { total } };
+          };
           const byId = (repository: string, id: number) =>
             [...fake.issues.entries()].find(
               ([key, candidate]) =>
@@ -1027,6 +1037,23 @@ const layerGitHubRestFake = Layer.effect(
               return target.parentNumber === undefined
                 ? yield* notFound(input.operation)
                 : ok(relatedJson(repository, target.parentNumber));
+            }
+            if (relationMatch[3] === "sub_issues" && method === "GET") {
+              if (fake.unlistedSubIssues?.has(target.number) === true) {
+                return yield* new GitHubRequestPolicy.GitHubApiRequestError({
+                  host: "github.com",
+                  operation: input.operation,
+                  cause: "the sub-issue listing was lost",
+                });
+              }
+              const query = new URLSearchParams(input.path.split("?")[1] ?? "");
+              const children = [...fake.issues.entries()]
+                .filter(
+                  ([key, issue]) =>
+                    key.startsWith(`${repository}#`) && issue.parentNumber === target.number,
+                )
+                .map(([, issue]) => relatedJson(repository, issue.number));
+              return ok((query.get("page") ?? "1") === "1" ? children : []);
             }
             if (relationMatch[3] === "sub_issues" && method === "POST") {
               const child = byId(
@@ -1126,6 +1153,7 @@ const layerGitHubRestFake = Layer.effect(
               body: issue.body,
               labels: issue.labels.map((name) => ({ name })),
               ...(issue.pullRequest === true ? { pull_request: { url: "pull" } } : {}),
+              ...subIssueSummary(issueMatch[1]!, issue.number),
               ...(issue.created === undefined
                 ? {}
                 : { user: { id: issue.created.user.id, login: factoryAccount.login } }),
@@ -11775,6 +11803,361 @@ it.effect("Termination/T6: provenance read at verify must be the one its capture
       }),
     ),
   ),
+);
+
+/** What the latest pass recorded for an item: its disposition, reason class and detail. */
+const recordOf = (issueNumber: number) =>
+  Effect.gen(function* () {
+    const state = yield* (yield* FactoryLifecycle.FactoryLifecycle).readState({ factoryId });
+    return state.lastCollection.find((record) => record.itemKey === itemKeyFor(issueNumber));
+  });
+
+/** Lands `issueNumber` through T3's own build, independent review, integration and closure. */
+const landThroughT3 = (
+  issueNumber: number,
+  commit: string,
+  admitted?: FactoryLifecycle.FactoryAdmissionResult,
+) =>
+  Effect.gen(function* () {
+    yield* recordCommit(commit, [lifecycleBase]);
+    yield* workStage(admitted ?? admittedBy(yield* advance("tracker_event", 1)), {
+      outcome: "implemented",
+      subject: { ...subjectFor(commit, lifecycleBase), branch: `t3-factory/${issueNumber}` },
+      summary: `Implemented ${issueNumber}.`,
+    });
+    yield* workStage(admittedBy(yield* advance("outcome")), {
+      outcome: "review_passed",
+      subject: subjectFor(commit),
+      summary: "Passes.",
+    });
+    yield* advance("outcome");
+    assert.deepStrictEqual((yield* itemHistory(issueNumber)).slice(-2), ["integrated", "closed"]);
+    const [integrated] = (yield* integrationOf(issueNumber)).outcomes;
+    return integrated!.report.integration!;
+  });
+
+const verifierExecution = {
+  modelSelection: rosterSelection,
+  runtimeMode: "full-access" as const,
+  interactionMode: "default" as const,
+};
+
+it.effect(
+  "Binding/B1: a landed correction binds its proof from the adopted template once; any changed identity, input, consumer, policy or base waits before launch",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          yield* configureLifecycleFactory;
+          const root = yield* fs.realPath(yield* fs.makeTempDirectoryScoped());
+          const templates = path.join(root, "templates");
+          const outputs = path.join(root, "outputs");
+          yield* fs.makeDirectory(path.join(templates, "inputs"), { recursive: true });
+          yield* fs.makeDirectory(outputs, { recursive: true });
+          const input = path.join(templates, "inputs", "fixture.json");
+          yield* fs.writeFileString(input, '{"settlement":"fixture"}');
+          // Root adopts stable semantics once; it names no landing, failure or output.
+          const writeTemplate = (name: string, change: Record<string, unknown> = {}) =>
+            Effect.gen(function* () {
+              const text = JSON.stringify({
+                schema: "factory-verification-template/1",
+                issue: 7501,
+                prerequisite: 7502,
+                worker: { execution: "verifier" },
+                auth: { identity: "verifier@example.invalid" },
+                inputs: [
+                  { path: "inputs/fixture.json", sha256: sha256('{"settlement":"fixture"}') },
+                ],
+                consumer: { contract: "settlement-proof", version: "1" },
+                policyIdentity: "policy-r1",
+                ownership: { owned: [] },
+                ...change,
+              });
+              yield* fs.writeFileString(path.join(templates, name), text);
+              return { root: templates, path: name, sha256: sha256(text) };
+            });
+          const template = yield* writeTemplate("7501.json");
+          const authority = {
+            templateRoot: templates,
+            outputBase: outputs,
+            consumers: [{ contract: "settlement-proof", version: "1" }],
+            identities: { verifier: "verifier@example.invalid" } as Record<string, string>,
+          };
+          const reconfigure = (verification: Partial<typeof authority> = {}) =>
+            configureFactory(
+              lifecycleConfiguration({
+                executionChoices: { verifier: verifierExecution },
+                verification: { ...authority, ...verification },
+              }),
+            );
+          yield* reconfigure();
+
+          // The correction lands through T3; the proof item then fails and is corrected.
+          yield* seedIssue(7502);
+          const landed = yield* landThroughT3(7502, "c0007502");
+          yield* seedIssue(7503, { state: "closed" });
+          yield* seedIssue(7501, { blockerNumbers: [7502, 7503] });
+          yield* workStage(admittedBy(yield* advance("tracker_event", 1)), {
+            outcome: "failed",
+            failure: "settlement check failed",
+            summary: "Verification failed.",
+          });
+
+          // The policy proposes the rerun on the landed commit with its template pointer only.
+          const proposal = {
+            pointer: template,
+            execution: "verifier",
+            baseRef: landed.mergeCommit,
+          };
+          yield* usePolicy((input) =>
+            input.observation.itemKey === itemKeyFor(7501) && input.stage.type === "rework"
+              ? Effect.map(stageRequest(input), (request) =>
+                  request !== undefined && "taskKind" in request
+                    ? {
+                        ...request,
+                        execution: proposal.execution,
+                        workspaceStrategy: {
+                          type: "worktree" as const,
+                          baseRef: proposal.baseRef,
+                          startFromOrigin: false,
+                        },
+                        verificationBinding: proposal.pointer,
+                      }
+                    : request,
+                )
+              : stageRequest(input),
+          );
+          yield* workStage(admittedBy(yield* advance("outcome")), {
+            outcome: "correction_spec",
+            summary: "Rerun the settlement proof on the landed correction.",
+          });
+          const failedId = (yield* (yield* FactoryOutcomeStore.FactoryOutcomeStore).itemEvents({
+            factoryId,
+            itemKey: itemKeyFor(7501),
+          })).findLast((event) => event.type === "outcome" && event.kind === "failed")!;
+          const failedOutcomeId = failedId.type === "outcome" ? failedId.outcomeId : "";
+
+          const refusedWith = (detail: string, reasonClass = "needs_routing") =>
+            Effect.gen(function* () {
+              assert.deepStrictEqual(admissionsOnly(yield* advance("clock")), []);
+              const record = yield* recordOf(7501);
+              assert.deepStrictEqual(
+                [record?.disposition, record?.reasonClass],
+                ["nothing_proposed", reasonClass],
+              );
+              assert.include(record?.detail ?? "", detail);
+              assert.match(
+                record?.detail ?? "",
+                /^#7501 waits \[[0-9a-f]{12}\]: .* Actor: .* Resume: /,
+              );
+            });
+
+          // Tracker closure alone is no landing: this blocker was closed outside T3.
+          proposal.pointer = yield* writeTemplate("7503.json", { prerequisite: 7503 });
+          yield* refusedWith(
+            "#7503 has not landed: it has no verified implemented head",
+            "waiting",
+          );
+          proposal.pointer = template;
+          // Configured authority, not the template, decides identity and consumer meaning.
+          yield* reconfigure({ identities: { verifier: "other@example.invalid" } });
+          yield* refusedWith("configured as other@example.invalid");
+          yield* reconfigure({ identities: {} });
+          yield* refusedWith("declares no account identity for execution verifier");
+          yield* reconfigure({ consumers: [] });
+          yield* refusedWith("is not one Root declared", "held");
+          yield* reconfigure();
+          // The worker the template names, not one the policy prefers.
+          proposal.execution = "builder";
+          yield* refusedWith("binding names execution verifier");
+          proposal.execution = "verifier";
+          // Inputs are rehashed, not trusted.
+          yield* fs.writeFileString(input, '{"settlement":"changed"}');
+          yield* refusedWith("input inputs/fixture.json is unreadable");
+          yield* fs.writeFileString(input, '{"settlement":"fixture"}');
+          proposal.pointer = yield* writeTemplate("stale-policy.json", {
+            policyIdentity: "policy-r0",
+          });
+          yield* refusedWith("binding names policy policy-r0");
+          proposal.pointer = { ...template, sha256: "0".repeat(64) };
+          yield* refusedWith("not sha256 0000");
+          proposal.pointer = template;
+          proposal.baseRef = lifecycleBase;
+          yield* refusedWith(`would not start at landed commit ${landed.mergeCommit}`);
+          proposal.baseRef = landed.mergeCommit;
+          // Earlier output in the derived directory is never written over.
+          const outputRoot = path.join(
+            outputs,
+            outputRootName({
+              issue: 7501,
+              itemKey: itemKeyFor(7501),
+              failedOutcomeId,
+              commit: landed.mergeCommit,
+              templateSha256: template.sha256,
+            }),
+          );
+          yield* fs.makeDirectory(outputRoot);
+          yield* fs.writeFileString(path.join(outputRoot, "earlier.json"), "{}");
+          yield* refusedWith("is not a new empty directory");
+          yield* fs.remove(outputRoot, { recursive: true });
+
+          // Everything holds: the proof is admitted once, on its derived binding and output root.
+          const admitted = admittedBy(yield* advance("clock"));
+          assert.deepStrictEqual(stageOf(admitted), [itemKeyFor(7501), "rework"]);
+          const basis =
+            admitted.reservation.origin === "admitted"
+              ? admitted.reservation.stageBasis
+              : undefined;
+          assert.match(basis ?? "", /^rework:.+\|vb:[0-9a-f]{32}\|out:[0-9a-f]{32}$/);
+          for (const trigger of ["clock", "restart", "owner_decision"] as const) {
+            assert.deepStrictEqual(admissionsOnly(yield* advance(trigger)), []);
+          }
+          assert.strictEqual(
+            (yield* itemHistory(7501)).filter((entry) => entry === "rework").length,
+            1,
+          );
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Parent/P1: a parent closes once under project authority when its own records prove every required clause, never on membership",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          yield* configureLifecycleFactory;
+          const criteriaRoot = yield* fs.realPath(yield* fs.makeTempDirectoryScoped());
+          const reconfigure = (close: "project" | "owner") =>
+            configureFactory(lifecycleConfiguration({ parents: { close, criteriaRoot } }));
+          yield* reconfigure("project");
+          const parent = yield* seedIssue(7601, { body: "Export settlements.\n\n## Acceptance" });
+          const text = JSON.stringify({
+            schema: "factory-parent-criteria/1",
+            issue: 7601,
+            version: "v1",
+            bodySha256: sha256(parent.body),
+            clauses: [
+              {
+                id: "C1",
+                required: true,
+                source: { kind: "issue-body", ref: "## Acceptance 1" },
+                evidence: [
+                  { itemKey: `github:${claimRepository}#7602`, scope: "settlement export" },
+                ],
+              },
+              { id: "C2", required: true, source: { kind: "issue-body", ref: "## Acceptance 2" } },
+              { id: "C3", required: false, source: { kind: "comment", ref: "nice to have" } },
+              {
+                id: "C4",
+                required: true,
+                source: { kind: "issue-body", ref: "## Acceptance 4" },
+                state: "revised",
+              },
+            ],
+          });
+          yield* fs.writeFileString(path.join(criteriaRoot, "7601.json"), text);
+          const criteria = { root: criteriaRoot, path: "7601.json", sha256: sha256(text) };
+          const token = criterionToken(7601, "C2");
+          // The parent is never built: its policy asks only for closure, or for one clause child.
+          const parentAsks = { spawn: false };
+          yield* usePolicy((input) =>
+            input.observation.itemKey !== itemKeyFor(7601)
+              ? stageRequest(input)
+              : Effect.succeed(
+                  parentAsks.spawn
+                    ? {
+                        type: "spawn" as const,
+                        reason: "clause C2 is the smallest authorized missing criterion",
+                        ticket: {
+                          title: `#7601 ${token} Add the settlement export check`,
+                          body: "Bounded child for clause C2.",
+                          labels: ["ready"],
+                          parentIssueNumber: 7601,
+                          blocks: [],
+                        },
+                      }
+                    : { type: "proceed" as const, parentClosure: { criteria } },
+                ),
+          );
+          const waitsOn = (detail: string) =>
+            Effect.gen(function* () {
+              const record = yield* recordOf(7601);
+              assert.deepStrictEqual(
+                [record?.disposition, record?.reasonClass],
+                ["nothing_proposed", "parent"],
+                `${detail} / ${record?.detail}`,
+              );
+              assert.include(record?.detail ?? "", detail);
+              assert.strictEqual(
+                (yield* GitHubFake).issues.get(issueKey(claimRepository, 7601))!.state,
+                "open",
+              );
+            });
+
+          // C1's child is a sub-issue that lands through T3; C2 has no evidence yet.
+          yield* seedIssue(7602, { parentNumber: 7601 });
+          yield* landThroughT3(7602, "c0007602");
+          yield* advance("clock");
+          yield* waitsOn(
+            "clause C2 is missing: no evidence item (C1=satisfied, C2=missing, C3=missing, C4=revised)",
+          );
+
+          // The one bounded child for C2 opens through the existing ticket path, under the parent.
+          parentAsks.spawn = true;
+          // The child is ordinary work: once opened it is admitted, while the parent only waits.
+          const childBuild = admittedBy(yield* advance("clock"));
+          parentAsks.spawn = false;
+          const github = yield* GitHubFake;
+          const child = [...github.issues.values()].find((issue) => issue.title.includes(token))!;
+          assert.strictEqual(child.parentNumber, 7601);
+          assert.deepStrictEqual(stageOf(childBuild), [itemKeyFor(child.number), "implement"]);
+          yield* advance("clock");
+          yield* waitsOn(
+            `clause C2 is missing: github:${claimRepository}#${child.number}: it has no verified implemented head`,
+          );
+
+          // The child lands while the membership cannot be read whole: that closes nothing.
+          const unlisted = new Set([7601]);
+          github.unlistedSubIssues = unlisted;
+          const patchesBefore = yield* closeRequests;
+          yield* landThroughT3(child.number, "c0007603", childBuild);
+          yield* advance("clock");
+          yield* waitsOn("its children are unread");
+          // Under owner authority, the parent waits for the owner's own approval.
+          unlisted.clear();
+          yield* reconfigure("owner");
+          yield* advance("clock");
+          yield* waitsOn("the owner has not approved closing this parent");
+          assert.strictEqual((yield* closeRequests) - patchesBefore, 1);
+          yield* reconfigure("project");
+
+          // Every required clause proved: T3 closes it once, its record naming each landing.
+          yield* advance("clock");
+          const closed = github.issues.get(issueKey(claimRepository, 7601))!;
+          assert.strictEqual(closed.state, "closed");
+          const record = closed.comments.find((comment) => comment.body.includes(sha256(text)))!;
+          assert.include(
+            record.body,
+            `Clause C1 (settlement export): github:${claimRepository}#7602 landed`,
+          );
+          assert.include(
+            record.body,
+            `Clause C2 (criterion C2 child): github:${claimRepository}#${child.number} landed`,
+          );
+          assert.strictEqual((yield* closeRequests) - patchesBefore, 2);
+          for (const trigger of ["restart", "clock", "owner_decision"] as const)
+            yield* advance(trigger);
+          assert.strictEqual((yield* closeRequests) - patchesBefore, 2);
+          assert.notInclude(yield* itemHistory(7601), "implement");
+        }),
+      ),
+    ),
 );
 
 const pullsFor = (branch: string) =>

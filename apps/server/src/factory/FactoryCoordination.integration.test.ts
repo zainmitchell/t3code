@@ -1,11 +1,25 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
-import { FactoryId, FactoryItemKey, ProjectId } from "@t3tools/contracts";
+import {
+  CommandId,
+  FactoryDecisionKey,
+  FactoryId,
+  FactoryItemKey,
+  FactoryPoolId,
+  NodeId,
+  ProjectId,
+  ProviderInstanceId,
+  RunId,
+  ThreadId,
+} from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as SqlClient from "effect/sql/SqlClient";
 
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import type { TrackerIssue } from "./factoryClaimPolicy.ts";
+import { bindingBasis } from "./factoryCoordination.ts";
 import * as FactoryLifecycle from "./FactoryLifecycle.ts";
 import * as FactoryOperationStore from "./FactoryOperationStore.ts";
 import * as FactoryOutcomeStore from "./FactoryOutcomeStore.ts";
@@ -318,5 +332,99 @@ it.effect(
       // Not a parent: nothing is said.
       assert.deepStrictEqual(yield* childrenOf([], 0), {});
       assert.deepStrictEqual(yield* childrenOf([], "absent"), {});
+    }).pipe(Effect.provide(layerTest)),
+);
+
+const poolId = FactoryPoolId.make("verifiers");
+const modelSelection = { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" };
+
+/** One bound verification's admission commit, as `factory.execution.start` makes it. */
+const reserveVerification = (issueNumber: number, outputRoot: string, revision: number) =>
+  Effect.gen(function* () {
+    const store = yield* FactoryStore.FactoryStore;
+    const sql = yield* SqlClient.SqlClient;
+    const itemKey = keyOf(issueNumber);
+    const recorded = yield* store.recordItemObservation({
+      factoryId,
+      itemKey,
+      itemVersion: "v1",
+      generation: yield* store.beginCollection(factoryId),
+      complete: true,
+      evidence: [],
+      sources: [],
+      claims: [],
+    });
+    if (recorded.type !== "recorded") return yield* Effect.die("unrecorded");
+    const commandId = CommandId.make(`command:verify:${issueNumber}`);
+    return yield* sql.withTransaction(
+      store.reserveExecution({
+        commandId,
+        executionThreadId: ThreadId.make(`thread:verify:${issueNumber}`),
+        runId: RunId.make(`run:verify:${issueNumber}`),
+        taskNodeId: NodeId.make(`node:verify:${issueNumber}`),
+        modelSelection,
+        origin: {
+          type: "admission",
+          admission: {
+            factoryId,
+            configRevision: revision,
+            decisionKey: FactoryDecisionKey.make(`decision:verify:${issueNumber}`),
+            itemKey,
+            itemVersion: "v1",
+            taskKind: "rework",
+            policyRevision: "policy-r1",
+            poolId,
+            units: 1,
+            packetDigest: "packet",
+            observationId: recorded.observation.observationId,
+            basisDigest: recorded.observation.basisDigest,
+            deadline: DateTime.makeUnsafe("2099-01-01T00:00:00.000Z"),
+            stageBasis: `rework:spec-${issueNumber}${bindingBasis(`binding-${issueNumber}`.padEnd(32, "0"), outputRoot)}`,
+          },
+        },
+      }),
+    );
+  });
+
+it.effect(
+  "Coordination/output: an output root is one decision's for good, however its admissions race",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* FactoryStore.FactoryStore;
+      const configuration = yield* store.configure({
+        factoryId,
+        projectId: ProjectId.make("project-btc"),
+        policyRevision: "policy-r1",
+        enabled: true,
+        pools: [{ poolId, capacityUnits: 9 }],
+        execution: { modelSelection, runtimeMode: "full-access", interactionMode: "default" },
+        packet: { briefSchemaVersion: "brief-v1", helper: null },
+        artifactRoot: process.cwd(),
+      });
+      const shared = "C:/records/outputs/139-aaaaaaaaaaaaaaaa";
+      // Two collections admit different decisions on one root at once: exactly one holds it.
+      const [left, right] = yield* Effect.all(
+        [
+          reserveVerification(171, shared, configuration.revision),
+          // The same directory spelled another way on Windows.
+          reserveVerification(
+            172,
+            `${shared.toUpperCase().replaceAll("/", "\\")}\\`,
+            configuration.revision,
+          ),
+        ],
+        { concurrency: 2 },
+      );
+      assert.deepStrictEqual([left.type, right.type].toSorted(), ["refused", "reserved"]);
+      const refused = left.type === "refused" ? left : right;
+      assert.strictEqual(refused.type === "refused" && refused.refusal, "output_root_reserved");
+      // Released history still holds it: a later or changed binding never reuses that output.
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`UPDATE factory_reservations SET state = 'released' WHERE factory_id = ${factoryId}`;
+      const later = yield* reserveVerification(173, shared, configuration.revision);
+      assert.strictEqual(later.type === "refused" && later.refusal, "output_root_reserved");
+      // Another root is free.
+      const other = yield* reserveVerification(174, `${shared}-other`, configuration.revision);
+      assert.strictEqual(other.type, "reserved");
     }).pipe(Effect.provide(layerTest)),
 );

@@ -24,6 +24,11 @@ const sha256 = (content: string | Uint8Array) =>
   NodeCrypto.createHash("sha256").update(content).digest("hex");
 
 const Bounded = (maximum: number) => Schema.String.check(Schema.isMaxLength(maximum));
+const PinnedFile = Schema.Struct({
+  root: Bounded(4_096),
+  path: Bounded(4_096),
+  sha256: Bounded(64),
+});
 
 /** One item's decision from the project's policy; it chooses content and gates, never a stage. */
 const PolicyDecision = Schema.Union([
@@ -43,6 +48,11 @@ const PolicyDecision = Schema.Union([
      * proposal is the item's current preparation and the build starts exactly at its base.
      */
     prepared: Schema.optional(Bounded(64)),
+    /**
+     * The Root-adopted binding document a bound verification runs under. A pointer only: T3
+     * rereads it and checks it against its own configuration and records before it admits.
+     */
+    verificationBinding: Schema.optional(PinnedFile),
   }),
   /**
    * Decomposition for an item at its first stage that has no unit spec yet: a worker proposes
@@ -73,7 +83,16 @@ const PolicyDecision = Schema.Union([
     }),
   }),
   /** T3's own stage (integration, closure) may go ahead: the product's gates for it hold. */
-  Schema.Struct({ decision: Schema.Literal("proceed") }),
+  Schema.Struct({
+    decision: Schema.Literal("proceed"),
+    /**
+     * A parent to close on its adopted criteria. T3 reconciles every clause from its own records
+     * and closes only under the factory's configured parent authority.
+     */
+    parentClosure: Schema.optional(
+      Schema.Struct({ criteria: PinnedFile, ownerDecisionId: Schema.optional(Bounded(64)) }),
+    ),
+  }),
   Schema.Struct({
     decision: Schema.Literal("reserve"),
     reason: Bounded(2_000),
@@ -410,7 +429,12 @@ export const layer = Layer.effect(
           return request;
         }
         case "proceed": {
-          const proceed: FactoryLifecycle.FactoryProceed = { type: "proceed" };
+          const proceed: FactoryLifecycle.FactoryProceed = {
+            type: "proceed",
+            ...(decision.parentClosure === undefined
+              ? {}
+              : { parentClosure: decision.parentClosure }),
+          };
           return proceed;
         }
         case "fail": {
@@ -453,6 +477,9 @@ export const layer = Layer.effect(
             ...(decision.workspace === undefined ? {} : { workspaceStrategy: decision.workspace }),
             ...(decision.execution === undefined ? {} : { execution: decision.execution }),
             ...(decision.prepared === undefined ? {} : { prepared: decision.prepared }),
+            ...(decision.verificationBinding === undefined
+              ? {}
+              : { verificationBinding: decision.verificationBinding }),
             ...(decision.grant === undefined
               ? {}
               : {

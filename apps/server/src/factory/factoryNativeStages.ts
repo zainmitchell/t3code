@@ -434,6 +434,54 @@ export const makeNativeStages = (deps: NativeStageDependencies) => {
   });
 
   /**
+   * A parent whose adopted criteria T3 found proved, clause by clause, from its own records: closed
+   * once per criteria document by the existing closing operation, its record naming every landing.
+   * A parent is never built or integrated itself, so this is its only closure.
+   */
+  const planParentClosure = Effect.fnUntraced(function* (input: {
+    readonly configuration: FactoryStore.FactoryConfiguration;
+    readonly itemKey: FactoryItemKey;
+    readonly criteriaSha256: string;
+    readonly evidence: ReadonlyArray<string>;
+    readonly fence: FactoryStore.CustodyFence;
+  }): Effect.fn.Return<NativeStagePlan, NativeStageError> {
+    const { configuration, itemKey } = input;
+    const subject = subjectOf(itemKey);
+    if (configuration.claim === undefined || subject === undefined) {
+      return { type: "issue", issue: "the parent has no tracker to close" };
+    }
+    const operationId = `close:parent:${sha256(canonical([configuration.factoryId, itemKey, input.criteriaSha256])).slice(0, 40)}`;
+    const existing = yield* operations.get(operationId);
+    if (Option.isSome(existing)) {
+      if (existing.value.state === "failed") return { type: "issue", issue: existing.value.reason };
+      yield* keepLive(existing.value);
+      return { type: "in_flight", operationId };
+    }
+    const marker = closeMarker(operationId);
+    const closing = yield* deps.ensureFencedOperation(
+      {
+        operationId,
+        factoryId: configuration.factoryId,
+        itemKey,
+        intent: {
+          kind: "tracker_close",
+          ...subject,
+          marker,
+          body: [
+            marker,
+            `T3 factory ${configuration.factoryId} closes this parent: every required clause of its adopted criteria (sha256 ${input.criteriaSha256}) is proved by landed work.`,
+            ...input.evidence,
+          ].join("\n\n"),
+        },
+      },
+      input.fence,
+    );
+    return Option.isNone(closing)
+      ? { type: "custody_changed" }
+      : { type: "in_flight", operationId };
+  });
+
+  /**
    * A tracker issue the policy asked for on the item's evidence (a verification-only item's
    * correction ticket): one intent per item and stage basis. The text is not part of its identity,
    * so a reworded ask for the same failure joins the first ticket instead of opening another. Its
@@ -599,5 +647,12 @@ export const makeNativeStages = (deps: NativeStageDependencies) => {
     }
   });
 
-  return { planIntegration, planClosure, planTicket, recordOutcomes, settleTicketCreates };
+  return {
+    planIntegration,
+    planClosure,
+    planParentClosure,
+    planTicket,
+    recordOutcomes,
+    settleTicketCreates,
+  };
 };
