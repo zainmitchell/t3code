@@ -161,6 +161,18 @@ const Fields = {
       unconfirmedAt: Schema.optional(Schema.String),
     }),
   ),
+  /**
+   * The pull request create a `pull_request_merge` recorded before sending it. Until a pull request
+   * from its head into its base is listed, no other create is sent unless `cleared` names what showed
+   * none stands from it: a refusal, or a create that never left.
+   */
+  pullRequestCreate: Schema.optional(
+    Schema.Struct({
+      attempt: Schema.Int,
+      at: Schema.String,
+      cleared: Schema.optional(Schema.String),
+    }),
+  ),
 };
 
 export const FactoryOperation = Schema.Union([
@@ -264,6 +276,19 @@ export class FactoryOperationStore extends Context.Service<
     readonly noteCreatePending: (
       operationId: string,
     ) => Effect.Effect<Option.Option<{ readonly attempt: number }>, FactoryOperationStoreError>;
+    /**
+     * Records, before it is sent, the pull request create an intended operation is about to send;
+     * none when an uncleared create is recorded or another attempt recorded one first.
+     */
+    readonly notePullRequestCreate: (
+      operationId: string,
+    ) => Effect.Effect<Option.Option<{ readonly attempt: number }>, FactoryOperationStoreError>;
+    /** Clears that pull request create, naming why none stands from it; false if it changed. */
+    readonly clearPullRequestCreate: (input: {
+      readonly operationId: string;
+      readonly attempt: number;
+      readonly by: string;
+    }) => Effect.Effect<boolean, FactoryOperationStoreError>;
     /** Records that a search after that create's attempt found nothing; false if it changed. */
     readonly noteCreateUnconfirmed: (input: {
       readonly operationId: string;
@@ -492,6 +517,35 @@ const make = Effect.gen(function* () {
         ).pipe(Option.map(({ attempt }) => ({ attempt })));
       },
       Effect.mapError(fail("note-create-pending")),
+    ),
+    notePullRequestCreate: Effect.fn("FactoryOperationStore.notePullRequestCreate")(
+      function* (operationId: string) {
+        const at = DateTime.formatIso(yield* DateTime.now);
+        const written = yield* amend(operationId, (current) => {
+          const previous = current.pullRequestCreate;
+          if (previous !== undefined && previous.cleared === undefined) return undefined;
+          return { ...current, pullRequestCreate: { attempt: (previous?.attempt ?? 0) + 1, at } };
+        });
+        return Option.flatMap(written, (operation) =>
+          Option.fromNullishOr(operation.pullRequestCreate),
+        ).pipe(Option.map(({ attempt }) => ({ attempt })));
+      },
+      Effect.mapError(fail("note-pull-request-create")),
+    ),
+    clearPullRequestCreate: Effect.fn("FactoryOperationStore.clearPullRequestCreate")(
+      function* (input: {
+        readonly operationId: string;
+        readonly attempt: number;
+        readonly by: string;
+      }) {
+        const written = yield* amend(input.operationId, (current) => {
+          const pending = current.pullRequestCreate;
+          if (pending?.attempt !== input.attempt || pending.cleared !== undefined) return undefined;
+          return { ...current, pullRequestCreate: { ...pending, cleared: input.by } };
+        });
+        return Option.isSome(written);
+      },
+      Effect.mapError(fail("clear-pull-request-create")),
     ),
     noteCreateUnconfirmed: Effect.fn("FactoryOperationStore.noteCreateUnconfirmed")(
       function* (input: { readonly operationId: string; readonly attempt: number }) {

@@ -86,6 +86,11 @@ class Hub extends Context.Service<
     readonly relationWrites: Array<string>;
     faults: {
       loseCreateAnswer?: boolean;
+      /** A validation refusal of a create nothing was sent for before. */
+      refuseCreate?: boolean;
+      /** The process is lost after GitHub opened the pull request, or before the create left. */
+      createThenDie?: boolean;
+      dieBeforeCreate?: boolean;
       mergeThenLose?: "answer" | "process";
       publishThenLose?: boolean;
       issueCreateAmbiguous?: boolean;
@@ -93,6 +98,11 @@ class Hub extends Context.Service<
     };
     markerSearch: Deferred.Deferred<void> | undefined;
     markerSearches: number;
+    /** Listings of an existing pull request that still show nothing (an injected lag). */
+    pullListLag: number;
+    /** Concurrent attempts both list before either records its create. */
+    pullSearch: Deferred.Deferred<void> | undefined;
+    pullSearches: number;
   }
 >()("t3/factory/FactoryEffects.test/Hub") {}
 
@@ -156,6 +166,9 @@ const layerHub = Layer.effect(
         faults: {},
         markerSearch: undefined,
         markerSearches: 0,
+        pullListLag: 0,
+        pullSearch: undefined,
+        pullSearches: 0,
       } satisfies Hub["Service"];
     }),
     ({ root }) => Effect.sync(() => NodeFS.rmSync(root, { recursive: true, force: true })),
@@ -188,26 +201,54 @@ const layerTracker = Layer.effect(
     const session: Partial<FactoryTracker.TrackerSession> = {
       account: { accountId: "9001" },
       findPullRequest: ({ head, base }) =>
-        Effect.sync(() =>
-          Option.fromNullishOr(
-            hub.pulls.findLast((pull) => pull.head === head && pull.base === base),
-          ).pipe(Option.map((pull) => factsOf(hub, pull))),
-        ),
+        Effect.gen(function* () {
+          hub.pullSearches += 1;
+          if (hub.pullSearch !== undefined) {
+            if (hub.pullSearches === 2) yield* Deferred.succeed(hub.pullSearch, undefined);
+            yield* Deferred.await(hub.pullSearch);
+          }
+          const found = hub.pulls.findLast((pull) => pull.head === head && pull.base === base);
+          if (found !== undefined && hub.pullListLag > 0) {
+            hub.pullListLag -= 1;
+            return Option.none();
+          }
+          return Option.fromNullishOr(found).pipe(Option.map((pull) => factsOf(hub, pull)));
+        }),
       readPullRequest: ({ number }) => Effect.sync(() => factsOf(hub, pullFor(number))),
       createPullRequest: ({ head, base }) =>
-        Effect.sync((): FactoryTracker.CreatePullRequestOutcome => {
+        Effect.suspend(() => {
+          if (hub.faults.dieBeforeCreate === true) {
+            hub.faults.dieBeforeCreate = false;
+            return Effect.die("the process was lost before the create was sent");
+          }
           hub.writes.push("create pull request");
           const open = hub.pulls.some((pull) => pull.head === head && pull.state === "open");
-          if (tipOf(hub, head) === null || open) {
-            return { type: "rejected", transient: false, cause: '{"status":422}' };
+          // GitHub's 422 is a general validation refusal: it names no cause (github-api-proof-boundaries.json).
+          if (tipOf(hub, head) === null || open || hub.faults.refuseCreate === true) {
+            hub.faults.refuseCreate = false;
+            return Effect.succeed<FactoryTracker.CreatePullRequestOutcome>({
+              type: "rejected",
+              transient: false,
+              cause: '{"status":422}',
+            });
           }
           const number = 143 + hub.pulls.length;
           hub.pulls.push({ number, head, base, state: "open", draft: false, merged: undefined });
+          if (hub.faults.createThenDie === true) {
+            hub.faults.createThenDie = false;
+            return Effect.die("the process was lost after the create was sent");
+          }
           if (hub.faults.loseCreateAnswer === true) {
             hub.faults.loseCreateAnswer = false;
-            return { type: "ambiguous", cause: "GitHubApiRequestError" };
+            return Effect.succeed<FactoryTracker.CreatePullRequestOutcome>({
+              type: "ambiguous",
+              cause: "GitHubApiRequestError",
+            });
           }
-          return { type: "written", number };
+          return Effect.succeed<FactoryTracker.CreatePullRequestOutcome>({
+            type: "written",
+            number,
+          });
         }),
       markReadyForReview: ({ nodeId }) =>
         Effect.sync(() => {
@@ -745,4 +786,161 @@ it.live(
       assert.deepStrictEqual(hub.issues.get(200)?.parent, 2);
       assert.deepStrictEqual(hub.issues.get(142)?.blockedBy, [200]);
     }).pipe(Effect.provide(layerTest)),
+);
+
+const createsSent = (hub: Hub["Service"]) =>
+  hub.writes.filter((write) => write === "create pull request").length;
+
+/** A fresh FactoryEffects over the same store and remote, as after a restart. */
+const restartedEffects = Effect.scoped(
+  Effect.map(Layer.build(Layer.fresh(FactoryEffects.layer)), (context) =>
+    Context.get(context, FactoryEffects.FactoryEffects),
+  ),
+);
+
+it.live(
+  "Publication/97.A3: a lost create, a lagging listing and a later 422 leave one unresolved create, then land",
+  () =>
+    Effect.gen(function* () {
+      const hub = yield* Hub;
+      yield* configure;
+      const head = commitFile(hub.cwd, "b.txt", "work\n", "work");
+      yield* intendMerge("lagging", head);
+      hub.faults.loseCreateAnswer = true;
+      hub.pullListLag = 3;
+      for (let attempt = 0; attempt < 3; attempt++) yield* apply("integrate:lagging");
+      const unresolved = yield* recordOf("integrate:lagging");
+      // A 422 or an empty listing says nothing about the earlier create: it may have applied.
+      assert.strictEqual(unresolved.state, "intended");
+      assert.strictEqual(createsSent(hub), 1);
+      assert.strictEqual(hub.pulls.length, 1);
+      assert.strictEqual(unresolved.wait?.kind, "uncertain");
+      for (const part of ["who acts:", "action:", "resumes when:"]) {
+        assert.include(unresolved.lastError ?? "", part);
+      }
+      // GitHub lists it at last: the operation continues on that one pull request and lands it.
+      yield* apply("integrate:lagging");
+      hub.checksDone.add(head);
+      hub.approved.add(head);
+      yield* apply("integrate:lagging");
+      const landed = yield* recordOf("integrate:lagging");
+      const main = tipOf(hub, "main")!;
+      assert.deepStrictEqual(landed.state === "applied" ? landed.receipt : landed, {
+        kind: "pull_request_merge",
+        repository,
+        number: 143,
+        branch: "main",
+        commit: main,
+        parents: [hub.base, head],
+        tree: git(hub.origin, "rev-parse", `${main}^{tree}`),
+        attribution: "operation",
+      });
+      assert.strictEqual(createsSent(hub), 1);
+    }).pipe(Effect.provide(layerTest)),
+);
+
+it.live("Publication/97.A3: a fresh create GitHub refuses still fails as not created", () =>
+  Effect.gen(function* () {
+    const hub = yield* Hub;
+    yield* configure;
+    const head = commitFile(hub.cwd, "b.txt", "work\n", "work");
+    yield* intendMerge("refused", head);
+    hub.faults.refuseCreate = true;
+    yield* apply("integrate:refused");
+    const refused = yield* recordOf("integrate:refused");
+    assert.strictEqual(refused.state, "failed");
+    assert.include(
+      refused.state === "failed" ? refused.reason : "",
+      "refused: the pull request was not created",
+    );
+    assert.strictEqual(createsSent(hub), 1);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.live(
+  "Publication/97.A3: a create lost with the process, before or after it left, is never sent again unresolved",
+  () =>
+    Effect.gen(function* () {
+      const hub = yield* Hub;
+      yield* configure;
+      // Lost after GitHub opened it, with the listing lagging: a restart reads back and finds it.
+      const head = commitFile(hub.cwd, "b.txt", "work\n", "work");
+      yield* intendMerge("after", head);
+      hub.faults.createThenDie = true;
+      hub.pullListLag = 2;
+      yield* apply("integrate:after");
+      const restarted = yield* restartedEffects;
+      yield* restarted.apply("integrate:after");
+      yield* restarted.apply("integrate:after");
+      yield* restarted.apply("integrate:after");
+      assert.strictEqual(createsSent(hub), 1);
+      assert.strictEqual(hub.pulls.length, 1);
+      assert.strictEqual((yield* recordOf("integrate:after")).wait?.actor, "the required checks");
+      // Lost before it left: nothing exists, and nothing more is sent; the wait says who can act.
+      git(hub.cwd, "checkout", "-q", "-b", "second", hub.base);
+      const second = commitFile(hub.cwd, "c.txt", "second\n", "second");
+      yield* Effect.flatMap(FactoryOperationStore.FactoryOperationStore, (operations) =>
+        operations.intend({
+          operationId: "integrate:before",
+          factoryId,
+          itemKey: FactoryItemKey.make(`github:${repository}#150`),
+          intent: {
+            kind: "pull_request_merge",
+            projectId,
+            repository,
+            remote: "origin",
+            base: "main",
+            head: "t3-factory/effects/150",
+            reviewedHead: second,
+            method: "merge",
+            marker: "T3-Factory-Operation: integrate:before",
+            title: "Second",
+            body: "Refs #150",
+            acceptanceStatus: acceptance,
+          },
+        }),
+      );
+      hub.faults.dieBeforeCreate = true;
+      yield* apply("integrate:before");
+      yield* restarted.apply("integrate:before");
+      yield* restarted.apply("integrate:before");
+      const held = yield* recordOf("integrate:before");
+      assert.strictEqual(held.state, "intended");
+      assert.strictEqual(createsSent(hub), 1);
+      assert.isFalse(hub.pulls.some((pull) => pull.head === "t3-factory/effects/150"));
+      assert.include(held.lastError ?? "", "t3-factory/effects/150");
+      // Its owner opens the pull request; the operation continues on it.
+      hub.pulls.push({
+        number: 150,
+        head: "t3-factory/effects/150",
+        base: "main",
+        state: "open",
+        draft: false,
+        merged: undefined,
+      });
+      yield* restarted.apply("integrate:before");
+      assert.strictEqual((yield* recordOf("integrate:before")).wait?.actor, "the required checks");
+      assert.strictEqual(createsSent(hub), 1);
+    }).pipe(Effect.provide(layerTest)),
+);
+
+it.live("Publication/97.A3: concurrent attempts send one create", () =>
+  Effect.gen(function* () {
+    const hub = yield* Hub;
+    yield* configure;
+    const head = commitFile(hub.cwd, "b.txt", "work\n", "work");
+    yield* intendMerge("concurrent", head);
+    hub.faults.loseCreateAnswer = true;
+    hub.pullListLag = 4;
+    hub.pullSearch = yield* Deferred.make<void>();
+    yield* Effect.all([apply("integrate:concurrent"), apply("integrate:concurrent")], {
+      concurrency: 2,
+    });
+    hub.pullSearch = undefined;
+    yield* apply("integrate:concurrent");
+    yield* apply("integrate:concurrent");
+    assert.strictEqual(createsSent(hub), 1);
+    assert.strictEqual(hub.pulls.length, 1);
+    assert.strictEqual((yield* recordOf("integrate:concurrent")).state, "intended");
+  }).pipe(Effect.provide(layerTest)),
 );

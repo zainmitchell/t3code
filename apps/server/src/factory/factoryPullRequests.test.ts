@@ -10,6 +10,7 @@ import {
   isMergedElsewhere,
   MERGED_ELSEWHERE,
   type PullRequestAttempt,
+  type PullRequestCreateLedger,
   pullRequestStep,
   type PullRequestFacts,
   type PullRequestStep,
@@ -166,6 +167,7 @@ it.effect(
         const completion = yield* attemptPullRequestMerge(session, integrator, {
           cwd: "/unused",
           intent: { ...intent("a".repeat(40)), remote: credentialRemote },
+          creates: ledger(),
         });
         assert.strictEqual(completion.state, "waiting");
         if (completion.state !== "waiting") return;
@@ -350,6 +352,25 @@ it("PR integration: only the work can answer a merge at another head; a missing 
 });
 
 const repository = "example-org/example-project";
+
+/** An operation's create record kept in memory, as FactoryOperationStore keeps it on the record. */
+const ledger = (unresolved = false): PullRequestCreateLedger => {
+  let pending: { attempt: number; cleared?: string } | undefined;
+  return {
+    unresolved,
+    record: Effect.sync(() => {
+      if (pending !== undefined && pending.cleared === undefined) return Option.none();
+      pending = { attempt: (pending?.attempt ?? 0) + 1 };
+      return Option.some({ attempt: pending.attempt });
+    }),
+    clear: (attempt, by) =>
+      Effect.sync(() => {
+        if (pending?.attempt !== attempt || pending.cleared !== undefined) return false;
+        pending.cleared = by;
+        return true;
+      }),
+  };
+};
 const intent = (reviewedHead: string) =>
   ({
     kind: "pull_request_merge",
@@ -420,6 +441,7 @@ it.effect(
         attemptPullRequestMerge(session, integrator, {
           cwd: "/unused",
           intent: intent(reviewedHead),
+          creates: ledger(),
         });
       const sibling = yield* attempt(siblingHead);
       assert.deepStrictEqual(yield* attempt(siblingHead), sibling);
@@ -465,6 +487,7 @@ it.effect(
       const elsewhere = yield* attemptPullRequestMerge(merged.session, integrator, {
         cwd: "/unused",
         intent: intent(siblingHead),
+        creates: ledger(),
       });
       assert.isTrue(elsewhere.state === "failed" && isMergedElsewhere(elsewhere.reason));
       const session = {
@@ -475,6 +498,7 @@ it.effect(
         yield* attemptPullRequestMerge(session, integrator, {
           cwd: "/unused",
           intent: intent(siblingHead),
+          creates: ledger(),
         }),
         {
           state: "applied",
@@ -562,11 +586,11 @@ const recordingRemote = (state: {
         return { type: "published" as const };
       }),
   };
-  const attempt = (marker: string) =>
+  const attempt = (marker: string, creates = ledger()) =>
     attemptPullRequestMerge(
       session as FactoryTracker.TrackerSession,
       integrator as FactoryIntegrator.FactoryIntegratorShape,
-      { cwd: "/unused", intent: { ...intent(reviewed), marker } },
+      { cwd: "/unused", intent: { ...intent(reviewed), marker }, creates },
     );
   return { writes, attempt };
 };
@@ -684,5 +708,33 @@ it.effect(
       });
       assert.deepStrictEqual(yield* lost.attempt(ordinary), landed);
       assert.deepStrictEqual(lost.writes, ["publish", "status", "merge"]);
+    }),
+);
+
+it.effect(
+  "PR integration: an unresolved earlier create only reads back, whatever a later answer would say",
+  () =>
+    Effect.gen(function* () {
+      const remote = recordingRemote({ contains: false, tip: "b".repeat(40) });
+      const waiting = yield* remote.attempt(ordinary, ledger(true));
+      assert.deepStrictEqual(shown(waiting), {
+        reason:
+          "a create of the pull request from factory/41-example into main may have applied, and GitHub lists none yet; no other create is sent",
+        kind: "uncertain",
+        actor: `GitHub's pull request listing, or the owner of ${repository}`,
+        resume: "GitHub lists a pull request from factory/41-example into main",
+      });
+      assert.deepStrictEqual(remote.writes, ["publish"]);
+      // Once the pull request is listed, the unresolved create is moot and the attempt goes on.
+      const listed = recordingRemote({
+        pull: open({ mergeableState: "blocked" }),
+        contains: false,
+        tip: "b".repeat(40),
+      });
+      assert.strictEqual(
+        shown(yield* listed.attempt(ordinary, ledger(true))).reason,
+        "pull request #41 awaits checks: ci / test",
+      );
+      assert.deepStrictEqual(listed.writes, ["publish", "status"]);
     }),
 );

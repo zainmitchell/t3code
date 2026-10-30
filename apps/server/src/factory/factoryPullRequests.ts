@@ -200,6 +200,26 @@ export type PullRequestAttempt =
   | FactoryOperationStore.FactoryOperationCompletion
   | { readonly state: "waiting"; readonly reason: string; readonly wait: WaitFor };
 
+/**
+ * This operation's durable record of the pull request creates it sends: recorded before each one leaves,
+ * so a create whose answer or process was lost is never followed by another until its pull request is
+ * listed or its refusal cleared it.
+ */
+export interface PullRequestCreateLedger {
+  /** A create recorded before this attempt and not cleared: it may have opened the pull request. */
+  readonly unresolved: boolean;
+  /** Records the create about to be sent; none when another attempt recorded one first. */
+  readonly record: Effect.Effect<
+    Option.Option<{ readonly attempt: number }>,
+    FactoryOperationStore.FactoryOperationStoreError
+  >;
+  /** Records that the create was refused or never sent, so none stands from it. */
+  readonly clear: (
+    attempt: number,
+    by: string,
+  ) => Effect.Effect<boolean, FactoryOperationStore.FactoryOperationStoreError>;
+}
+
 type Intent = Extract<
   FactoryOperationStore.FactoryOperationIntent,
   { readonly kind: "pull_request_merge" }
@@ -238,12 +258,18 @@ export const reviewedHeadInBase = Effect.fnUntraced(function* (
 export const attemptPullRequestMerge = Effect.fnUntraced(function* (
   session: FactoryTracker.TrackerSession,
   integrator: FactoryIntegrator.FactoryIntegratorShape,
-  input: { readonly cwd: string; readonly intent: Intent },
+  input: {
+    readonly cwd: string;
+    readonly intent: Intent;
+    readonly creates: PullRequestCreateLedger;
+  },
 ): Effect.fn.Return<
   PullRequestAttempt,
-  FactoryTracker.FactoryTrackerError | FactoryIntegrator.FactoryIntegratorError
+  | FactoryTracker.FactoryTrackerError
+  | FactoryIntegrator.FactoryIntegratorError
+  | FactoryOperationStore.FactoryOperationStoreError
 > {
-  const { cwd, intent } = input;
+  const { cwd, intent, creates } = input;
   const { repository } = intent;
   const landed = Effect.fnUntraced(function* (number: number, commit: string) {
     const merged = yield* session.readCommit({ repository, sha: commit });
@@ -349,6 +375,21 @@ export const attemptPullRequestMerge = Effect.fnUntraced(function* (
     }
   }
   if (Option.isNone(found)) {
+    // A 422 or an empty listing says nothing about an earlier create that left: only its pull
+    // request being listed resolves it (github-api-proof-boundaries.json).
+    const unresolved = {
+      state: "waiting" as const,
+      reason: `a create of the pull request from ${intent.head} into ${intent.base} may have applied, and GitHub lists none yet; no other create is sent`,
+      wait: uncertain({
+        actor: `GitHub's pull request listing, or the owner of ${repository}`,
+        action: `list pull requests from ${intent.head} into ${intent.base}; if none exists, open it yourself`,
+        resume: `GitHub lists a pull request from ${intent.head} into ${intent.base}`,
+        facts: ["create_pull_request_unresolved", intent.head, intent.base],
+      }),
+    };
+    if (creates.unresolved) return unresolved;
+    const recorded = yield* creates.record;
+    if (Option.isNone(recorded)) return unresolved;
     const created = yield* session.createPullRequest({
       repository,
       head: intent.head,
@@ -358,6 +399,10 @@ export const attemptPullRequestMerge = Effect.fnUntraced(function* (
     });
     // Whatever the answer said, the pull request that exists now is the one to go on with.
     found = yield* session.findPullRequest({ repository, head: intent.head, base: intent.base });
+    if (Option.isNone(found) && created.type === "rejected") {
+      // Refused by GitHub, or never sent: no pull request stands from this create.
+      yield* creates.clear(recorded.value.attempt, `refused: ${created.cause}`);
+    }
     if (Option.isNone(found)) {
       return created.type === "rejected" && !created.transient
         ? {
