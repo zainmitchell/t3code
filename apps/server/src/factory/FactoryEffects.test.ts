@@ -16,6 +16,7 @@ import {
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 
@@ -103,6 +104,20 @@ class Hub extends Context.Service<
     /** Concurrent attempts both list before either records its create. */
     pullSearch: Deferred.Deferred<void> | undefined;
     pullSearches: number;
+    /**
+     * A fixed schedule for two attempts on one operation: the first lists, the second lists and waits
+     * until the first has cleared its refused create, and the first then waits to be released.
+     */
+    race:
+      | {
+          finds: number;
+          notes: number;
+          readonly firstListed: Deferred.Deferred<void>;
+          readonly secondListed: Deferred.Deferred<void>;
+          readonly cleared: Deferred.Deferred<void>;
+          readonly release: Deferred.Deferred<void>;
+        }
+      | undefined;
   }
 >()("t3/factory/FactoryEffects.test/Hub") {}
 
@@ -169,6 +184,7 @@ const layerHub = Layer.effect(
         pullListLag: 0,
         pullSearch: undefined,
         pullSearches: 0,
+        race: undefined,
       } satisfies Hub["Service"];
     }),
     ({ root }) => Effect.sync(() => NodeFS.rmSync(root, { recursive: true, force: true })),
@@ -202,6 +218,15 @@ const layerTracker = Layer.effect(
       account: { accountId: "9001" },
       findPullRequest: ({ head, base }) =>
         Effect.gen(function* () {
+          const race = hub.race;
+          if (race !== undefined) {
+            race.finds += 1;
+            if (race.finds === 1) yield* Deferred.succeed(race.firstListed, undefined);
+            if (race.finds === 2) {
+              yield* Deferred.succeed(race.secondListed, undefined);
+              yield* Deferred.await(race.cleared);
+            }
+          }
           hub.pullSearches += 1;
           if (hub.pullSearch !== undefined) {
             if (hub.pullSearches === 2) yield* Deferred.succeed(hub.pullSearch, undefined);
@@ -438,10 +463,38 @@ const layerProjects = Layer.effect(
   ),
 );
 
+/** The real store, holding the first attempt's create record and refusal at the race's fixed points. */
+const layerOperations = Layer.effect(
+  FactoryOperationStore.FactoryOperationStore,
+  Effect.gen(function* () {
+    const operations = yield* FactoryOperationStore.FactoryOperationStore;
+    const hub = yield* Hub;
+    return FactoryOperationStore.FactoryOperationStore.of({
+      ...operations,
+      notePullRequestCreate: (operationId) =>
+        Effect.gen(function* () {
+          const race = hub.race;
+          if (race !== undefined && race.notes++ === 0) yield* Deferred.await(race.secondListed);
+          return yield* operations.notePullRequestCreate(operationId);
+        }),
+      clearPullRequestCreate: (input) =>
+        Effect.gen(function* () {
+          const cleared = yield* operations.clearPullRequestCreate(input);
+          const race = hub.race;
+          if (race !== undefined) {
+            yield* Deferred.succeed(race.cleared, undefined);
+            yield* Deferred.await(race.release);
+          }
+          return cleared;
+        }),
+    });
+  }),
+).pipe(Layer.provide(FactoryOperationStore.layer));
+
 const layerTest = FactoryEffects.layer.pipe(
   Layer.provideMerge(
     Layer.mergeAll(
-      FactoryOperationStore.layer,
+      layerOperations,
       FactoryStore.layer,
       EffectOutbox.layer,
       FactoryEffects.layerWakes,
@@ -943,4 +996,63 @@ it.live("Publication/97.A3: concurrent attempts send one create", () =>
     assert.strictEqual(hub.pulls.length, 1);
     assert.strictEqual((yield* recordOf("integrate:concurrent")).state, "intended");
   }).pipe(Effect.provide(layerTest)),
+);
+
+it.live(
+  "Publication/97.A3: an earlier attempt's refusal never ends a newer create whose fate is unknown",
+  () =>
+    Effect.gen(function* () {
+      const hub = yield* Hub;
+      yield* configure;
+      const head = commitFile(hub.cwd, "b.txt", "work\n", "work");
+      yield* intendMerge("race", head);
+      hub.race = {
+        finds: 0,
+        notes: 0,
+        firstListed: yield* Deferred.make<void>(),
+        secondListed: yield* Deferred.make<void>(),
+        cleared: yield* Deferred.make<void>(),
+        release: yield* Deferred.make<void>(),
+      };
+      // The first create is refused; the second opens the pull request, its answer is lost and the
+      // listing lags it.
+      hub.faults.refuseCreate = true;
+      hub.faults.loseCreateAnswer = true;
+      hub.pullListLag = 2;
+      const first = yield* Effect.forkChild(apply("integrate:race"));
+      yield* Deferred.await(hub.race.firstListed);
+      // Both attempts read the operation before either recorded a create.
+      const second = yield* Effect.forkChild(apply("integrate:race"));
+      yield* Fiber.join(second);
+      yield* Deferred.succeed(hub.race.release, undefined);
+      yield* Fiber.join(first);
+      hub.race = undefined;
+      const raced = yield* recordOf("integrate:race");
+      assert.strictEqual(raced.state, "intended");
+      assert.strictEqual(raced.pullRequestCreate?.attempt, 2);
+      assert.isUndefined(raced.pullRequestCreate?.cleared);
+      assert.strictEqual(createsSent(hub), 2);
+      assert.strictEqual(hub.pulls.length, 1);
+      // Replayed after a restart, the unresolved create is read back, never sent again, and lands once.
+      const restarted = yield* restartedEffects;
+      yield* restarted.apply("integrate:race");
+      yield* restarted.apply("integrate:race");
+      hub.checksDone.add(head);
+      hub.approved.add(head);
+      yield* restarted.apply("integrate:race");
+      const landed = yield* recordOf("integrate:race");
+      const main = tipOf(hub, "main")!;
+      assert.deepStrictEqual(landed.state === "applied" ? landed.receipt : landed, {
+        kind: "pull_request_merge",
+        repository,
+        number: 143,
+        branch: "main",
+        commit: main,
+        parents: [hub.base, head],
+        tree: git(hub.origin, "rev-parse", `${main}^{tree}`),
+        attribution: "operation",
+      });
+      assert.strictEqual(createsSent(hub), 2);
+      assert.strictEqual(hub.pulls.length, 1);
+    }).pipe(Effect.provide(layerTest)),
 );

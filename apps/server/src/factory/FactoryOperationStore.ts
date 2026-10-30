@@ -251,10 +251,14 @@ export class FactoryOperationStore extends Context.Service<
       readonly factoryId: FactoryId;
       readonly itemKey: FactoryItemKey;
     }) => Effect.Effect<ReadonlyArray<FactoryOperation>, FactoryOperationStoreError>;
-    /** Records how an intended operation ended; false when it already ended. */
+    /**
+     * Records how an intended operation ended; false when it already ended. With `createAttempt`, the
+     * completion is only that pull request create's to give: false when the record names another.
+     */
     readonly complete: (input: {
       readonly operationId: string;
       readonly completion: FactoryOperationCompletion;
+      readonly createAttempt?: number;
     }) => Effect.Effect<boolean, FactoryOperationStoreError>;
     /**
      * Keeps an intended operation intended, with why its last attempt did not end it. A wait on
@@ -454,27 +458,46 @@ const make = Effect.gen(function* () {
       function* (input: {
         readonly operationId: string;
         readonly completion: FactoryOperationCompletion;
+        readonly createAttempt?: number;
       }) {
-        const current = yield* read(input.operationId);
-        if (Option.isNone(current) || current.value.state !== "intended") return false;
-        const { state: _state, lastError: _lastError, wait: _wait, ...fields } = current.value;
         const completedAt = DateTime.formatIso(yield* DateTime.now);
-        const completed: FactoryOperation =
-          input.completion.state === "applied"
-            ? { ...fields, state: "applied", receipt: input.completion.receipt, completedAt }
-            : {
-                ...fields,
-                state: input.completion.state,
-                reason: input.completion.reason,
-                completedAt,
-              };
-        const rows = yield* sql`
-          UPDATE factory_operations
-          SET state = ${completed.state}, record_json = ${yield* encodeOperation(completed)}
-          WHERE operation_id = ${input.operationId} AND state = 'intended'
-          RETURNING operation_id
-        `;
-        return rows.length === 1;
+        // Compared with the record as read, so a create recorded meanwhile is never ended by an
+        // answer about an earlier one.
+        for (let attempt = 0; attempt < 5; attempt++) {
+          const rows = yield* sql<{ readonly record_json: string }>`
+            SELECT record_json FROM factory_operations
+            WHERE operation_id = ${input.operationId} AND state = 'intended'
+          `;
+          const row = rows[0];
+          if (row === undefined) return false;
+          const current = yield* decodeOperation(row.record_json);
+          if (current.state !== "intended") return false;
+          if (
+            input.createAttempt !== undefined &&
+            current.pullRequestCreate?.attempt !== input.createAttempt
+          ) {
+            return false;
+          }
+          const { state: _state, lastError: _lastError, wait: _wait, ...fields } = current;
+          const completed: FactoryOperation =
+            input.completion.state === "applied"
+              ? { ...fields, state: "applied", receipt: input.completion.receipt, completedAt }
+              : {
+                  ...fields,
+                  state: input.completion.state,
+                  reason: input.completion.reason,
+                  completedAt,
+                };
+          const written = yield* sql`
+            UPDATE factory_operations
+            SET state = ${completed.state}, record_json = ${yield* encodeOperation(completed)}
+            WHERE operation_id = ${input.operationId} AND state = 'intended'
+              AND record_json = ${row.record_json}
+            RETURNING operation_id
+          `;
+          if (written.length === 1) return true;
+        }
+        return false;
       },
       Effect.mapError(fail("complete")),
     ),
