@@ -332,6 +332,49 @@ it.live(
           },
         );
         assert.strictEqual(git(repo.origin, "rev-parse", branch.branch), repo.head);
+        // A tip the caller did not prove is not replaced, even one that exists locally.
+        assert.deepStrictEqual(
+          yield* integrator.publish({
+            cwd: repo.cwd,
+            ...branch,
+            commit: rebased,
+            replace: repo.base,
+          }),
+          { type: "diverged", tip: repo.head },
+        );
+        assert.strictEqual(git(repo.origin, "rev-parse", branch.branch), repo.head);
+        // Exactly the proven tip is replaced, under a lease on it.
+        assert.deepStrictEqual(
+          yield* integrator.publish({
+            cwd: repo.cwd,
+            ...branch,
+            commit: rebased,
+            replace: repo.head,
+          }),
+          { type: "published" },
+        );
+        assert.strictEqual(git(repo.origin, "rev-parse", branch.branch), rebased);
+        // Someone else moves the branch after its tip was proved: the proof no longer holds.
+        write(repo.cwd, "c.txt", "someone else\n");
+        git(repo.cwd, "add", ".");
+        git(repo.cwd, "commit", "-m", "someone else's work");
+        const foreign = git(repo.cwd, "rev-parse", "HEAD");
+        git(repo.cwd, "push", "origin", `${foreign}:refs/heads/${branch.branch}`);
+        git(repo.cwd, "checkout", "-b", "amended", repo.base);
+        write(repo.cwd, "b.txt", "amended\n");
+        git(repo.cwd, "add", ".");
+        git(repo.cwd, "commit", "-m", "amended work");
+        const amended = git(repo.cwd, "rev-parse", "HEAD");
+        assert.deepStrictEqual(
+          yield* integrator.publish({
+            cwd: repo.cwd,
+            ...branch,
+            commit: amended,
+            replace: rebased,
+          }),
+          { type: "diverged", tip: foreign },
+        );
+        assert.strictEqual(git(repo.origin, "rev-parse", branch.branch), foreign);
       }),
     ).pipe(Effect.provide(layer)),
 );

@@ -55,13 +55,16 @@ interface PublishRefused {
 export interface FactoryIntegratorShape {
   /**
    * Puts a reviewed head on a remote branch for its pull request: creates the branch or
-   * fast-forwards it, never overwrites it. `diverged` leaves the branch as someone made it.
+   * fast-forwards it. It overwrites only `replace`, when the branch still holds exactly that tip,
+   * under a lease on it. `diverged` leaves the branch as someone made it.
    */
   readonly publish: (input: {
     readonly cwd: string;
     readonly remote: string;
     readonly branch: string;
     readonly commit: string;
+    /** A tip the caller proved T3 itself published on this branch for this item. */
+    readonly replace?: string;
   }) => Effect.Effect<
     | { readonly type: "published" }
     | { readonly type: "diverged"; readonly tip: string }
@@ -334,22 +337,26 @@ const make = Effect.gen(function* () {
     readonly remote: string;
     readonly branch: string;
     readonly commit: string;
+    readonly replace?: string;
   }) {
     const { cwd, commit } = input;
     const target = { branch: input.branch, remote: input.remote };
     const current = yield* tip({ cwd, target });
     if (current === commit) return { type: "published" } as const;
-    if (current !== null) {
+    const replacing = current !== null && current === input.replace;
+    if (current !== null && !replacing) {
       // Every ancestor of the reviewed head is local; a tip we do not have is someone else's.
       const known = yield* run("publish", cwd, ["cat-file", "-e", `${current}^{commit}`]);
       if (known.exitCode !== 0 || !(yield* isAncestor(cwd, current, commit))) {
         return { type: "diverged", tip: current } as const;
       }
     }
-    // A plain push: the remote itself refuses anything but a create or a fast-forward.
+    // A plain push, which the remote refuses unless it creates or fast-forwards; or the lease on
+    // exactly the proven tip, which it refuses if the branch moved since it was read.
     const pushed = yield* run("publish", cwd, [
       "push",
       "--porcelain",
+      ...(replacing ? [`--force-with-lease=${localRef(input.branch)}:${current}`] : []),
       input.remote,
       `${commit}:${localRef(input.branch)}`,
     ]);

@@ -411,6 +411,30 @@ const make = Effect.gen(function* () {
                   by,
                 }),
             },
+            publications: {
+              // Only this factory and item's own receipts, on the same repository, remote and branch.
+              proves: (tip) =>
+                Effect.map(
+                  operations.forItem({
+                    factoryId: operation.factoryId,
+                    itemKey: operation.itemKey,
+                  }),
+                  (recorded) =>
+                    recorded.some(
+                      (each) =>
+                        each.intent.kind === "pull_request_merge" &&
+                        each.intent.repository === intent.repository &&
+                        each.intent.remote === intent.remote &&
+                        each.published?.branch === intent.head &&
+                        each.published.commit === tip,
+                    ),
+                ),
+              record: operations.notePublished({
+                operationId: operation.operationId,
+                branch: intent.head,
+                commit: intent.reviewedHead,
+              }),
+            },
           }),
       );
     }

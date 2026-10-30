@@ -222,6 +222,16 @@ export interface PullRequestCreateLedger {
   ) => Effect.Effect<boolean, FactoryOperationStore.FactoryOperationStoreError>;
 }
 
+/** This item's own publications on its pull request branch, as T3 recorded them. */
+export interface PublicationLedger {
+  /** Whether a receipt of this item, repository, remote and branch names exactly `tip`. */
+  readonly proves: (
+    tip: string,
+  ) => Effect.Effect<boolean, FactoryOperationStore.FactoryOperationStoreError>;
+  /** Records that the remote accepted the reviewed head on the branch. */
+  readonly record: Effect.Effect<boolean, FactoryOperationStore.FactoryOperationStoreError>;
+}
+
 type Intent = Extract<
   FactoryOperationStore.FactoryOperationIntent,
   { readonly kind: "pull_request_merge" }
@@ -264,6 +274,7 @@ export const attemptPullRequestMerge = Effect.fnUntraced(function* (
     readonly cwd: string;
     readonly intent: Intent;
     readonly creates: PullRequestCreateLedger;
+    readonly publications: PublicationLedger;
   },
 ): Effect.fn.Return<
   PullRequestAttempt,
@@ -345,12 +356,19 @@ export const attemptPullRequestMerge = Effect.fnUntraced(function* (
     }
   }
   if (Option.isNone(found) || found.value.state === "open") {
-    const published = yield* integrator.publish({
+    const publication = {
       cwd,
       remote: intent.remote,
       branch: intent.head,
       commit: intent.reviewedHead,
-    });
+    };
+    let published = yield* integrator.publish(publication);
+    // An amended or rebased reviewed head replaces only a tip this item's own receipt names, under
+    // a lease on it; a tip nothing proves is T3's, or one that moved, stays and fails below.
+    if (published.type === "diverged" && (yield* input.publications.proves(published.tip))) {
+      published = yield* integrator.publish({ ...publication, replace: published.tip });
+    }
+    if (published.type === "published") yield* input.publications.record;
     if (published.type === "diverged") {
       return {
         state: "failed",

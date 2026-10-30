@@ -10,6 +10,7 @@ import {
   isMergedElsewhere,
   MERGED_ELSEWHERE,
   type PullRequestAttempt,
+  type PublicationLedger,
   type PullRequestCreateLedger,
   pullRequestStep,
   type PullRequestFacts,
@@ -168,6 +169,7 @@ it.effect(
           cwd: "/unused",
           intent: { ...intent("a".repeat(40)), remote: credentialRemote },
           creates: ledger(),
+          publications: unproved,
         });
         assert.strictEqual(completion.state, "waiting");
         if (completion.state !== "waiting") return;
@@ -353,6 +355,11 @@ it("PR integration: only the work can answer a merge at another head; a missing 
 
 const repository = "example-org/example-project";
 
+/** No publication of this item is on record: nothing on its branch is T3's to replace. */
+const unproved: PublicationLedger = {
+  proves: () => Effect.succeed(false),
+  record: Effect.succeed(true),
+};
 /** An operation's create record kept in memory, as FactoryOperationStore keeps it on the record. */
 const ledger = (unresolved = false): PullRequestCreateLedger => {
   let pending: { attempt: number; cleared?: string } | undefined;
@@ -442,6 +449,7 @@ it.effect(
           cwd: "/unused",
           intent: intent(reviewedHead),
           creates: ledger(),
+          publications: unproved,
         });
       const sibling = yield* attempt(siblingHead);
       assert.deepStrictEqual(yield* attempt(siblingHead), sibling);
@@ -488,6 +496,7 @@ it.effect(
         cwd: "/unused",
         intent: intent(siblingHead),
         creates: ledger(),
+        publications: unproved,
       });
       assert.isTrue(elsewhere.state === "failed" && isMergedElsewhere(elsewhere.reason));
       const session = {
@@ -499,6 +508,7 @@ it.effect(
           cwd: "/unused",
           intent: intent(siblingHead),
           creates: ledger(),
+          publications: unproved,
         }),
         {
           state: "applied",
@@ -590,7 +600,7 @@ const recordingRemote = (state: {
     attemptPullRequestMerge(
       session as FactoryTracker.TrackerSession,
       integrator as FactoryIntegrator.FactoryIntegratorShape,
-      { cwd: "/unused", intent: { ...intent(reviewed), marker }, creates },
+      { cwd: "/unused", intent: { ...intent(reviewed), marker }, creates, publications: unproved },
     );
   return { writes, attempt };
 };

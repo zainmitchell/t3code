@@ -173,6 +173,13 @@ const Fields = {
       cleared: Schema.optional(Schema.String),
     }),
   ),
+  /**
+   * The head a `pull_request_merge` put on its branch, once the remote accepted it: the only proof
+   * that a tip there is T3's own for this item. A commit merely existing locally proves nothing.
+   */
+  published: Schema.optional(
+    Schema.Struct({ branch: Schema.String, commit: Schema.String, at: Schema.String }),
+  ),
 };
 
 export const FactoryOperation = Schema.Union([
@@ -287,6 +294,12 @@ export class FactoryOperationStore extends Context.Service<
     readonly notePullRequestCreate: (
       operationId: string,
     ) => Effect.Effect<Option.Option<{ readonly attempt: number }>, FactoryOperationStoreError>;
+    /** Records the head an intended pull request merge published on its branch. */
+    readonly notePublished: (input: {
+      readonly operationId: string;
+      readonly branch: string;
+      readonly commit: string;
+    }) => Effect.Effect<boolean, FactoryOperationStoreError>;
     /** Clears that pull request create, naming why none stands from it; false if it changed. */
     readonly clearPullRequestCreate: (input: {
       readonly operationId: string;
@@ -554,6 +567,22 @@ const make = Effect.gen(function* () {
         ).pipe(Option.map(({ attempt }) => ({ attempt })));
       },
       Effect.mapError(fail("note-pull-request-create")),
+    ),
+    notePublished: Effect.fn("FactoryOperationStore.notePublished")(
+      function* (input: {
+        readonly operationId: string;
+        readonly branch: string;
+        readonly commit: string;
+      }) {
+        const at = DateTime.formatIso(yield* DateTime.now);
+        const written = yield* amend(input.operationId, (current) =>
+          current.published?.branch === input.branch && current.published.commit === input.commit
+            ? undefined
+            : { ...current, published: { branch: input.branch, commit: input.commit, at } },
+        );
+        return Option.isSome(written);
+      },
+      Effect.mapError(fail("note-published")),
     ),
     clearPullRequestCreate: Effect.fn("FactoryOperationStore.clearPullRequestCreate")(
       function* (input: {

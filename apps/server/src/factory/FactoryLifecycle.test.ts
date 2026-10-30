@@ -1627,10 +1627,15 @@ const layerIntegratorFake = Layer.effect(
       tree: `tree-${commit}`,
     });
     return FactoryIntegrator.FactoryIntegrator.of({
-      publish: ({ branch, commit }) =>
+      publish: ({ branch, commit, replace }) =>
         Effect.sync(() => {
           const current = github.remoteBranches.get(branch);
-          if (current !== undefined && current !== commit && !ancestors(commit).has(current)) {
+          if (
+            current !== undefined &&
+            current !== commit &&
+            current !== replace &&
+            !ancestors(commit).has(current)
+          ) {
             return { type: "diverged" as const, tip: current };
           }
           github.remoteBranches.set(branch, commit);
@@ -14396,9 +14401,15 @@ it.effect(
     ),
 );
 
-it.effect(
-  "Lifecycle/beta-PR: failing checks are the work's to correct, and the rework lands through the same pull request",
-  () =>
+// The rework's head descends from the published one, is amended onto the base, or is amended
+// after someone else moved the branch T3 published.
+it.effect.each([
+  ["descends from the published head", "c0007202", false],
+  ["is amended onto the base", lifecycleBase, false],
+  ["is amended after someone else moved the branch", lifecycleBase, true],
+] as const)(
+  "Lifecycle/beta-PR: failing checks are the work's to correct, and a rework that %s lands through the same pull request only from T3's own tip",
+  ([, parent, moved]) =>
     runIsolated(
       Effect.scoped(
         Effect.gen(function* () {
@@ -14429,7 +14440,7 @@ it.effect(
           });
           const rework = admittedBy(yield* advance("outcome"));
           assert.deepStrictEqual(stageOf(rework), [item, "rework"]);
-          yield* recordCommit("c0007203", ["c0007202"]);
+          yield* recordCommit("c0007203", [parent]);
           github.checks.set("c0007203", "success");
           yield* workStage(rework, {
             outcome: "implemented",
@@ -14442,6 +14453,19 @@ it.effect(
             subject: subjectFor("c0007203"),
             summary: "Passes.",
           });
+          if (moved) {
+            // A tip no receipt of this item names is someone else's: it stays, nothing merges.
+            yield* recordCommit("f0007202", ["c0007202"]);
+            github.remoteBranches.set(branch, "f0007202");
+            yield* advance("outcome");
+            assert.strictEqual(github.remoteBranches.get(branch), "f0007202");
+            assert.isUndefined((yield* pullsFor(branch))[0]?.merged);
+            assert.include(
+              JSON.stringify((yield* integrationOf(7202)).outcomes),
+              "not_fast_forward",
+            );
+            return;
+          }
           yield* advance("outcome");
           const pulls = yield* pullsFor(branch);
           assert.strictEqual(pulls.length, 1);
