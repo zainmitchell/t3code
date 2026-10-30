@@ -504,6 +504,8 @@ export interface CustodyFence {
   readonly factoryId: FactoryId;
   readonly custodyRead: ReadonlyArray<FactoryReservationId>;
   readonly transfersRead: ReadonlyArray<{ readonly transferId: string; readonly state: string }>;
+  /** The configuration revision an act's authority was read from; a later one refuses it. */
+  readonly configurationRevision?: number;
 }
 
 /**
@@ -528,6 +530,13 @@ export const custodyMoved = Effect.fnUntraced(function* (
       (row.parent_reservation_id === null || !read.has(row.parent_reservation_id)),
   );
   if (unread) return true;
+  if (fence.configurationRevision !== undefined) {
+    const [latest] = yield* sql<{ readonly revision: number }>`
+      SELECT MAX(revision) AS revision FROM factory_configurations
+      WHERE factory_id = ${fence.factoryId}
+    `;
+    if (latest?.revision !== fence.configurationRevision) return true;
+  }
   // A transfer makes a legacy writer known whether or not it holds a reservation, and a rollback
   // hands it back still writing.
   const weighed = new Set(

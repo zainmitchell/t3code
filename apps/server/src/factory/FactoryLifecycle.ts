@@ -190,6 +190,10 @@ const overtakenBy = (
   if (decision === undefined || isPolicyFailure(decision) || isNothingProposed(decision)) {
     return undefined;
   }
+  // A parent closure waiting on its owner's answer still asks that question.
+  if (isProceed(decision) && decision.parentClosure?.ownerDecisionId === pending.decisionId) {
+    return undefined;
+  }
   const asks = isReservationRequest(decision)
     ? { kind: "gate", evidenceDigest: decision.evidenceDigest }
     : isProceed(decision) ||
@@ -1321,10 +1325,11 @@ export const makePreparedCriteriaPublication = (deps: {
           reservation.issue !== input.issue ||
           reservation.root !== root.root ||
           reservation.digest !== input.digest ||
-          canonical(reservation.basis) !== canonical(input.basis) ||
           !sameIdentity(reservation.rootIdentity, root.identity)
         )
-          return "the target belongs to another preparation basis or criteria root";
+          return "the target belongs to another parent or criteria root";
+        // The same bytes revalidated on a later basis are the same kept copy; it keeps its
+        // creation's basis as provenance.
         let record = found.value;
         if (record.state === "reserved") {
           const opened = yield* fs.open(reservation.anchorPath, { flag: "wx" }).pipe(Effect.result);
@@ -4228,7 +4233,8 @@ const make = Effect.gen(function* () {
             `Clause ${clause.id} (${landed.scope}): ${landed.itemKey} landed ${landed.commit} (tree ${landed.tree}) by ${landed.operationId}, reviewed head ${landed.reviewedHead}.`,
         ),
       ),
-      fence,
+      // The parent authority this closure was judged under must still be current at its commit.
+      fence: { ...fence, configurationRevision: configuration.revision },
     });
   });
 

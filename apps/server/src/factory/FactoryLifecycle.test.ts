@@ -13723,6 +13723,145 @@ it.effect(
     ),
 );
 
+it.effect.each(["prepared", "adopted"] as const)(
+  "Parent/authority: %s closure cannot commit beside authority replaced after validation",
+  (route) =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          yield* configureLifecycleFactory;
+          const criteriaRoot = yield* fs.realPath(yield* fs.makeTempDirectoryScoped());
+          yield* configureFactory(
+            lifecycleConfiguration({ parents: { close: "project", criteriaRoot } }),
+          );
+          const body = "## Acceptance\n- A: keep the required result\n";
+          yield* seedIssue(7921, { body });
+          yield* seedIssue(7922, { parentNumber: 7921, body });
+          const state = {
+            ready: new Set([7922]),
+            prepared: undefined as Prepared | undefined,
+            retriage: false,
+          };
+          yield* usePolicy(preparingPolicy(7921, state));
+          yield* landThroughT3(7922, "c0007922");
+          const prepared = preparedCriteriaFor(7921, body, [
+            {
+              id: "A",
+              evidence: [{ itemKey: itemKeyFor(7922), scope: "A: keep the required result" }],
+            },
+          ]);
+          const criteria = { root: criteriaRoot, path: "root.json", sha256: prepared.sha256 };
+          if (route === "prepared") {
+            state.ready = new Set([7921]);
+            const triage = admittedBy(yield* advance("clock"));
+            yield* workStage(triage, {
+              outcome: "criteria_proposed",
+              summary: "Exact current parent.",
+              criteria: criteriaProposalFor(7921, body, admittedVersion(triage), ["A"]),
+            });
+            yield* advance("outcome");
+          } else yield* fs.writeFileString(path.join(criteriaRoot, criteria.path), prepared.bytes);
+          const outcomes = yield* FactoryOutcomeStore.FactoryOutcomeStore;
+          const decisionId = `parent-closure-${route}`;
+          yield* outcomes.reserveDecision({
+            decisionId,
+            factoryId,
+            itemKey: itemKeyFor(7921),
+            stage: "implement",
+            kind: "gate",
+            reason: "Owner approves only this synthetic parent.",
+            evidenceDigest: sha256("parent closure fixture"),
+          });
+          yield* usePolicy((input) =>
+            Effect.succeed(
+              input.observation.itemKey !== itemKeyFor(7921)
+                ? { type: "none" as const, reason: "other item settled" }
+                : {
+                    type: "proceed" as const,
+                    parentClosure: {
+                      ...(route === "prepared" ? { prepared } : { criteria }),
+                      ownerDecisionId: decisionId,
+                    },
+                  },
+            ),
+          );
+          const store = yield* FactoryStore.FactoryStore;
+          const before = Option.getOrThrow(yield* store.getConfiguration(factoryId));
+          const lookups = yield* AdmissionLookups;
+          let changed = false;
+          const services =
+            yield* Effect.context<Effect.Services<ReturnType<typeof configureFactory>>>();
+          lookups.beforeIntent = (intent) =>
+            intent.kind !== "tracker_close" || intent.issueNumber !== 7921
+              ? Effect.void
+              : Effect.gen(function* () {
+                  lookups.beforeIntent = undefined;
+                  if (route === "prepared")
+                    assert.strictEqual(
+                      yield* fs.readFileString(
+                        path.join(criteriaRoot, `parent-7921-${prepared.sha256}.json`),
+                      ),
+                      prepared.bytes,
+                    );
+                  yield* configureFactory(
+                    lifecycleConfiguration({ parents: { close: "owner", criteriaRoot } }),
+                  );
+                  const current = Option.getOrThrow(yield* store.getConfiguration(factoryId));
+                  assert.isAbove(current.revision, before.revision);
+                  changed = true;
+                }).pipe(Effect.provide(services), Effect.orDie);
+          yield* advance("clock");
+          assert.isTrue(changed);
+          const operations = yield* FactoryOperationStore.FactoryOperationStore;
+          const parentCloses = Effect.map(
+            operations.forItem({ factoryId, itemKey: itemKeyFor(7921) }),
+            (all) => all.filter((operation) => operation.intent.kind === "tracker_close"),
+          );
+          assert.deepStrictEqual(yield* parentCloses, []);
+          const closeId = `close:parent:${sha256(JSON.stringify([factoryId, itemKeyFor(7921), prepared.sha256, null])).slice(0, 40)}`;
+          assert.deepStrictEqual(
+            yield* (yield* EffectOutbox.EffectOutboxV2).listByCommandId(
+              CommandId.make(`factory-operation:${closeId}`),
+            ),
+            [],
+          );
+          const github = yield* GitHubFake;
+          assert.strictEqual(github.issues.get(issueKey(claimRepository, 7921))!.state, "open");
+          assert.notInclude(yield* itemHistory(7921), "closed");
+          const question = (yield* outcomes.reservedDecisions(factoryId)).find(
+            (item) => item.decisionId === decisionId,
+          )!;
+          assert.strictEqual(question.state, "pending");
+          assert.strictEqual(question.resolution, undefined);
+          yield* parentWaitsOn(7921, "the owner has not approved closing this parent");
+          assert.isTrue(
+            yield* outcomes.resolveDecision({
+              decisionId,
+              answer: "approve",
+              by: "session:owner:synthetic-test",
+            }),
+          );
+          yield* advance("owner_decision");
+          assert.strictEqual(github.issues.get(issueKey(claimRepository, 7921))!.state, "closed");
+          assert.strictEqual((yield* parentCloses).length, 1);
+          assert.strictEqual(
+            (yield* itemHistory(7921)).filter((item) => item === "closed").length,
+            1,
+          );
+          const closedRequests = yield* closeRequests;
+          const rebuilt = yield* freshLifecycle(yield* Scope.Scope);
+          yield* advance("restart").pipe(
+            Effect.provideService(FactoryLifecycle.FactoryLifecycle, rebuilt),
+          );
+          assert.strictEqual(yield* closeRequests, closedRequests);
+          assert.strictEqual((yield* parentCloses).length, 1);
+        }),
+      ),
+    ),
+);
+
 const pullsFor = (branch: string) =>
   Effect.map(GitHubFake, (fake) => [...fake.pulls.values()].filter((pull) => pull.head === branch));
 
