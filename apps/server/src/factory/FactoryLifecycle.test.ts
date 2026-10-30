@@ -22500,7 +22500,7 @@ it.effect(
       Effect.scoped(
         Effect.gen(function* () {
           yield* configureLifecycleFactory;
-          yield* configureFactory(lifecycleConfiguration({ pools: pool(3) }));
+          yield* configureFactory(lifecycleConfiguration({ pools: pool(4) }));
           yield* usePolicy(routinePreparationPolicy);
           // A legacy item parked for an outside coordinator, and an ordinary item.
           yield* seedIssue(7951, {
@@ -22509,6 +22509,7 @@ it.effect(
           });
           yield* seedIssue(7952, { body: "Rotate the importer key." });
           yield* seedIssue(7953, { body: "Settle payouts." });
+          yield* seedIssue(7954, { body: "Repair the build recipe." });
           const first = admittedOnly(yield* advance("tracker_event", 1));
           const triageOf = (issue: number) =>
             first.find((admission) => stageOf(admission)?.[0] === itemKeyFor(issue))!;
@@ -22516,6 +22517,7 @@ it.effect(
             [itemKeyFor(7951), "triage"],
             [itemKeyFor(7952), "triage"],
             [itemKeyFor(7953), "triage"],
+            [itemKeyFor(7954), "triage"],
           ]);
           assert.deepStrictEqual(admittedOnly(yield* advance("restart", 2)), []);
           // One preparation stops on routine coordination, the other on a genuine permission.
@@ -22534,7 +22536,13 @@ it.effect(
             summary: "A financial choice.",
             failure: "decision: settle payouts in EUR or GBP; the owner chooses",
           });
-          // The routine gap is prepared again by the factory, exactly once; the hold is not.
+          // Work another writer holds is the policy's held ownership, not routine coordination.
+          yield* workStage(triageOf(7954), {
+            outcome: "not_actionable",
+            summary: "Another writer holds it.",
+            failure: "ownership: the existing recipe writer holds this repair",
+          });
+          // The routine gap is prepared again by the factory, exactly once; the holds are not.
           const retry = admittedBy(yield* advance("outcome", 3));
           assert.deepStrictEqual(stageOf(retry), [itemKeyFor(7951), "triage"]);
           for (const trigger of ["restart", "clock"] as const) {
@@ -22597,8 +22605,9 @@ it.effect(
             ).slice(0, 40),
           );
           assert.deepStrictEqual(yield* itemHistory(7953), ["triage", "not_actionable"]);
-          // The permission stays a person's: no further work, no question answered for them.
+          // The permission and the held ownership stay a person's: no further work, no answer.
           assert.deepStrictEqual(yield* itemHistory(7952), ["triage", "not_actionable"]);
+          assert.deepStrictEqual(yield* itemHistory(7954), ["triage", "not_actionable"]);
           assert.isFalse(
             (yield* decisionsOf(7952)).some((decision) => decision.resolution !== undefined),
           );
@@ -22764,6 +22773,8 @@ it.effect(
             },
             subject: { repository: claimRepository, baseCommit: lifecycleBase },
           });
+          // A status note lands beside the prepared unit: news, not new input.
+          yield* ownerComment(7972, "Second runtime patch deployed.");
           // Root repairs requirements only: the configuration pin changes, the script does not.
           yield* configureFactory(
             lifecycleConfiguration({ pools: pool(2), policyRevision: revision("2") }),
@@ -22776,6 +22787,58 @@ it.effect(
           for (const trigger of ["restart", "clock"] as const) {
             assert.deepStrictEqual(admittedOnly(yield* advance(trigger, 2)), []);
           }
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Prepare/C1: a preparation is reused across comments added after it, a pause and restore and a restart; a comment it read changing prepares again",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* configureLifecycleFactory;
+          yield* configureFactory(lifecycleConfiguration({ pools: pool(2) }));
+          // As the connector policy: a preparation counts only for the key T3 offers for it.
+          const offered: Array<string | undefined> = [];
+          yield* usePolicy((input) => {
+            offered.push(input.triageDecisionKey);
+            return input.stage.type === "implement" &&
+              input.triageDecisionKey !== undefined &&
+              !input.outcomes.some((outcome) => outcome.decisionKey === input.triageDecisionKey)
+              ? triageRequest(input)
+              : Effect.succeed({ type: "none" as const, reason: "held" });
+          });
+          yield* seedIssue(7981, { body: "Repair the build recipe." });
+          yield* ownerComment(7981, "Owner: hold this until the recipe writer finishes.");
+          const triage = admittedBy(yield* advance("tracker_event", 1));
+          if (triage.reservation.origin !== "admitted") return assert.fail("expected an admission");
+          const decided = triage.reservation.decisionKey;
+          yield* workStage(triage, {
+            outcome: "not_actionable",
+            summary: "Held by the owner.",
+            failure: "hold: the owner holds this until the recipe writer finishes",
+          });
+          // Status notes, a pause and restore (configuration-only revisions) and a restart.
+          yield* ownerComment(7981, "Runnable package delivered: source c35be4ee.");
+          assert.deepStrictEqual(admittedOnly(yield* advance("outcome", 3)), []);
+          yield* configureFactory(lifecycleConfiguration({ pools: pool(2), enabled: false }));
+          yield* configureFactory(lifecycleConfiguration({ pools: pool(2) }));
+          yield* ownerComment(7981, "Second runtime patch deployed.");
+          for (const trigger of ["clock", "restart", "tracker_event"] as const) {
+            assert.deepStrictEqual(admittedOnly(yield* advance(trigger, 2)), []);
+          }
+          // The policy was offered the preparation the item already has, and kept its hold.
+          assert.strictEqual(offered.at(-1), decided);
+          assert.deepStrictEqual(yield* itemHistory(7981), ["triage", "not_actionable"]);
+
+          // The owner's note it read is edited to release the hold: new input, prepared once.
+          const issue = (yield* GitHubFake).issues.get(issueKey(claimRepository, 7981))!;
+          issue.comments[0] = { ...issue.comments[0]!, body: "Owner: released; build it." };
+          const again = admittedBy(yield* advance("tracker_event", 2));
+          assert.deepStrictEqual(stageOf(again), [itemKeyFor(7981), "triage"]);
+          assert.deepStrictEqual(admittedOnly(yield* advance("clock", 2)), []);
         }),
       ),
     ),

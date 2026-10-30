@@ -594,7 +594,10 @@ export interface FactoryPolicyItem {
     readonly reason: "routine_gap" | "legacy_needs_main";
     readonly gap?: string;
   };
-  /** The decision a triage of this item version would be; only before its first build. */
+  /**
+   * The decision a triage of this item version is: the earlier one it reuses when only comments
+   * were added since, else a new one. Only before its first build.
+   */
   readonly triageDecisionKey?: FactoryDecisionKey;
   /**
    * The legacy work a transfer handed over for the item, so a brief can continue from it rather
@@ -1909,11 +1912,49 @@ export const decisionKeyOf = (
  */
 /**
  * A preparation gap that is routine coordination, the factory's own to settle by preparing again:
- * missing scope, evidence, candidate or check bindings. A person's decision, permission, private
- * data or hold is never routine.
+ * a request for an outside coordinator. A person's decision, permission, private data, ownership
+ * another writer or person holds, or hold is never routine: project policies name those held.
  */
 export const isRoutineGap = (failure: string | undefined) =>
-  failure !== undefined && /^\s*(?:main|needs-main|ownership)\s*:/i.test(failure);
+  failure !== undefined && /^\s*(?:main|needs-main)\s*:/i.test(failure);
+
+/**
+ * A preparation result that stands until its inputs change: a usable unit, or a hold the policy
+ * names held. A decision is answered by a comment, and a failure may be settled by one, so neither
+ * stands against comments added later.
+ */
+const standsAgainstComments = (report: FactoryOutcomeStore.FactoryOutcome["report"]) =>
+  report.outcome === "unit_proposed" ||
+  (report.outcome === "not_actionable" &&
+    /^\s*(?:hold|permission|private_data|ownership)\s*:/i.test(report.failure ?? ""));
+
+const COMMENT_CARRIER = /:comment:\d+$/;
+
+/**
+ * Whether evidence read now is what an earlier decision read with only comments added since:
+ * every carrier it read still reads the same and nothing else is new. A comment it read that was
+ * edited or deleted is a change; a later note beside it is not.
+ */
+export const onlyCommentsAdded = (
+  read: FactoryStore.ItemObservation["evidence"],
+  now: FactoryStore.ItemObservation["evidence"],
+) => {
+  const current = new Map(now.map((entry) => [entry.carrierId, entry]));
+  const earlier = new Set(read.map((entry) => entry.carrierId));
+  return (
+    read.every((entry) => {
+      const same = current.get(entry.carrierId);
+      return same?.bodyDigest === entry.bodyDigest && same.version === entry.version;
+    }) &&
+    now.every((entry) => earlier.has(entry.carrierId) || COMMENT_CARRIER.test(entry.carrierId))
+  );
+};
+
+/** An earlier preparation of the item whose inputs differ from now only by added comments. */
+interface ReusedPreparation {
+  readonly basis: string;
+  readonly decisionKey: FactoryDecisionKey;
+}
 
 /** The legacy tracker label that parked an item for an external coordinator. */
 export const LEGACY_NEEDS_MAIN_LABEL = "needs-main";
@@ -1959,6 +2000,7 @@ const triageDecisionOf = (
   observation: FactoryStore.ItemObservation,
   outcomes: ReadonlyArray<FactoryPolicyOutcome>,
   readback?: string,
+  reused: ReadonlyArray<ReusedPreparation> = [],
 ) => {
   const keyOf = (basis: string) =>
     decisionKeyOf({ ...input, taskKind: "triage", stage: { type: "triage", basis } }, observation);
@@ -1985,7 +2027,11 @@ const triageDecisionOf = (
           { exactPolicy: true },
         ),
       ),
+      ...reused.flatMap((earlier) => (earlier.basis === basis ? [earlier.decisionKey] : [])),
     ]);
+  // What the item's preparation stands on: the latest earlier one of this basis it reuses.
+  const decisionOf = (basis: string) =>
+    reused.findLast((earlier) => earlier.basis === basis)?.decisionKey ?? keyOf(basis);
   const first = triageBasis(observation.itemVersion);
   const firstKey = keyOf(first);
   const firstKeys = keysOf(first);
@@ -2002,10 +2048,23 @@ const triageDecisionOf = (
       outcome.failureDigest !== undefined,
   );
   if (failed?.failureDigest === undefined) {
-    return { basis: first, key: firstKey, keys: firstKeys, keysFor: keysOf };
+    return {
+      basis: first,
+      key: firstKey,
+      decision: decisionOf(first),
+      keys: firstKeys,
+      keysFor: keysOf,
+    };
   }
   const basis = triageBasis(observation.itemVersion, failed.failureDigest, readback);
-  return { basis, key: keyOf(basis), keys: keysOf(basis), keysFor: keysOf, failed };
+  return {
+    basis,
+    key: keyOf(basis),
+    decision: decisionOf(basis),
+    keys: keysOf(basis),
+    keysFor: keysOf,
+    failed,
+  };
 };
 
 const make = Effect.gen(function* () {
@@ -3731,7 +3790,9 @@ const make = Effect.gen(function* () {
             candidate.observation,
           ),
           // No triage is offered while a failed preparation's readback cannot be made.
-          ...(triage === undefined || "unread" in triage ? {} : { triageDecisionKey: triage.key }),
+          ...(triage === undefined || "unread" in triage
+            ? {}
+            : { triageDecisionKey: triage.decision }),
           ...(() => {
             const preparation =
               triage === undefined || "unread" in triage
@@ -3942,7 +4003,47 @@ const make = Effect.gen(function* () {
       itemKey: candidate.itemKey,
       policyRevision: configuration.policyRevision,
     };
-    const plain = triageDecisionOf(input, candidate.observation, outcomes);
+    // Earlier standing preparations on this item text and policy, decided on what is read now save
+    // for comments added since, oldest first: a status note is not a new preparation.
+    const identity = policyIdentityOf(configuration.policyRevision);
+    const reused: Array<ReusedPreparation> = [];
+    const weighed = new Set<string>();
+    for (const outcome of outcomes) {
+      const reservationId = outcome.origin.reservationId;
+      if (
+        outcome.stage !== "triage" ||
+        outcome.state !== "verified" ||
+        !standsAgainstComments(outcome.report) ||
+        reservationId === undefined ||
+        weighed.has(reservationId) ||
+        outcome.itemVersion !== candidate.observation.itemVersion ||
+        outcome.policyRevision === undefined ||
+        policyIdentityOf(outcome.policyRevision) !== identity
+      ) {
+        continue;
+      }
+      weighed.add(reservationId);
+      const earlier = yield* store.getReservation(reservationId);
+      if (
+        Option.isNone(earlier) ||
+        earlier.value.origin !== "admitted" ||
+        earlier.value.stageBasis === undefined ||
+        earlier.value.observationId === undefined
+      ) {
+        continue;
+      }
+      const read = yield* store.getObservation({
+        factoryId: configuration.factoryId,
+        observationId: earlier.value.observationId,
+      });
+      if (
+        Option.isSome(read) &&
+        onlyCommentsAdded(read.value.evidence, candidate.observation.evidence)
+      ) {
+        reused.push({ basis: earlier.value.stageBasis, decisionKey: earlier.value.decisionKey });
+      }
+    }
+    const plain = triageDecisionOf(input, candidate.observation, outcomes, undefined, reused);
     const reservationId = plain.failed?.origin.reservationId;
     if (plain.failed === undefined) return plain;
     const failed = plain.failed;
@@ -4012,6 +4113,7 @@ const make = Effect.gen(function* () {
             candidate.observation,
             { exactPolicy: true },
           ),
+          ...reused.flatMap((earlier) => (earlier.basis === basis ? [earlier.decisionKey] : [])),
         ].includes(outcome.decisionKey)
       ) {
         continue;
@@ -4065,7 +4167,7 @@ const make = Effect.gen(function* () {
         ...(retried.size === 0 ? [] : [[...retried].toSorted(([a], [b]) => a.localeCompare(b))]),
       ]),
     ).slice(0, 32);
-    return triageDecisionOf(input, candidate.observation, outcomes, readback);
+    return triageDecisionOf(input, candidate.observation, outcomes, readback, reused);
   });
 
   /**
