@@ -442,6 +442,8 @@ export const makeNativeStages = (deps: NativeStageDependencies) => {
     readonly configuration: FactoryStore.FactoryConfiguration;
     readonly itemKey: FactoryItemKey;
     readonly criteriaSha256: string;
+    /** The closure a reopen ended, so a parent reopened on the same criteria can close again. */
+    readonly reopenOf: string | undefined;
     readonly evidence: ReadonlyArray<string>;
     readonly fence: FactoryStore.CustodyFence;
   }): Effect.fn.Return<NativeStagePlan, NativeStageError> {
@@ -450,7 +452,7 @@ export const makeNativeStages = (deps: NativeStageDependencies) => {
     if (configuration.claim === undefined || subject === undefined) {
       return { type: "issue", issue: "the parent has no tracker to close" };
     }
-    const operationId = `close:parent:${sha256(canonical([configuration.factoryId, itemKey, input.criteriaSha256])).slice(0, 40)}`;
+    const operationId = `close:parent:${sha256(canonical([configuration.factoryId, itemKey, input.criteriaSha256, input.reopenOf ?? null])).slice(0, 40)}`;
     const existing = yield* operations.get(operationId);
     if (Option.isSome(existing)) {
       if (existing.value.state === "failed") return { type: "issue", issue: existing.value.reason };

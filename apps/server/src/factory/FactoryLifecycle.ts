@@ -125,6 +125,7 @@ import {
   type FactoryStageType,
   isFactoryStage,
   nextStage,
+  PARENT_CLOSURE,
   stageBasis,
   triageBasis,
 } from "./factoryStages.ts";
@@ -1056,6 +1057,394 @@ export const policyChildren = Effect.fnUntraced(function* (
   return { children };
 });
 
+/**
+ * Whether `candidate` lies inside `root` as the OS resolves both, through links: an absolute,
+ * anchored path with no `..`, whose real location is the root or below it.
+ */
+export const makeInsideRoot = (fs: FileSystem.FileSystem, path: Path.Path) => {
+  const windowsPaths = path.sep === "\\";
+  const comparable = (value: string) => (windowsPaths ? value.toLowerCase() : value);
+
+  // Follows junctions and symlinks through the deepest part of the path that exists, so a
+  // path the worker has not created yet still resolves where the OS would put it.
+  const resolveThroughLinks = Effect.fnUntraced(function* (absolute: string) {
+    let existing = absolute;
+    const remainder: Array<string> = [];
+    for (;;) {
+      const real = yield* fs.realPath(existing).pipe(Effect.option);
+      if (Option.isSome(real)) return Option.some(path.join(real.value, ...remainder));
+      const parent = path.dirname(existing);
+      if (parent === existing) return Option.none<string>();
+      remainder.unshift(path.basename(existing));
+      existing = parent;
+    }
+  });
+
+  const isAnchoredAbsolute = (candidate: string) =>
+    windowsPaths
+      ? /^[A-Za-z]:[\\/]/.test(candidate) || /^[\\/]{2}[^\\/]/.test(candidate)
+      : path.isAbsolute(candidate);
+
+  const insideArtifactRoot = Effect.fnUntraced(function* (root: string, candidate: string) {
+    // Drive-relative and root-relative Windows forms depend on the process's current drive.
+    if (!isAnchoredAbsolute(candidate)) return false;
+    // ".." after a link resolves against the link's target, not lexically, so refuse it.
+    if (candidate.split(/[\\/]/).includes("..")) return false;
+    const realRoot = yield* resolveThroughLinks(root);
+    const realCandidate = yield* resolveThroughLinks(candidate);
+    if (Option.isNone(realRoot) || Option.isNone(realCandidate)) return false;
+    const relative = path.relative(comparable(realRoot.value), comparable(realCandidate.value));
+    return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+  });
+  return insideArtifactRoot;
+};
+
+export interface VerificationBindingDeps {
+  readonly fs: FileSystem.FileSystem;
+  readonly path: Path.Path;
+  readonly insideRoot: (root: string, candidate: string) => Effect.Effect<boolean>;
+  readonly reads: PolicyOutcomeReads & {
+    readonly operations: NonNullable<PolicyOutcomeReads["operations"]>;
+  };
+}
+
+/** What a bound verification is checked against: the item now, and what was proposed for it. */
+export interface VerificationBindingInput {
+  readonly configuration: FactoryStore.FactoryConfiguration;
+  readonly candidate: {
+    readonly itemKey: FactoryItemKey;
+    readonly subject: { readonly repository: string; readonly issueNumber: number };
+    readonly issue: TrackerIssue;
+    readonly events: ReadonlyArray<FactoryOutcomeStore.StoredItemEvent>;
+    readonly stage: Exclude<FactoryStage, { readonly type: "done" }>;
+  };
+  readonly pointer: PinnedFile;
+  readonly execution: string | undefined;
+  readonly workspace: OrchestrationV2ThreadLaunchWorkspaceStrategy | undefined;
+  /** The item version the verification runs for; a unit prepared for another proves nothing. */
+  readonly itemVersion: string;
+}
+
+/**
+ * A bound verification's binding, checked and completed from T3's own records and its Root-adopted
+ * configuration, never from the policy: the stage basis and packet note to admit it with, or the
+ * one wait that holds it. A template carries only stable meaning; T3 derives the failure, the
+ * landing, the source and a fresh output directory. A whole binding must match all of them.
+ */
+export const deriveVerificationBinding = Effect.fnUntraced(function* (
+  deps: VerificationBindingDeps,
+  input: VerificationBindingInput,
+) {
+  const { fs, path, reads } = deps;
+  const insideArtifactRoot = deps.insideRoot;
+  const { configuration, candidate, pointer } = input;
+  const decision = { execution: input.execution, workspaceStrategy: input.workspace };
+  const issue = candidate.subject.issueNumber;
+  const wait = (
+    what: string,
+    actor: string,
+    action: string,
+    resume: string,
+    reasonClass = "needs_routing",
+  ) => ({
+    wait: waitText({
+      issue,
+      what,
+      actor,
+      action,
+      consequence: "the bound verification does not start; earlier attempts and failures stay",
+      resume,
+    }),
+    reasonClass,
+  });
+  const { stage } = candidate;
+  if (stage.type !== "rework") {
+    return wait(
+      `a verification binding was proposed at its ${stage.type} stage`,
+      "project policy",
+      "propose a binding only for the rework of a failed proof",
+      "a rework stage",
+    );
+  }
+  const verification = configuration.verification;
+  if (verification === undefined) {
+    return wait(
+      "the factory has no verification authority configured",
+      "Root coordinator",
+      "adopt verification {templateRoot, outputBase, consumers, identities} in the factory configuration",
+      "that configuration is installed",
+    );
+  }
+  const target = path.resolve(pointer.root, pointer.path);
+  const bytes =
+    (yield* insideArtifactRoot(verification.templateRoot, pointer.root)) &&
+    (yield* insideArtifactRoot(pointer.root, target))
+      ? yield* fs.readFile(target).pipe(Effect.option)
+      : Option.none<Uint8Array>();
+  if (Option.isNone(bytes) || sha256(bytes.value) !== pointer.sha256) {
+    return wait(
+      `binding ${pointer.path} is unreadable, outside ${verification.templateRoot} or not sha256 ${pointer.sha256}`,
+      "Root coordinator",
+      "install the exact adopted binding document under the template root",
+      "the pinned bytes read back",
+    );
+  }
+  const decoded = decodeVerificationDocument(new TextDecoder().decode(bytes.value));
+  if (Option.isNone(decoded) || decoded.value.issue !== issue) {
+    return wait(
+      `binding ${pointer.path} is not a verification template or binding for #${issue}`,
+      "Root coordinator",
+      "adopt a factory-verification-template/1 for this issue",
+      "a valid document is pinned",
+    );
+  }
+  const doc = decoded.value;
+  const outcomes = yield* policyOutcomes(reads, candidate.events);
+  const failed = failureAnswered(outcomes, stage.specOutcomeId);
+  if (failed === undefined) {
+    return wait(
+      `correction spec ${stage.specOutcomeId} answers no verified failure`,
+      "T3",
+      "record the failure the proof reruns for",
+      "a verified failure precedes the spec",
+    );
+  }
+  const prerequisite =
+    doc.schema === "factory-verification-binding/1"
+      ? Number(/#(\d+)$/.exec(doc.landed.itemKey)?.[1])
+      : (doc.prerequisite ?? defectChild(candidate.itemKey, outcomes, failed));
+  if (prerequisite === undefined || !Number.isSafeInteger(prerequisite)) {
+    return wait(
+      `no correction child T3 opened for failure ${failed.outcomeId} names its defect basis`,
+      "Root coordinator",
+      "name the prerequisite in the template, or let T3 open the correction",
+      "the prerequisite is known",
+    );
+  }
+  const edge = candidate.issue.blockedBy?.find(
+    (blocker) =>
+      blocker.number === prerequisite && blocker.repository === candidate.subject.repository,
+  );
+  if (edge === undefined || edge.state !== "closed") {
+    return wait(
+      `#${prerequisite} is ${edge === undefined ? "not a recorded blocker" : "still open"}`,
+      `#${prerequisite} through T3`,
+      `land and close #${prerequisite} as a blocker of #${issue}`,
+      `T3 records #${prerequisite} integrated`,
+      "waiting",
+    );
+  }
+  const found = landingOf(
+    yield* policyItemFacts(
+      reads,
+      configuration.factoryId,
+      FactoryItemKeyFor({ repository: candidate.subject.repository, issueNumber: prerequisite }),
+      new Map(),
+    ),
+  );
+  if ("why" in found) {
+    return wait(
+      `#${prerequisite} has not landed: ${found.why}`,
+      `#${prerequisite} through T3 review and integration`,
+      `land #${prerequisite} at its exact reviewed head`,
+      `T3 records #${prerequisite} integrated by its own operation`,
+      "waiting",
+    );
+  }
+  const landed = found.landing;
+  const execution = doc.worker.execution;
+  if (
+    decision.execution !== execution ||
+    configuration.executionChoices?.[execution] === undefined
+  ) {
+    return wait(
+      `binding names execution ${execution}, which this decision does not run or the configuration does not hold`,
+      "Root coordinator",
+      `configure execution ${execution} and propose it for this verification`,
+      "the execution is configured and proposed",
+    );
+  }
+  const adopted = verification.identities[execution];
+  if (adopted === undefined || adopted.identity !== doc.auth.identity) {
+    return wait(
+      adopted === undefined
+        ? `the configuration declares no account identity for execution ${execution}`
+        : `binding names identity ${doc.auth.identity}, but execution ${execution} is configured as ${adopted.identity}`,
+      "Root coordinator",
+      `declare the non-secret account identity execution ${execution} runs as`,
+      "the identities agree",
+    );
+  }
+  const identity = adopted.identity;
+  // The engine's own record of the unit's scope, where one was prepared, binds the template's.
+  const proposed = outcomes.findLast(
+    (outcome) =>
+      outcome.state === "verified" &&
+      outcome.report.outcome === "unit_proposed" &&
+      outcome.report.proposal?.basis === input.itemVersion,
+  )?.report.proposal?.ownedFiles;
+  if (
+    proposed !== undefined &&
+    [...proposed].toSorted().join("\n") !== [...doc.ownership.owned].toSorted().join("\n")
+  ) {
+    return wait(
+      `binding owns ${doc.ownership.owned.join(", ") || "nothing"}, but the prepared unit owns ${proposed.join(", ") || "nothing"}`,
+      "Root coordinator",
+      "adopt a template for the unit's current owned files",
+      "the owned scopes agree",
+    );
+  }
+  if (
+    !verification.consumers.some(
+      (consumer) =>
+        consumer.contract === doc.consumer.contract && consumer.version === doc.consumer.version,
+    )
+  ) {
+    return wait(
+      `consumer ${doc.consumer.contract} ${doc.consumer.version} is not one Root declared`,
+      "owner or Root coordinator",
+      "declare the consumer contract in verification.consumers",
+      "a supported consumer is installed",
+      "held",
+    );
+  }
+  const policyName =
+    doc.schema === "factory-verification-binding/1" ? doc.policyRevision : doc.policyIdentity;
+  if (!namesPolicy(policyName, configuration.policyRevision)) {
+    return wait(
+      `binding names policy ${policyName}, not the installed ${configuration.policyRevision}`,
+      "Root coordinator",
+      "adopt a binding for the installed policy",
+      "the policy identities agree",
+    );
+  }
+  for (const input of doc.inputs) {
+    const file = path.resolve(pointer.root, input.path);
+    const read = (yield* insideArtifactRoot(pointer.root, file))
+      ? yield* fs.readFile(file).pipe(Effect.option)
+      : Option.none<Uint8Array>();
+    if (Option.isNone(read) || sha256(read.value) !== input.sha256.toLowerCase()) {
+      return wait(
+        `input ${input.path} is unreadable, outside the template root or not sha256 ${input.sha256}`,
+        "Root coordinator",
+        "restore the exact adopted input",
+        "every input rehashes as recorded",
+      );
+    }
+  }
+  const workspace = decision.workspaceStrategy;
+  if (
+    workspace?.type !== "worktree" ||
+    workspace.baseRef !== landed.commit ||
+    workspace.startFromOrigin === true
+  ) {
+    return wait(
+      `the verification would not start at landed commit ${landed.commit}`,
+      "project policy",
+      `start the worktree exactly at ${landed.commit}`,
+      "the proposal starts there",
+    );
+  }
+  if (doc.schema === "factory-verification-binding/1") {
+    const claimed = doc.landed;
+    const same =
+      doc.failedOutcomeId === failed.outcomeId &&
+      doc.source.repository === candidate.subject.repository &&
+      doc.source.commit === landed.commit &&
+      claimed.itemKey === landed.itemKey &&
+      claimed.operationId === landed.operationId &&
+      claimed.commit === landed.commit &&
+      claimed.tree === landed.tree &&
+      claimed.parents.join() === landed.parents.join() &&
+      claimed.branch === landed.branch &&
+      claimed.reviewedHead === landed.reviewedHead &&
+      claimed.reviewOutcomeId === landed.reviewOutcomeId &&
+      claimed.integratedOutcomeId === landed.integratedOutcomeId;
+    if (!same) {
+      return wait(
+        `binding ${pointer.path} does not name failure ${failed.outcomeId} and the landing T3 recorded`,
+        "Root coordinator",
+        "adopt a template so T3 derives the landing, or a binding that matches it",
+        "a matching document is pinned",
+      );
+    }
+  }
+  const outputRoot =
+    doc.schema === "factory-verification-binding/1"
+      ? path.resolve(doc.outputRoot)
+      : path.join(
+          path.resolve(verification.outputBase),
+          outputRootName({
+            issue,
+            itemKey: candidate.itemKey,
+            failedOutcomeId: failed.outcomeId,
+            commit: landed.commit,
+            templateSha256: pointer.sha256,
+          }),
+        );
+  const named = path.relative(path.resolve(verification.outputBase), outputRoot);
+  const existing = yield* fs.readDirectory(outputRoot).pipe(Effect.option);
+  if (
+    named === "" ||
+    named.startsWith("..") ||
+    path.isAbsolute(named) ||
+    named.includes(path.sep) ||
+    (Option.isSome(existing) && existing.value.length > 0)
+  ) {
+    return wait(
+      `output root ${outputRoot} is not a new empty directory directly under ${verification.outputBase}`,
+      "Root coordinator",
+      "leave earlier output in place and bind a fresh output root",
+      "a fresh output root is bound",
+    );
+  }
+  const bindingDigest = sha256(
+    canonical({
+      binding: pointer,
+      failedOutcomeId: failed.outcomeId,
+      landed,
+      outputRoot,
+      execution,
+      identity,
+      inputs: doc.inputs,
+      consumer: doc.consumer,
+      policyRevision: configuration.policyRevision,
+    }),
+  );
+  return {
+    digest: bindingDigest,
+    landed,
+    basis: bindingBasis(bindingDigest, outputRoot),
+    note: [
+      `T3 bound this verification (binding ${bindingDigest.slice(0, 16)}): it reruns failure ${failed.outcomeId} on ${landed.commit} (tree ${landed.tree}), the landing of ${landed.itemKey} by operation ${landed.operationId}.`,
+      `Write only under ${outputRoot}; T3 reserved it for this attempt alone. Change no product file.`,
+      bindingMarker({ binding: pointer, execution, baseRef: landed.commit }),
+    ].join("\n"),
+  };
+});
+
+const MARKER = /^<!-- t3-verification-binding (\{.*\}) -->$/m;
+const BindingMarker = Schema.Struct({
+  binding: Schema.Struct({ root: Schema.String, path: Schema.String, sha256: Schema.String }),
+  execution: Schema.String,
+  baseRef: Schema.String,
+});
+const decodeBindingMarker = Schema.decodeUnknownOption(Schema.fromJsonString(BindingMarker));
+
+/** What a bound packet records of its proposal, so its first use can derive the binding again. */
+const bindingMarker = (marker: typeof BindingMarker.Type) =>
+  `<!-- t3-verification-binding ${JSON.stringify(marker)} -->`;
+
+/**
+ * The proposal a bound verification was admitted on, read from its own packet: the packet is the
+ * text its reservation's digest names, so a changed one proves nothing and reads as none.
+ */
+export const admittedBinding = (packetText: string, packetDigest: string) => {
+  if (sha256(packetText) !== packetDigest) return Option.none();
+  const found = MARKER.exec(packetText)?.[1];
+  return found === undefined ? Option.none() : decodeBindingMarker(found);
+};
+
 /** The item's own content and evidence, without the claims on it. */
 const substantiveDigest = (
   observation: Pick<FactoryStore.ItemObservation, "itemVersion" | "evidence">,
@@ -1188,40 +1577,7 @@ const make = Effect.gen(function* () {
   const custodyContext =
     yield* Effect.context<Effect.Services<ReturnType<typeof readExecutionCustody>>>();
 
-  const windowsPaths = path.sep === "\\";
-  const comparable = (value: string) => (windowsPaths ? value.toLowerCase() : value);
-
-  // Follows junctions and symlinks through the deepest part of the path that exists, so a
-  // path the worker has not created yet still resolves where the OS would put it.
-  const resolveThroughLinks = Effect.fnUntraced(function* (absolute: string) {
-    let existing = absolute;
-    const remainder: Array<string> = [];
-    for (;;) {
-      const real = yield* fs.realPath(existing).pipe(Effect.option);
-      if (Option.isSome(real)) return Option.some(path.join(real.value, ...remainder));
-      const parent = path.dirname(existing);
-      if (parent === existing) return Option.none<string>();
-      remainder.unshift(path.basename(existing));
-      existing = parent;
-    }
-  });
-
-  const isAnchoredAbsolute = (candidate: string) =>
-    windowsPaths
-      ? /^[A-Za-z]:[\\/]/.test(candidate) || /^[\\/]{2}[^\\/]/.test(candidate)
-      : path.isAbsolute(candidate);
-
-  const insideArtifactRoot = Effect.fnUntraced(function* (root: string, candidate: string) {
-    // Drive-relative and root-relative Windows forms depend on the process's current drive.
-    if (!isAnchoredAbsolute(candidate)) return false;
-    // ".." after a link resolves against the link's target, not lexically, so refuse it.
-    if (candidate.split(/[\\/]/).includes("..")) return false;
-    const realRoot = yield* resolveThroughLinks(root);
-    const realCandidate = yield* resolveThroughLinks(candidate);
-    if (Option.isNone(realRoot) || Option.isNone(realCandidate)) return false;
-    const relative = path.relative(comparable(realRoot.value), comparable(realCandidate.value));
-    return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
-  });
+  const insideArtifactRoot = makeInsideRoot(fs, path);
 
   /** Checks the proposed execution against the configuration before anything is reserved. */
   const preflight = Effect.fnUntraced(function* (
@@ -2512,10 +2868,12 @@ const make = Effect.gen(function* () {
       }
       // Until its first verified outcome, an item is decided as a new one: unclaimed and
       // eligible. After it, a later stage continues the item this factory owns, under that
-      // claim, with no foreign claim on it.
-      // A ticket T3 opened for it (a parent's clause child) is no work begun on the item itself.
+      // claim. A ticket T3 opened for it, or a parent's own closure, is no work begun on it.
       const begun = events.some(
-        (event) => event.type === "outcome" && event.kind !== "ticket_opened",
+        (event) =>
+          event.type === "outcome" &&
+          event.kind !== "ticket_opened" &&
+          !event.outcomeId.startsWith(PARENT_CLOSURE),
       );
       const owner = begun ? yield* itemOwner(factoryId, itemKey) : undefined;
       if (begun) {
@@ -2777,7 +3135,7 @@ const make = Effect.gen(function* () {
             if (pending.itemKey !== itemKey || pending.state !== "pending") continue;
             // T3's own question about a ticket create is settled by that create, not the policy.
             if (pending.stage === TICKET_DECISION_STAGE) continue;
-            const reason = overtakenBy(pending, candidate.stage, decision);
+            const reason = overtakenBy(pending, candidate.stage, result.effective ?? decision);
             if (reason !== undefined) {
               yield* outcomeStore.supersedeDecision({ decisionId: pending.decisionId, reason });
             }
@@ -3014,281 +3372,6 @@ const make = Effect.gen(function* () {
   });
 
   /**
-   * A bound verification's binding, checked and completed from T3's own records and its Root-adopted
-   * configuration, never from the policy: the stage basis and packet note to admit it with, or the
-   * one wait that holds it. A template carries only stable meaning; T3 derives the failure, the
-   * landing, the source and a fresh output directory. A whole binding must match all of them.
-   */
-  const bindVerification = Effect.fnUntraced(function* (
-    configuration: FactoryStore.FactoryConfiguration,
-    candidate: Candidate,
-    decision: FactoryAdmissionRequest,
-    pointer: PinnedFile,
-  ) {
-    const issue = candidate.subject.issueNumber;
-    const wait = (
-      what: string,
-      actor: string,
-      action: string,
-      resume: string,
-      reasonClass = "needs_routing",
-    ) => ({
-      wait: waitText({
-        issue,
-        what,
-        actor,
-        action,
-        consequence: "the bound verification does not start; earlier attempts and failures stay",
-        resume,
-      }),
-      reasonClass,
-    });
-    const { stage } = candidate;
-    if (stage.type !== "rework") {
-      return wait(
-        `a verification binding was proposed at its ${stage.type} stage`,
-        "project policy",
-        "propose a binding only for the rework of a failed proof",
-        "a rework stage",
-      );
-    }
-    const verification = configuration.verification;
-    if (verification === undefined) {
-      return wait(
-        "the factory has no verification authority configured",
-        "Root coordinator",
-        "adopt verification {templateRoot, outputBase, consumers, identities} in the factory configuration",
-        "that configuration is installed",
-      );
-    }
-    const target = path.resolve(pointer.root, pointer.path);
-    const bytes =
-      (yield* insideArtifactRoot(verification.templateRoot, pointer.root)) &&
-      (yield* insideArtifactRoot(pointer.root, target))
-        ? yield* fs.readFile(target).pipe(Effect.option)
-        : Option.none<Uint8Array>();
-    if (Option.isNone(bytes) || sha256(bytes.value) !== pointer.sha256) {
-      return wait(
-        `binding ${pointer.path} is unreadable, outside ${verification.templateRoot} or not sha256 ${pointer.sha256}`,
-        "Root coordinator",
-        "install the exact adopted binding document under the template root",
-        "the pinned bytes read back",
-      );
-    }
-    const decoded = decodeVerificationDocument(new TextDecoder().decode(bytes.value));
-    if (Option.isNone(decoded) || decoded.value.issue !== issue) {
-      return wait(
-        `binding ${pointer.path} is not a verification template or binding for #${issue}`,
-        "Root coordinator",
-        "adopt a factory-verification-template/1 for this issue",
-        "a valid document is pinned",
-      );
-    }
-    const doc = decoded.value;
-    const reads = { outcomeStore, store, operations: operationStore };
-    const outcomes = yield* policyOutcomes(reads, candidate.events);
-    const failed = failureAnswered(outcomes, stage.specOutcomeId);
-    if (failed === undefined) {
-      return wait(
-        `correction spec ${stage.specOutcomeId} answers no verified failure`,
-        "T3",
-        "record the failure the proof reruns for",
-        "a verified failure precedes the spec",
-      );
-    }
-    const prerequisite =
-      doc.schema === "factory-verification-binding/1"
-        ? Number(/#(\d+)$/.exec(doc.landed.itemKey)?.[1])
-        : (doc.prerequisite ?? defectChild(candidate.itemKey, outcomes, failed));
-    if (prerequisite === undefined || !Number.isSafeInteger(prerequisite)) {
-      return wait(
-        `no correction child T3 opened for failure ${failed.outcomeId} names its defect basis`,
-        "Root coordinator",
-        "name the prerequisite in the template, or let T3 open the correction",
-        "the prerequisite is known",
-      );
-    }
-    const edge = candidate.issue.blockedBy?.find(
-      (blocker) =>
-        blocker.number === prerequisite && blocker.repository === candidate.subject.repository,
-    );
-    if (edge === undefined || edge.state !== "closed") {
-      return wait(
-        `#${prerequisite} is ${edge === undefined ? "not a recorded blocker" : "still open"}`,
-        `#${prerequisite} through T3`,
-        `land and close #${prerequisite} as a blocker of #${issue}`,
-        `T3 records #${prerequisite} integrated`,
-        "waiting",
-      );
-    }
-    const found = landingOf(
-      yield* policyItemFacts(
-        reads,
-        configuration.factoryId,
-        FactoryItemKeyFor({ repository: candidate.subject.repository, issueNumber: prerequisite }),
-        new Map(),
-      ),
-    );
-    if ("why" in found) {
-      return wait(
-        `#${prerequisite} has not landed: ${found.why}`,
-        `#${prerequisite} through T3 review and integration`,
-        `land #${prerequisite} at its exact reviewed head`,
-        `T3 records #${prerequisite} integrated by its own operation`,
-        "waiting",
-      );
-    }
-    const landed = found.landing;
-    const execution = doc.worker.execution;
-    if (
-      decision.execution !== execution ||
-      configuration.executionChoices?.[execution] === undefined
-    ) {
-      return wait(
-        `binding names execution ${execution}, which this decision does not run or the configuration does not hold`,
-        "Root coordinator",
-        `configure execution ${execution} and propose it for this verification`,
-        "the execution is configured and proposed",
-      );
-    }
-    const identity = verification.identities[execution];
-    if (identity === undefined || identity !== doc.auth.identity) {
-      return wait(
-        identity === undefined
-          ? `the configuration declares no account identity for execution ${execution}`
-          : `binding names identity ${doc.auth.identity}, but execution ${execution} is configured as ${identity}`,
-        "Root coordinator",
-        `declare the non-secret account identity execution ${execution} runs as`,
-        "the identities agree",
-      );
-    }
-    if (
-      !verification.consumers.some(
-        (consumer) =>
-          consumer.contract === doc.consumer.contract && consumer.version === doc.consumer.version,
-      )
-    ) {
-      return wait(
-        `consumer ${doc.consumer.contract} ${doc.consumer.version} is not one Root declared`,
-        "owner or Root coordinator",
-        "declare the consumer contract in verification.consumers",
-        "a supported consumer is installed",
-        "held",
-      );
-    }
-    const policyName =
-      doc.schema === "factory-verification-binding/1" ? doc.policyRevision : doc.policyIdentity;
-    if (!namesPolicy(policyName, configuration.policyRevision)) {
-      return wait(
-        `binding names policy ${policyName}, not the installed ${configuration.policyRevision}`,
-        "Root coordinator",
-        "adopt a binding for the installed policy",
-        "the policy identities agree",
-      );
-    }
-    for (const input of doc.inputs) {
-      const file = path.resolve(pointer.root, input.path);
-      const read = (yield* insideArtifactRoot(pointer.root, file))
-        ? yield* fs.readFile(file).pipe(Effect.option)
-        : Option.none<Uint8Array>();
-      if (Option.isNone(read) || sha256(read.value) !== input.sha256.toLowerCase()) {
-        return wait(
-          `input ${input.path} is unreadable, outside the template root or not sha256 ${input.sha256}`,
-          "Root coordinator",
-          "restore the exact adopted input",
-          "every input rehashes as recorded",
-        );
-      }
-    }
-    const workspace = decision.workspaceStrategy;
-    if (
-      workspace?.type !== "worktree" ||
-      workspace.baseRef !== landed.commit ||
-      workspace.startFromOrigin === true
-    ) {
-      return wait(
-        `the verification would not start at landed commit ${landed.commit}`,
-        "project policy",
-        `start the worktree exactly at ${landed.commit}`,
-        "the proposal starts there",
-      );
-    }
-    if (doc.schema === "factory-verification-binding/1") {
-      const claimed = doc.landed;
-      const same =
-        doc.failedOutcomeId === failed.outcomeId &&
-        doc.source.repository === candidate.subject.repository &&
-        doc.source.commit === landed.commit &&
-        claimed.itemKey === landed.itemKey &&
-        claimed.operationId === landed.operationId &&
-        claimed.commit === landed.commit &&
-        claimed.tree === landed.tree &&
-        claimed.parents.join() === landed.parents.join() &&
-        claimed.branch === landed.branch &&
-        claimed.reviewedHead === landed.reviewedHead &&
-        claimed.reviewOutcomeId === landed.reviewOutcomeId &&
-        claimed.integratedOutcomeId === landed.integratedOutcomeId;
-      if (!same) {
-        return wait(
-          `binding ${pointer.path} does not name failure ${failed.outcomeId} and the landing T3 recorded`,
-          "Root coordinator",
-          "adopt a template so T3 derives the landing, or a binding that matches it",
-          "a matching document is pinned",
-        );
-      }
-    }
-    const outputRoot =
-      doc.schema === "factory-verification-binding/1"
-        ? path.resolve(doc.outputRoot)
-        : path.join(
-            path.resolve(verification.outputBase),
-            outputRootName({
-              issue,
-              itemKey: candidate.itemKey,
-              failedOutcomeId: failed.outcomeId,
-              commit: landed.commit,
-              templateSha256: pointer.sha256,
-            }),
-          );
-    const named = path.relative(path.resolve(verification.outputBase), outputRoot);
-    const existing = yield* fs.readDirectory(outputRoot).pipe(Effect.option);
-    if (
-      named === "" ||
-      named.startsWith("..") ||
-      path.isAbsolute(named) ||
-      named.includes(path.sep) ||
-      (Option.isSome(existing) && existing.value.length > 0)
-    ) {
-      return wait(
-        `output root ${outputRoot} is not a new empty directory directly under ${verification.outputBase}`,
-        "Root coordinator",
-        "leave earlier output in place and bind a fresh output root",
-        "a fresh output root is bound",
-      );
-    }
-    const bindingDigest = sha256(
-      canonical({
-        binding: pointer,
-        failedOutcomeId: failed.outcomeId,
-        landed,
-        outputRoot,
-        execution,
-        identity,
-        inputs: doc.inputs,
-        consumer: doc.consumer,
-        policyRevision: configuration.policyRevision,
-      }),
-    );
-    return {
-      basis: bindingBasis(bindingDigest, outputRoot),
-      note: [
-        `T3 bound this verification (binding ${bindingDigest.slice(0, 16)}): it reruns failure ${failed.outcomeId} on ${landed.commit} (tree ${landed.tree}), the landing of ${landed.itemKey} by operation ${landed.operationId}.`,
-        `Write only under ${outputRoot}; T3 reserved it for this attempt alone. Change no product file.`,
-      ].join("\n"),
-    };
-  });
-
-  /**
    * A parent's closure on its adopted criteria, under the factory's configured parent authority.
    * T3 rereads the criteria and judges every clause from its own records and the parent's whole
    * membership; the policy's word that they are met counts for nothing. Its plan, or one wait.
@@ -3413,6 +3496,7 @@ const make = Effect.gen(function* () {
       configuration,
       itemKey: candidate.itemKey,
       criteriaSha256: pinned.sha256,
+      reopenOf: candidate.stage.type === "implement" ? candidate.stage.reopenOf : undefined,
       evidence: clauses.flatMap((clause) =>
         clause.landed.map(
           (landed) =>
@@ -3434,6 +3518,8 @@ const make = Effect.gen(function* () {
       readonly detail?: string;
       readonly reasonClass?: string;
       readonly admission?: FactoryAdmissionResult;
+      /** The decision as T3 acted on it, when that differs from the policy's, e.g. a bound grant. */
+      readonly effective?: FactoryPolicyDecision;
       readonly issue?: { readonly kind: string; readonly detail: string };
     },
     | FactoryLifecycleError
@@ -3643,13 +3729,25 @@ const make = Effect.gen(function* () {
         };
       }
     }
-    let bound: { readonly basis: string; readonly note: string } | undefined;
+    let bound:
+      | { readonly basis: string; readonly note: string; readonly digest: string }
+      | undefined;
     if (decision.verificationBinding !== undefined) {
-      const checked = yield* bindVerification(
-        configuration,
-        candidate,
-        decision,
-        decision.verificationBinding,
+      const checked = yield* deriveVerificationBinding(
+        {
+          fs,
+          path,
+          insideRoot: insideArtifactRoot,
+          reads: { outcomeStore, store, operations: operationStore },
+        },
+        {
+          configuration,
+          candidate,
+          pointer: decision.verificationBinding,
+          execution: decision.execution,
+          workspace: decision.workspaceStrategy,
+          itemVersion: candidate.observation.itemVersion,
+        },
       );
       if ("wait" in checked) {
         return {
@@ -3662,7 +3760,17 @@ const make = Effect.gen(function* () {
     }
     let grant: FactoryAdmissionRequest["grant"];
     if (decision.requiresGrant !== undefined) {
-      const required = decision.requiresGrant;
+      // A grant answers one exact binding: the same evidence text for another binding is another
+      // request, so leftover units of an earlier answer never fund it.
+      const required =
+        bound === undefined
+          ? decision.requiresGrant
+          : {
+              reason: `${decision.requiresGrant.reason} (verification binding ${bound.digest.slice(0, 16)})`,
+              evidenceDigest: sha256(
+                `${decision.requiresGrant.evidenceDigest}\nbinding:${bound.digest}`,
+              ),
+            };
       const authorized = yield* authorizedGrants(factoryId);
       const available = (yield* store.listGrants(factoryId)).find(
         (candidateGrant) =>
@@ -3675,7 +3783,10 @@ const make = Effect.gen(function* () {
       );
       if (available === undefined) {
         yield* reserve("grant", required.reason, required.evidenceDigest);
-        return { disposition: "awaiting_grant" };
+        return {
+          disposition: "awaiting_grant",
+          effective: { ...decision, requiresGrant: required },
+        };
       }
       grant = {
         grantId: available.grantId,

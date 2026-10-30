@@ -1,6 +1,6 @@
 import { assert, describe, it } from "@effect/vitest";
 
-import { type ItemEvent, nextStage, stageBasis } from "./factoryStages.ts";
+import { type ItemEvent, nextStage, PARENT_CLOSURE, stageBasis } from "./factoryStages.ts";
 
 let seq = 0;
 const admitted = (stage: Extract<ItemEvent, { type: "admitted" }>["stage"]): ItemEvent => ({
@@ -30,6 +30,41 @@ describe("factory stages", () => {
     assert.deepStrictEqual(nextStage(events), { type: "close", integrationOutcomeId: "o6" });
     events.push(admitted("close"), outcome("closed"));
     assert.deepStrictEqual(nextStage(events), { type: "done", closureOutcomeId: "o8" });
+  });
+
+  it("a parent's own closure on its criteria is done; a stray closure, a rejected one or a reopen is not", () => {
+    const parentClosure = (id: string): ItemEvent => ({
+      type: "outcome",
+      seq: ++seq,
+      outcomeId: `${PARENT_CLOSURE}${id}`,
+      kind: "closed",
+    });
+    const opened = outcome("ticket_opened");
+    const closure = parentClosure("a");
+    assert.deepStrictEqual(nextStage([opened, closure]), {
+      type: "done",
+      closureOutcomeId: closure.type === "outcome" ? closure.outcomeId : "",
+    });
+    // Any other closure without an integration is no end of an item.
+    assert.deepStrictEqual(nextStage([opened, outcome("closed")]), { type: "implement" });
+    assert.deepStrictEqual(
+      nextStage([
+        closure,
+        { type: "rejected", seq: ++seq, outcomeId: `${PARENT_CLOSURE}a`, failureDigest: "x" },
+      ]).type,
+      "implement",
+    );
+    const reopened: ItemEvent = {
+      type: "reopened",
+      seq: ++seq,
+      closureOutcomeId: `${PARENT_CLOSURE}a`,
+    };
+    assert.deepStrictEqual(nextStage([closure, reopened]), {
+      type: "implement",
+      reopenOf: `${PARENT_CLOSURE}a`,
+    });
+    const again = parentClosure("b");
+    assert.strictEqual(nextStage([closure, reopened, again]).type, "done");
   });
 
   it("N10: every failed review gets one correction, then rework and review, with no cap", () => {

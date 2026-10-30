@@ -195,8 +195,22 @@ export const FactoryConfigurationInput = Schema.Struct({
       /** Each bound verification writes only to a new directory directly under this one. */
       outputBase: TrimmedNonEmptyString,
       consumers: Schema.Array(Schema.Struct({ contract: Bounded, version: Bounded })),
-      /** The non-secret account identity each named execution runs as. */
-      identities: Schema.Record(Bounded, Bounded),
+      /**
+       * The non-secret account each named execution runs as: the label templates name, and what
+       * its provider instance must itself report, fresh and authenticated, before it starts.
+       */
+      identities: Schema.Record(
+        Bounded,
+        Schema.Struct({
+          identity: Bounded,
+          observe: Schema.Struct({
+            type: Schema.optional(Bounded),
+            email: Schema.optional(Bounded),
+            profileId: Schema.optional(Bounded),
+            workspaceId: Schema.optional(Bounded),
+          }),
+        }),
+      ),
     }),
   ),
   /**

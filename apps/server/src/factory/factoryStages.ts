@@ -122,6 +122,9 @@ export type FactoryStage =
   | { readonly type: "close"; readonly integrationOutcomeId: string }
   | { readonly type: "done"; readonly closureOutcomeId: string };
 
+/** The outcome id prefix of a parent's closure on its adopted criteria. */
+export const PARENT_CLOSURE = "native:close:parent:";
+
 /**
  * An implementation is reviewable only if no implement or rework decision was admitted after it
  * landed; a late success reported after the newest such claim is still reviewed, even if that
@@ -175,6 +178,11 @@ export const nextStage = (events: ReadonlyArray<ItemEvent>): FactoryStage => {
     }
     if (event.type === "rejected") {
       rejected.add(event.outcomeId);
+      // A parent's rejected closure is withdrawn: it is judged on its criteria again.
+      if (closure === event.outcomeId && closure.startsWith(PARENT_CLOSURE)) {
+        closure = undefined;
+        continue;
+      }
       // A retry its owner rejects, as a stalled stage's card asks, is retried once more on that rejection.
       if (correctRetry?.outcomeId === event.outcomeId) {
         correctRetry = { digest: event.failureDigest, outcomeId: event.outcomeId };
@@ -280,7 +288,10 @@ export const nextStage = (events: ReadonlyArray<ItemEvent>): FactoryStage => {
         if (review?.passed === true) integration = event.outcomeId;
         break;
       case "closed":
-        if (integration !== undefined) closure = event.outcomeId;
+        // A parent is never integrated: its own closure on proved criteria is its end.
+        if (integration !== undefined || event.outcomeId.startsWith(PARENT_CLOSURE)) {
+          closure = event.outcomeId;
+        }
         break;
       // Evidence for the policy, not a lifecycle transition.
       case "unit_proposed":

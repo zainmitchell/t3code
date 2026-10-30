@@ -19,6 +19,7 @@ import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -40,6 +41,10 @@ import * as FactoryRunPreparation from "./FactoryRunPreparation.ts";
 import * as FactoryStore from "./FactoryStore.ts";
 import * as FactoryExecutionGenerations from "./FactoryExecutionGenerations.ts";
 import * as FactoryTracker from "./FactoryTracker.ts";
+import { admittedBinding, deriveVerificationBinding, makeInsideRoot } from "./FactoryLifecycle.ts";
+import * as FactoryOutcomeStore from "./FactoryOutcomeStore.ts";
+import { subjectOf } from "./factoryOutcomes.ts";
+import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 
 export class FactoryClaimServiceError extends Schema.TaggedError<FactoryClaimServiceError>()(
   "FactoryClaimServiceError",
@@ -122,6 +127,17 @@ const make = Effect.gen(function* () {
     claims,
   });
   const tracker = yield* FactoryTracker.FactoryTracker;
+  const path = yield* Path.Path;
+  const insideRoot = makeInsideRoot(fs, path);
+  const operationStore = yield* FactoryOperationStore.FactoryOperationStore;
+  // The server's provider registry, read-only: the account a selected instance reports itself.
+  const registry = yield* Effect.serviceOption(ProviderRegistry.ProviderRegistry);
+  const workspaceHead = yield* FactoryRunPreparation.FactoryWorkspaceHead;
+  // Built on this service's own database: it reads the records a binding rests on, nothing else.
+  const outcomeStore = yield* Effect.provide(
+    FactoryOutcomeStore.FactoryOutcomeStore,
+    FactoryOutcomeStore.layer,
+  );
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const preparation = yield* FactoryRunPreparation.FactoryRunPreparation;
   const generations = yield* FactoryExecutionGenerations.FactoryExecutionGenerations;
@@ -501,12 +517,133 @@ const make = Effect.gen(function* () {
       ),
   );
 
+  /**
+   * Why a bound verification may not use its workspace or start its provider now, if it may not:
+   * its packet's proposal, records, configuration and pinned files derive the admitted binding
+   * again, its provider reports the adopted account fresh, and once prepared its worktree is the
+   * landed commit and tree.
+   */
+  const revalidateBinding = Effect.fnUntraced(function* (
+    reservation: FactoryStore.NativeReservation,
+    prepared: boolean,
+  ) {
+    if (reservation.origin !== "admitted") return undefined;
+    const basis = /^rework:([^|]+)\|vb:([0-9a-f]{32})\|out:[0-9a-f]{32}$/.exec(
+      reservation.stageBasis ?? "",
+    );
+    if (basis === null) return undefined;
+    const [, specOutcomeId, admittedDigest] = basis;
+    const configuration = yield* store.getConfiguration(reservation.factoryId);
+    const subject = subjectOf(reservation.itemKey);
+    if (
+      Option.isNone(configuration) ||
+      configuration.value.claim === undefined ||
+      configuration.value.verification === undefined ||
+      subject === undefined
+    ) {
+      return "binding_authority_missing";
+    }
+    const { threadId } = reservation.execution;
+    const projection = yield* orchestrator.getThreadProjection(threadId);
+    const run = projection.runs.find((candidate) => candidate.id === reservation.execution.runId);
+    const prompt = projection.messages.find((message) => message.id === run?.userMessageId)?.text;
+    const proposal =
+      prompt === undefined ? Option.none() : admittedBinding(prompt, reservation.packetDigest);
+    if (Option.isNone(proposal)) return "binding_packet_unreadable";
+    const read = yield* tracker
+      .withSession(
+        { host: configuration.value.claim.host, cwd: configuration.value.artifactRoot },
+        (session) => session.readIssue(subject),
+      )
+      .pipe(Effect.option);
+    if (Option.isNone(read)) return "binding_issue_unreadable";
+    const events = yield* outcomeStore.itemEvents({
+      factoryId: reservation.factoryId,
+      itemKey: reservation.itemKey,
+    });
+    // The scope it was admitted on is the issue text it read then; any edit since is a new scope.
+    const admittedText = (yield* outcomeStore.itemRecords({
+      factoryId: reservation.factoryId,
+      itemKey: reservation.itemKey,
+    })).find(
+      ({ record }) =>
+        record.type === "admitted" && record.reservationId === reservation.reservationId,
+    )?.record;
+    const issueText = admittedText?.type === "admitted" ? admittedText.issueText : undefined;
+    if (
+      issueText === undefined ||
+      issueText.title !== read.value.title ||
+      issueText.body !== read.value.body
+    ) {
+      return "binding_scope_changed";
+    }
+    const derived = yield* deriveVerificationBinding(
+      {
+        fs,
+        path,
+        insideRoot,
+        reads: { outcomeStore, store, operations: operationStore },
+      },
+      {
+        configuration: configuration.value,
+        candidate: {
+          itemKey: reservation.itemKey,
+          subject,
+          issue: read.value,
+          events,
+          stage: { type: "rework", specOutcomeId: specOutcomeId!, failureDigest: "" },
+        },
+        pointer: proposal.value.binding,
+        execution: proposal.value.execution,
+        workspace: { type: "worktree", baseRef: proposal.value.baseRef, startFromOrigin: false },
+        itemVersion: reservation.itemVersion,
+      },
+    );
+    if ("wait" in derived) return `binding_refused: ${derived.wait}`;
+    if (derived.digest.slice(0, 32) !== admittedDigest) return "binding_changed";
+    const selected = configuration.value.executionChoices?.[proposal.value.execution];
+    const adopted = configuration.value.verification.identities[proposal.value.execution];
+    if (
+      selected === undefined ||
+      adopted === undefined ||
+      selected.modelSelection.instanceId !== reservation.modelSelection.instanceId
+    ) {
+      return "binding_execution_changed";
+    }
+    const expected = Object.entries(adopted.observe).filter(([, value]) => value !== undefined);
+    if (expected.length === 0) return "provider_identity_unspecified";
+    // The account is what the selected instance itself reports now, never a configured name.
+    if (Option.isNone(registry)) return "provider_identity_unobservable";
+    const instanceId = reservation.modelSelection.instanceId;
+    const observed = (yield* registry.value.refreshInstance(instanceId)).find(
+      (provider) => provider.instanceId === instanceId,
+    )?.auth;
+    if (observed?.status !== "authenticated") return "provider_not_authenticated";
+    if (expected.some(([key, value]) => observed[key as keyof typeof observed] !== value)) {
+      return "provider_identity_mismatch";
+    }
+    if (!prepared) return undefined;
+    const worktree = projection.thread.worktreePath;
+    const checkout = worktree === null ? Option.none() : yield* workspaceHead.read(worktree);
+    if (
+      Option.isNone(checkout) ||
+      checkout.value.commit !== derived.landed.commit ||
+      checkout.value.tree !== derived.landed.tree
+    ) {
+      return "binding_worktree_mismatch";
+    }
+    return undefined;
+  });
+
   const authorizeFirstUse = Effect.fn("FactoryClaimService.authorizeFirstUse")(
     function* (
       reservation: FactoryStore.NativeReservation,
       stage: FactoryClaimStore.FirstUseStage,
     ) {
       if (reservation.origin !== "admitted") return authorized;
+      // A bound verification is checked again before every first use, claimed or continuing.
+      const unbound = yield* revalidateBinding(reservation, stage.type === "provider_start");
+      if (unbound !== undefined) return refused(unbound);
       const entry = yield* claims.get(reservation.reservationId);
       // A decision admitted without a claim requirement has nothing to recheck here.
       if (Option.isNone(entry)) return authorized;
@@ -1009,6 +1146,13 @@ const make = Effect.gen(function* () {
     const status = yield* runStatus(threadId, input.runId);
     const cancelledByRuntime =
       status === "cancelled" && (yield* claims.preparationCancelledByRuntime(input.runId));
+    // Before any workspace I/O: a bound verification whose binding no longer holds prepares
+    // nothing and starts no provider; its run fails with the reason.
+    const unbound = yield* revalidateBinding(reservation, false);
+    if (unbound !== undefined) {
+      if (status === "preparing") yield* failPreparingRun(threadId, input.runId, unbound);
+      return;
+    }
     const ownerId = PreparationOwnerId.make(yield* randomUuidV4);
     const obligation = yield* store.workspaceObligation(input.runId);
     const intent = (effect: Effect.Effect<boolean, FactoryStore.FactoryStoreError>) =>

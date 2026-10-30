@@ -1,3 +1,6 @@
+// @effect-diagnostics nodeBuiltinImport:off - a prepared worktree's checkout is read with git itself.
+import * as NodeChildProcess from "node:child_process";
+
 import type { CommandId } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -40,3 +43,33 @@ export const FactoryRunPreparation = Context.Reference<FactoryRunPreparationShap
     }),
   },
 );
+
+const readGitHead = (cwd: string) =>
+  Effect.promise(
+    () =>
+      new Promise<Option.Option<{ readonly commit: string; readonly tree: string }>>((resolve) =>
+        NodeChildProcess.execFile(
+          "git",
+          ["-C", cwd, "rev-parse", "--verify", "HEAD", "HEAD^{tree}"],
+          { windowsHide: true, timeout: 10_000 },
+          (error, stdout) => {
+            const [commit, tree] = stdout.trim().split(/\r?\n/);
+            resolve(
+              error === null && commit !== undefined && tree !== undefined
+                ? Option.some({ commit, tree })
+                : Option.none(),
+            );
+          },
+        ),
+      ),
+  );
+
+/**
+ * The commit and tree a prepared workspace has checked out, as git reads them in it; none when it
+ * cannot be read. Tests substitute it; nothing else does.
+ */
+export const FactoryWorkspaceHead = Context.Reference<{
+  readonly read: (
+    cwd: string,
+  ) => Effect.Effect<Option.Option<{ readonly commit: string; readonly tree: string }>>;
+}>("t3/factory/FactoryWorkspaceHead", { defaultValue: () => ({ read: readGitHead }) });

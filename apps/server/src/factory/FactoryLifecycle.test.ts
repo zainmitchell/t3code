@@ -1453,8 +1453,51 @@ const layerFactoryRunPreparationTest = Layer.effect(
   Layer.provide(RuntimeLayer.layerThreadManagementProvided),
 );
 
+/**
+ * What a bound verification's first use observes, scripted: the account its provider instance
+ * reports (SYNTHETIC: no real provider, account or credential is read) and the commit and tree
+ * its prepared worktree has checked out.
+ */
+class LaunchFake extends Context.Service<
+  LaunchFake,
+  {
+    auth: ServerProvider["auth"];
+    head: { readonly commit: string; readonly tree: string } | undefined;
+    refreshes: number;
+  }
+>()("t3/factory/FactoryLifecycle.test/LaunchFake") {}
+
+const layerLaunchFake = Layer.sync(LaunchFake, () => ({
+  auth: { status: "authenticated" as const, email: "verifier@example.invalid" },
+  head: undefined,
+  refreshes: 0,
+}));
+
+const layerLaunchObservations = Layer.mergeAll(
+  Layer.effect(
+    ProviderRegistry.ProviderRegistry,
+    Effect.map(LaunchFake, (fake) =>
+      ProviderRegistry.ProviderRegistry.of({
+        getProviders: Effect.sync(() => [{ ...codexSnapshot, auth: fake.auth }]),
+        refreshInstance: (instanceId: ServerProvider["instanceId"]) =>
+          Effect.sync(() => {
+            fake.refreshes++;
+            return [{ ...codexSnapshot, instanceId, auth: fake.auth }];
+          }),
+      } as unknown as ProviderRegistry.ProviderRegistry["Service"]),
+    ),
+  ),
+  Layer.effect(
+    FactoryRunPreparation.FactoryWorkspaceHead,
+    Effect.map(LaunchFake, (fake) => ({
+      read: () => Effect.sync(() => Option.fromNullishOr(fake.head)),
+    })),
+  ),
+);
+
 const makeLayerRuntime = (continueAfterRestart: boolean) =>
   Layer.mergeAll(RuntimeLayer.layer, RuntimeLayer.layerEventSink).pipe(
+    Layer.provide(layerLaunchObservations),
     // Merged, so read-state custody sees the same preparation adapter the runtime uses.
     Layer.provideMerge(layerFactoryRunPreparationTest),
     Layer.provideMerge(RuntimeLayer.layerProjectService),
@@ -1872,6 +1915,7 @@ const makeLayerTest = (options: TestRuntimeOptions = {}) => {
       Layer.provideMerge(layerGitGraphFake),
       Layer.provideMerge(FactoryEffects.layerWakes),
       Layer.provideMerge(layerPreparationFake),
+      Layer.provideMerge(layerLaunchFake),
       Layer.provideMerge(layerTestProviderInstanceRegistry),
       // The scripted contained provider resolves its join exactly as the real runner does.
       Layer.provideMerge(
@@ -11842,103 +11886,147 @@ const verifierExecution = {
   interactionMode: "default" as const,
 };
 
+/**
+ * A proof item whose prerequisite landed through T3, which failed and was corrected, with the
+ * template Root adopted for it and a policy that proposes its rerun with that pointer only.
+ */
+const setUpBoundProof = (issue: number, prerequisite: number, commit: string) =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    yield* configureLifecycleFactory;
+    const root = yield* fs.realPath(yield* fs.makeTempDirectoryScoped());
+    const templates = path.join(root, "templates");
+    const outputs = path.join(root, "outputs");
+    yield* fs.makeDirectory(path.join(templates, "inputs"), { recursive: true });
+    yield* fs.makeDirectory(outputs, { recursive: true });
+    const input = path.join(templates, "inputs", "fixture.json");
+    yield* fs.writeFileString(input, '{"settlement":"fixture"}');
+    // Root adopts stable semantics once; it names no landing, failure or output.
+    const writeTemplate = (name: string, change: Record<string, unknown> = {}) =>
+      Effect.gen(function* () {
+        const text = JSON.stringify({
+          schema: "factory-verification-template/1",
+          issue,
+          prerequisite,
+          worker: { execution: "verifier" },
+          auth: { identity: "verifier@example.invalid" },
+          inputs: [{ path: "inputs/fixture.json", sha256: sha256('{"settlement":"fixture"}') }],
+          consumer: { contract: "settlement-proof", version: "1" },
+          policyIdentity: "policy-r1",
+          ownership: { owned: [] },
+          ...change,
+        });
+        yield* fs.writeFileString(path.join(templates, name), text);
+        return { root: templates, path: name, sha256: sha256(text) };
+      });
+    const template = yield* writeTemplate(`${issue}.json`);
+    const authority = {
+      templateRoot: templates,
+      outputBase: outputs,
+      consumers: [{ contract: "settlement-proof", version: "1" }],
+      identities: {
+        verifier: {
+          identity: "verifier@example.invalid",
+          observe: { email: "verifier@example.invalid" },
+        },
+      } as Record<
+        string,
+        { readonly identity: string; readonly observe: { readonly email?: string } }
+      >,
+    };
+    const reconfigure = (verification: Partial<typeof authority> = {}) =>
+      configureFactory(
+        lifecycleConfiguration({
+          executionChoices: { verifier: verifierExecution },
+          verification: { ...authority, ...verification },
+        }),
+      );
+    yield* reconfigure();
+
+    // The correction lands through T3; the proof item then fails and is corrected.
+    yield* seedIssue(prerequisite);
+    const landed = yield* landThroughT3(prerequisite, commit);
+    yield* seedIssue(prerequisite + 1, { state: "closed" });
+    yield* seedIssue(issue, { blockerNumbers: [prerequisite, prerequisite + 1] });
+    yield* workStage(admittedBy(yield* advance("tracker_event", 1)), {
+      outcome: "failed",
+      failure: "settlement check failed",
+      summary: "Verification failed.",
+    });
+
+    // The policy proposes the rerun on the landed commit with its template pointer only.
+    const proposal: {
+      pointer: typeof template;
+      execution: string;
+      baseRef: string;
+      grant?: { readonly reason: string; readonly evidenceDigest: string };
+    } = {
+      pointer: template,
+      execution: "verifier",
+      baseRef: landed.mergeCommit,
+    };
+    yield* usePolicy((input) =>
+      input.observation.itemKey === itemKeyFor(issue) && input.stage.type === "rework"
+        ? Effect.map(stageRequest(input), (request) =>
+            request !== undefined && "taskKind" in request
+              ? {
+                  ...request,
+                  execution: proposal.execution,
+                  workspaceStrategy: {
+                    type: "worktree" as const,
+                    baseRef: proposal.baseRef,
+                    startFromOrigin: false,
+                  },
+                  verificationBinding: proposal.pointer,
+                  ...(proposal.grant === undefined ? {} : { requiresGrant: proposal.grant }),
+                }
+              : request,
+          )
+        : stageRequest(input),
+    );
+    yield* workStage(admittedBy(yield* advance("outcome")), {
+      outcome: "correction_spec",
+      summary: "Rerun the settlement proof on the landed correction.",
+    });
+    const failedId = (yield* (yield* FactoryOutcomeStore.FactoryOutcomeStore).itemEvents({
+      factoryId,
+      itemKey: itemKeyFor(issue),
+    })).findLast((event) => event.type === "outcome" && event.kind === "failed")!;
+    const failedOutcomeId = failedId.type === "outcome" ? failedId.outcomeId : "";
+
+    return {
+      fs,
+      path,
+      input,
+      outputs,
+      template,
+      writeTemplate,
+      reconfigure,
+      landed,
+      proposal,
+      failedOutcomeId,
+    };
+  });
+
 it.effect(
   "Binding/B1: a landed correction binds its proof from the adopted template once; any changed identity, input, consumer, policy or base waits before launch",
   () =>
     runIsolated(
       Effect.scoped(
         Effect.gen(function* () {
-          const fs = yield* FileSystem.FileSystem;
-          const path = yield* Path.Path;
-          yield* configureLifecycleFactory;
-          const root = yield* fs.realPath(yield* fs.makeTempDirectoryScoped());
-          const templates = path.join(root, "templates");
-          const outputs = path.join(root, "outputs");
-          yield* fs.makeDirectory(path.join(templates, "inputs"), { recursive: true });
-          yield* fs.makeDirectory(outputs, { recursive: true });
-          const input = path.join(templates, "inputs", "fixture.json");
-          yield* fs.writeFileString(input, '{"settlement":"fixture"}');
-          // Root adopts stable semantics once; it names no landing, failure or output.
-          const writeTemplate = (name: string, change: Record<string, unknown> = {}) =>
-            Effect.gen(function* () {
-              const text = JSON.stringify({
-                schema: "factory-verification-template/1",
-                issue: 7501,
-                prerequisite: 7502,
-                worker: { execution: "verifier" },
-                auth: { identity: "verifier@example.invalid" },
-                inputs: [
-                  { path: "inputs/fixture.json", sha256: sha256('{"settlement":"fixture"}') },
-                ],
-                consumer: { contract: "settlement-proof", version: "1" },
-                policyIdentity: "policy-r1",
-                ownership: { owned: [] },
-                ...change,
-              });
-              yield* fs.writeFileString(path.join(templates, name), text);
-              return { root: templates, path: name, sha256: sha256(text) };
-            });
-          const template = yield* writeTemplate("7501.json");
-          const authority = {
-            templateRoot: templates,
-            outputBase: outputs,
-            consumers: [{ contract: "settlement-proof", version: "1" }],
-            identities: { verifier: "verifier@example.invalid" } as Record<string, string>,
-          };
-          const reconfigure = (verification: Partial<typeof authority> = {}) =>
-            configureFactory(
-              lifecycleConfiguration({
-                executionChoices: { verifier: verifierExecution },
-                verification: { ...authority, ...verification },
-              }),
-            );
-          yield* reconfigure();
-
-          // The correction lands through T3; the proof item then fails and is corrected.
-          yield* seedIssue(7502);
-          const landed = yield* landThroughT3(7502, "c0007502");
-          yield* seedIssue(7503, { state: "closed" });
-          yield* seedIssue(7501, { blockerNumbers: [7502, 7503] });
-          yield* workStage(admittedBy(yield* advance("tracker_event", 1)), {
-            outcome: "failed",
-            failure: "settlement check failed",
-            summary: "Verification failed.",
-          });
-
-          // The policy proposes the rerun on the landed commit with its template pointer only.
-          const proposal = {
-            pointer: template,
-            execution: "verifier",
-            baseRef: landed.mergeCommit,
-          };
-          yield* usePolicy((input) =>
-            input.observation.itemKey === itemKeyFor(7501) && input.stage.type === "rework"
-              ? Effect.map(stageRequest(input), (request) =>
-                  request !== undefined && "taskKind" in request
-                    ? {
-                        ...request,
-                        execution: proposal.execution,
-                        workspaceStrategy: {
-                          type: "worktree" as const,
-                          baseRef: proposal.baseRef,
-                          startFromOrigin: false,
-                        },
-                        verificationBinding: proposal.pointer,
-                      }
-                    : request,
-                )
-              : stageRequest(input),
-          );
-          yield* workStage(admittedBy(yield* advance("outcome")), {
-            outcome: "correction_spec",
-            summary: "Rerun the settlement proof on the landed correction.",
-          });
-          const failedId = (yield* (yield* FactoryOutcomeStore.FactoryOutcomeStore).itemEvents({
-            factoryId,
-            itemKey: itemKeyFor(7501),
-          })).findLast((event) => event.type === "outcome" && event.kind === "failed")!;
-          const failedOutcomeId = failedId.type === "outcome" ? failedId.outcomeId : "";
-
+          const {
+            fs,
+            path,
+            input,
+            outputs,
+            template,
+            writeTemplate,
+            reconfigure,
+            landed,
+            proposal,
+            failedOutcomeId,
+          } = yield* setUpBoundProof(7501, 7502, "c0007502");
           const refusedWith = (detail: string, reasonClass = "needs_routing") =>
             Effect.gen(function* () {
               assert.deepStrictEqual(admissionsOnly(yield* advance("clock")), []);
@@ -11962,7 +12050,14 @@ it.effect(
           );
           proposal.pointer = template;
           // Configured authority, not the template, decides identity and consumer meaning.
-          yield* reconfigure({ identities: { verifier: "other@example.invalid" } });
+          yield* reconfigure({
+            identities: {
+              verifier: {
+                identity: "other@example.invalid",
+                observe: { email: "other@example.invalid" },
+              },
+            },
+          });
           yield* refusedWith("configured as other@example.invalid");
           yield* reconfigure({ identities: {} });
           yield* refusedWith("declares no account identity for execution verifier");
@@ -12003,7 +12098,11 @@ it.effect(
           yield* refusedWith("is not a new empty directory");
           yield* fs.remove(outputRoot, { recursive: true });
 
-          // Everything holds: the proof is admitted once, on its derived binding and output root.
+          // Everything holds: the proof is admitted once, on its derived binding and output root,
+          // and starts once its provider reports the adopted account and its worktree the landing.
+          const launch = yield* LaunchFake;
+          launch.head = { commit: landed.mergeCommit, tree: landed.tree };
+          const startsBefore = (yield* startedTurns).length;
           const admitted = admittedBy(yield* advance("clock"));
           assert.deepStrictEqual(stageOf(admitted), [itemKeyFor(7501), "rework"]);
           const basis =
@@ -12016,6 +12115,197 @@ it.effect(
           }
           assert.strictEqual(
             (yield* itemHistory(7501)).filter((entry) => entry === "rework").length,
+            1,
+          );
+          assert.strictEqual((yield* startedTurns).length - startsBefore, 1);
+          assert.isAbove(launch.refreshes, 0);
+          void input;
+        }),
+      ),
+    ),
+);
+
+/** The reason T3 gave for a run of this admission that never reached its provider. */
+const startRefusalOf = (admission: FactoryLifecycle.FactoryAdmissionResult) =>
+  Effect.gen(function* () {
+    const { threadId } = admittedExecution(admission);
+    const projection = yield* (yield* Orchestrator.OrchestratorV2).getThreadProjection(threadId);
+    return projection.turnItems.flatMap((item) =>
+      item.type === "error" && item.failure !== undefined ? [item.failure.message] : [],
+    );
+  });
+
+type LaunchFault = (
+  proof: Effect.Success<ReturnType<typeof setUpBoundProof>>,
+) => Effect.Effect<void, never, LaunchFake | PreparationFake | GitHubFake>;
+
+/**
+ * Between admission and first use, one thing a bound verification rests on changes, or what the
+ * provider and worktree report does not match. Each refuses before any provider starts.
+ */
+const launchFaults: ReadonlyArray<readonly [string, number, LaunchFault, string]> = [
+  [
+    "an unauthenticated account",
+    7520,
+    () => Effect.map(LaunchFake, (launch) => void (launch.auth = { status: "unauthenticated" })),
+    "provider_not_authenticated",
+  ],
+  [
+    "another account",
+    7523,
+    () =>
+      Effect.map(
+        LaunchFake,
+        (launch) =>
+          void (launch.auth = { status: "authenticated", email: "someone@example.invalid" }),
+      ),
+    "provider_identity_mismatch",
+  ],
+  [
+    "an endpoint that reports no account",
+    7526,
+    () => Effect.map(LaunchFake, (launch) => void (launch.auth = { status: "authenticated" })),
+    "provider_identity_mismatch",
+  ],
+  [
+    "a worktree at another commit",
+    7529,
+    () =>
+      Effect.map(
+        LaunchFake,
+        (launch) => void (launch.head = { ...launch.head!, commit: "c0000000" }),
+      ),
+    "binding_worktree_mismatch",
+  ],
+  [
+    "an input changed while preparing",
+    7532,
+    (proof) =>
+      Effect.map(PreparationFake, (preparation) => {
+        preparation.beforeRelease = proof.fs
+          .writeFileString(proof.input, '{"settlement":"changed"}')
+          .pipe(Effect.orDie);
+      }),
+    "binding_refused",
+  ],
+  [
+    "a template replaced while preparing",
+    7535,
+    (proof) =>
+      Effect.map(PreparationFake, (preparation) => {
+        preparation.beforeRelease = proof.fs
+          .writeFileString(proof.path.join(proof.template.root, proof.template.path), "{}")
+          .pipe(Effect.orDie);
+      }),
+    "binding_refused",
+  ],
+  [
+    "an issue edited while preparing",
+    7538,
+    () =>
+      Effect.gen(function* () {
+        const github = yield* GitHubFake;
+        const preparation = yield* PreparationFake;
+        preparation.beforeRelease = Effect.sync(() => {
+          github.issues.get(issueKey(claimRepository, 7538))!.body = "Edited scope.";
+        });
+      }),
+    "binding_scope_changed",
+  ],
+];
+
+it.effect.each(launchFaults)("Binding/B2: %s starts no provider", ([, issue, fault, reason]) =>
+  runIsolated(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const proof = yield* setUpBoundProof(issue, issue + 1, `c000${issue}`);
+        const launch = yield* LaunchFake;
+        launch.head = { commit: proof.landed.mergeCommit, tree: proof.landed.tree };
+        yield* fault(proof);
+        const startsBefore = (yield* startedTurns).length;
+        const admitted = admittedBy(yield* advance("clock", 2));
+        assert.deepStrictEqual(stageOf(admitted), [itemKeyFor(issue), "rework"]);
+        assert.strictEqual((yield* startedTurns).length - startsBefore, 0);
+        assert.isTrue(
+          (yield* startRefusalOf(admitted)).some((message) => message.includes(reason)),
+          JSON.stringify(yield* startRefusalOf(admitted)),
+        );
+      }),
+    ),
+  ),
+);
+
+it.effect(
+  "Binding/B3: a supervised proof spends its own binding's grant once; a changed binding cannot spend it",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const proof = yield* setUpBoundProof(7550, 7551, "c0007550");
+          const launch = yield* LaunchFake;
+          launch.head = { commit: proof.landed.mergeCommit, tree: proof.landed.tree };
+          const factory = yield* FactoryLifecycle.FactoryLifecycle;
+          const outcomes = yield* FactoryOutcomeStore.FactoryOutcomeStore;
+          const store = yield* FactoryStore.FactoryStore;
+          const grantRequests = Effect.map(outcomes.reservedDecisions(factoryId), (decisions) =>
+            decisions.filter(
+              (decision) => decision.itemKey === itemKeyFor(7550) && decision.kind === "grant",
+            ),
+          );
+          proof.proposal.grant = {
+            reason: "Run the supervised proof",
+            evidenceDigest: "grant-evidence",
+          };
+          assert.deepStrictEqual(admissionsOnly(yield* advance("clock")), []);
+          // Unchanged passes ask nothing again.
+          yield* advance("clock");
+          const [request, ...more] = yield* grantRequests;
+          assert.deepStrictEqual(more, []);
+          assert.include(request!.reason, "verification binding");
+          assert.isTrue(
+            yield* factory.resolveReservedDecision({
+              factoryId,
+              decisionId: request!.decisionId,
+              answer: "grant",
+              by: "owner",
+              grantUnits: 2,
+            }),
+          );
+          // The same evidence text for another binding is another request; the grant stays whole.
+          const original = proof.proposal.pointer;
+          proof.proposal.pointer = yield* proof.writeTemplate("7550-copy.json");
+          assert.deepStrictEqual(admissionsOnly(yield* advance("clock")), []);
+          assert.strictEqual(yield* dispositionOf(7550), "awaiting_grant");
+          const requests = yield* grantRequests;
+          const pending = requests.filter((decision) => decision.state === "pending");
+          assert.strictEqual(pending.length, 1);
+          assert.notStrictEqual(pending[0]!.evidenceDigest, request!.evidenceDigest);
+          const grantOf = Effect.map(store.listGrants(factoryId), (grants) =>
+            grants.find((grant) => grant.decisionId === request!.decisionId)!,
+          );
+          assert.strictEqual((yield* grantOf).remaining, 2);
+          // Its own binding spends one unit, once, however passes race or the server restarts.
+          proof.proposal.pointer = original;
+          // Two collections at once: one runs, the other coalesces into it.
+          const raced = yield* Effect.all(
+            [
+              factory.reconcile({ factoryId, trigger: "clock" }),
+              factory.reconcile({ factoryId, trigger: "owner_decision" }),
+            ],
+            { concurrency: 2 },
+          );
+          yield* runEffects;
+          assert.strictEqual(
+            raced
+              .flatMap((result) => (result.type === "collected" ? result.admissions : []))
+              .filter((admission) => admission.type === "admitted").length,
+            1,
+          );
+          for (const trigger of ["restart", "clock"] as const) yield* advance(trigger);
+          const spent = yield* grantOf;
+          assert.deepStrictEqual([spent.remaining, spent.spentBy.length], [1, 1]);
+          assert.strictEqual(
+            (yield* itemHistory(7550)).filter((entry) => entry === "rework").length,
             1,
           );
         }),
@@ -12155,6 +12445,22 @@ it.effect(
             yield* advance(trigger);
           assert.strictEqual((yield* closeRequests) - patchesBefore, 2);
           assert.notInclude(yield* itemHistory(7601), "implement");
+          // Its closure is the parent's end: done, with no integration made up for it.
+          assert.strictEqual(yield* dispositionOf(7601), "done");
+          assert.notInclude(yield* itemHistory(7601), "integrated");
+
+          // Reopened, that closure no longer stands: the parent is judged again on its records and,
+          // all clauses still proved, closed once more by a new operation, never the old receipt.
+          closed.state = "open";
+          yield* advance("clock");
+          const reopened = yield* itemHistory(7601);
+          assert.include(reopened, "reopened");
+          assert.strictEqual(reopened.filter((entry) => entry === "closed").length, 2);
+          assert.strictEqual(closed.state, "closed");
+          assert.strictEqual((yield* closeRequests) - patchesBefore, 3);
+          yield* advance("restart");
+          assert.strictEqual((yield* closeRequests) - patchesBefore, 3);
+          assert.strictEqual(yield* dispositionOf(7601), "done");
         }),
       ),
     ),
