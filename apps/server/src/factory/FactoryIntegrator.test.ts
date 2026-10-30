@@ -335,3 +335,46 @@ it.live(
       }),
     ).pipe(Effect.provide(layer)),
 );
+
+/** Refuses every push to `branch`, as a protected branch or a missing permission does. */
+const protect = (origin: string, branch: string) => {
+  const hook = NodePath.join(origin, "hooks", "pre-receive");
+  NodeFS.writeFileSync(
+    hook,
+    `#!/bin/sh\nwhile read old new ref; do\n  if [ "$ref" = "refs/heads/${branch}" ]; then\n    echo "protected branch ${branch}: this account may not push" >&2\n    exit 1\n  fi\ndone\n`,
+  );
+  NodeFS.chmodSync(hook, 0o755);
+};
+
+it.live("PR integration: a refused push leaves the branch as it was and says what refused it", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const repo = yield* repository;
+      const integrator = yield* FactoryIntegrator.FactoryIntegrator;
+      const branch = { remote: "origin", branch: "beta/13-protected" } as const;
+      assert.deepStrictEqual(
+        yield* integrator.publish({ cwd: repo.cwd, ...branch, commit: repo.base }),
+        { type: "published" },
+      );
+      protect(repo.origin, branch.branch);
+      const refused = yield* integrator.publish({ cwd: repo.cwd, ...branch, commit: repo.head });
+      assert.strictEqual(refused.type, "refused");
+      assert.strictEqual(refused.type === "refused" ? refused.tip : undefined, repo.base);
+      assert.include(refused.type === "refused" ? refused.detail : "", "this account may not push");
+      assert.strictEqual(git(repo.origin, "rev-parse", branch.branch), repo.base);
+      // A direct integration onto a protected target is refused the same way, and lands nothing.
+      protect(repo.origin, "main");
+      const applied = yield* integrator.apply({
+        cwd: repo.cwd,
+        target: remoteMain,
+        expected: repo.base,
+        reviewedHead: repo.head,
+        mode: "merge",
+        message: message("op-protected"),
+        identity,
+      });
+      assert.strictEqual(applied.type, "refused");
+      assert.strictEqual(git(repo.origin, "rev-parse", "main"), repo.base);
+    }),
+  ).pipe(Effect.provide(layer)),
+);

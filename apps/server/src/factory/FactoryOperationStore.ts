@@ -7,6 +7,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
+import { OperationWait } from "./factoryOperationWait.ts";
 import * as FactoryStore from "./FactoryStore.ts";
 
 const IssueTarget = { repository: Schema.String, issueNumber: Schema.Int };
@@ -139,8 +140,9 @@ const Fields = {
   itemKey: FactoryItemKey,
   intent: FactoryOperationIntent,
   createdAt: Schema.String,
-  /** The last attempt that could not tell whether the write applied, kept for the readback. */
+  /** Why the last attempt did not end it, as the factory's state shows it: `wait`, rendered. */
   lastError: Schema.optional(Schema.String),
+  wait: Schema.optional(OperationWait),
   /**
    * The issue a `tracker_create_issue` created, recorded as soon as it is known: later attempts
    * continue on it, so a lagging marker listing can never cause a second create.
@@ -242,11 +244,15 @@ export class FactoryOperationStore extends Context.Service<
       readonly operationId: string;
       readonly completion: FactoryOperationCompletion;
     }) => Effect.Effect<boolean, FactoryOperationStoreError>;
-    /** Keeps an intended operation intended, with why its last attempt could not be known. */
-    readonly noteUncertain: (input: {
+    /**
+     * Keeps an intended operation intended, with why its last attempt did not end it. A wait on
+     * the same basis keeps its `since`; false when the record already said exactly this.
+     */
+    readonly noteWait: (input: {
       readonly operationId: string;
-      readonly error: string;
-    }) => Effect.Effect<void, FactoryOperationStoreError>;
+      readonly wait: Omit<OperationWait, "since">;
+      readonly text: string;
+    }) => Effect.Effect<boolean, FactoryOperationStoreError>;
     /**
      * Records the issue an intended operation created; the first one recorded stays. Returns the
      * operation's recorded issue, or none if it has ended.
@@ -426,7 +432,7 @@ const make = Effect.gen(function* () {
       }) {
         const current = yield* read(input.operationId);
         if (Option.isNone(current) || current.value.state !== "intended") return false;
-        const { state: _state, lastError: _lastError, ...fields } = current.value;
+        const { state: _state, lastError: _lastError, wait: _wait, ...fields } = current.value;
         const completedAt = DateTime.formatIso(yield* DateTime.now);
         const completed: FactoryOperation =
           input.completion.state === "applied"
@@ -447,11 +453,23 @@ const make = Effect.gen(function* () {
       },
       Effect.mapError(fail("complete")),
     ),
-    noteUncertain: Effect.fn("FactoryOperationStore.noteUncertain")(
-      function* (input: { readonly operationId: string; readonly error: string }) {
-        yield* amend(input.operationId, (current) => ({ ...current, lastError: input.error }));
+    noteWait: Effect.fn("FactoryOperationStore.noteWait")(
+      function* (input: {
+        readonly operationId: string;
+        readonly wait: Omit<OperationWait, "since">;
+        readonly text: string;
+      }) {
+        const at = DateTime.formatIso(yield* DateTime.now);
+        const written = yield* amend(input.operationId, (current) => {
+          const previous = current.wait;
+          const same = previous?.basis === input.wait.basis && previous.kind === input.wait.kind;
+          if (same && current.lastError === input.text) return undefined;
+          const since = same ? previous.since : at;
+          return { ...current, lastError: input.text, wait: { ...input.wait, since } };
+        });
+        return Option.isSome(written);
       },
-      Effect.mapError(fail("note-uncertain")),
+      Effect.mapError(fail("note-wait")),
     ),
     noteCreatePending: Effect.fn("FactoryOperationStore.noteCreatePending")(
       function* (operationId: string) {

@@ -9,9 +9,12 @@ import {
   attemptPullRequestMerge,
   isMergedElsewhere,
   MERGED_ELSEWHERE,
+  type PullRequestAttempt,
   pullRequestStep,
   type PullRequestFacts,
+  type PullRequestStep,
 } from "./factoryPullRequests.ts";
+import { waitBasis } from "./factoryOperationWait.ts";
 import type * as FactoryTracker from "./FactoryTracker.ts";
 
 const reviewed = "c0000002";
@@ -28,6 +31,21 @@ const open = (overrides: Partial<PullRequestFacts> = {}): PullRequestFacts => ({
 });
 const noChecks = { pending: [], failed: [] };
 
+/** A wait as the factory's state shows it, without its basis facts. */
+const shown = (step: PullRequestStep | PullRequestAttempt) => {
+  const waiting =
+    "type" in step
+      ? step.type === "wait"
+        ? step
+        : undefined
+      : step.state === "waiting"
+        ? step
+        : undefined;
+  if (waiting === undefined) return assert.fail(`not a wait: ${JSON.stringify(step)}`);
+  const { reason, wait } = waiting;
+  return { reason, kind: wait.kind, actor: wait.actor, resume: wait.resume };
+};
+
 it("PR integration: GitHub's own gates decide between merging, waiting and correcting", () => {
   assert.deepStrictEqual(pullRequestStep(open(), reviewed, undefined), { type: "merge" });
   // Failing checks GitHub does not require leave the pull request mergeable.
@@ -38,11 +56,18 @@ it("PR integration: GitHub's own gates decide between merging, waiting and corre
     },
   );
   assert.deepStrictEqual(
-    pullRequestStep(open({ mergeableState: "blocked" }), reviewed, {
-      pending: ["ci / test"],
-      failed: [],
-    }),
-    { type: "wait", reason: "pull request #41 awaits checks: ci / test" },
+    shown(
+      pullRequestStep(open({ mergeableState: "blocked" }), reviewed, {
+        pending: ["ci / test"],
+        failed: [],
+      }),
+    ),
+    {
+      reason: "pull request #41 awaits checks: ci / test",
+      kind: "dependency",
+      actor: "the required checks",
+      resume: `the checks on ${reviewed} finish; a failure goes back to the work`,
+    },
   );
   assert.deepStrictEqual(
     pullRequestStep(open({ mergeableState: "blocked" }), reviewed, {
@@ -70,6 +95,32 @@ it("PR integration: GitHub's own gates decide between merging, waiting and corre
   for (const pending of [open({ mergeableState: null }), open({ draft: true })]) {
     assert.strictEqual(pullRequestStep(pending, reviewed, undefined).type, "wait");
   }
+});
+
+it("PR integration: a wait's basis is the facts it stands on, never their order or wording", () => {
+  const blocked = open({ mergeableState: "blocked" });
+  const basis = (step: PullRequestStep) => {
+    assert.strictEqual(step.type, "wait");
+    return step.type === "wait" ? waitBasis(step.wait) : "";
+  };
+  const checks = basis(pullRequestStep(blocked, reviewed, { pending: ["a", "b"], failed: [] }));
+  assert.strictEqual(
+    basis(pullRequestStep(blocked, reviewed, { pending: ["b", "a"], failed: [] })),
+    checks,
+  );
+  // One check finished: a new wait. Approvals then wait on their own basis.
+  assert.notStrictEqual(
+    basis(pullRequestStep(blocked, reviewed, { pending: ["b"], failed: [] })),
+    checks,
+  );
+  const approvals = basis(pullRequestStep(blocked, reviewed, noChecks));
+  assert.notStrictEqual(approvals, checks);
+  assert.strictEqual(basis(pullRequestStep(blocked, reviewed, noChecks)), approvals);
+  // The same block on a successor head is a different wait; the old head's never stands for it.
+  assert.notStrictEqual(
+    basis(pullRequestStep({ ...blocked, headSha: "c0000003" }, "c0000003", noChecks)),
+    approvals,
+  );
 });
 
 it("PR integration: only the reviewed head merged by its pull request counts as landed", () => {
@@ -161,14 +212,16 @@ it("PR integration: a block without a current request for changes keeps waiting 
   // Unreadable or partial review facts decide nothing.
   assert.strictEqual(step(undefined), "wait");
   // Checks still explain a block first.
-  assert.deepStrictEqual(
-    pullRequestStep(
-      examplePr,
-      exampleHead,
-      { pending: ["focused-checks"], failed: [] },
-      exampleFindings,
-    ),
-    { type: "wait", reason: "pull request #41 awaits checks: focused-checks" },
+  assert.strictEqual(
+    shown(
+      pullRequestStep(
+        examplePr,
+        exampleHead,
+        { pending: ["focused-checks"], failed: [] },
+        exampleFindings,
+      ),
+    ).reason,
+    "pull request #41 awaits checks: focused-checks",
   );
   // A pull request GitHub would merge is merged, whatever was said on it.
   assert.strictEqual(step(exampleFindings, { ...examplePr, mergeableState: "clean" }), "merge");
@@ -388,9 +441,13 @@ const recordingRemote = (state: {
   readonly pull?: PullRequestFacts | undefined;
   readonly contains: boolean;
   readonly tip: string | null;
+  readonly checks?: { readonly pending: ReadonlyArray<string>; readonly failed: [] };
+  /** `lost`: GitHub merges, and its answer never arrives. */
+  readonly merge?: "refused" | "lost";
 }) => {
   const writes: Array<string> = [];
   let pull = state.pull;
+  let merged = "";
   const session: Pick<
     FactoryTracker.TrackerSession,
     | "findPullRequest"
@@ -405,7 +462,10 @@ const recordingRemote = (state: {
   > = {
     findPullRequest: () => Effect.sync(() => Option.fromNullishOr(pull)),
     readPullRequest: () => Effect.sync(() => pull!),
-    readCommit: () => Effect.die("no pull request here was merged"),
+    readCommit: ({ sha }) =>
+      sha === mergeCommit
+        ? Effect.succeed({ parents: [state.tip!, reviewed], tree: "f".repeat(40), message: merged })
+        : Effect.die("no pull request here was merged"),
     createPullRequest: () =>
       Effect.sync(() => {
         writes.push("create");
@@ -413,17 +473,20 @@ const recordingRemote = (state: {
         return { type: "written" as const, number: pull.number };
       }),
     markReadyForReview: () => Effect.sync(() => void writes.push("ready")),
-    mergePullRequest: () =>
-      Effect.sync(() => {
+    mergePullRequest: ({ message }) =>
+      Effect.sync((): FactoryTracker.MergeOutcome => {
         writes.push("merge");
-        return { type: "refused" as const, status: 405 };
+        if (state.merge !== "lost") return { type: "refused", status: 405 };
+        merged = message;
+        pull = { ...pull!, state: "closed", merged: true, mergeCommit };
+        return { type: "ambiguous", cause: "GitHubApiRequestError" };
       }),
     ensureSuccessStatus: () =>
       Effect.sync(() => {
         writes.push("status");
         return true;
       }),
-    readChecks: () => Effect.succeed({ pending: ["ci / test"], failed: [] }),
+    readChecks: () => Effect.succeed(state.checks ?? { pending: ["ci / test"], failed: [] }),
     readReviewFindings: () => Effect.succeedNone,
   };
   const integrator: Pick<FactoryIntegrator.FactoryIntegratorShape, "tip" | "landed" | "publish"> = {
@@ -459,9 +522,11 @@ it.effect(
   () =>
     Effect.gen(function* () {
       const remote = recordingRemote({ contains: false, tip: null });
-      assert.deepStrictEqual(yield* remote.attempt(ordinary), {
-        state: "waiting",
+      assert.deepStrictEqual(shown(yield* remote.attempt(ordinary)), {
         reason: "integration target main does not exist on origin; nothing was published",
+        kind: "dependency",
+        actor: `the owner of ${repository}`,
+        resume: "main exists on origin",
       });
       assert.deepStrictEqual(remote.writes, []);
     }),
@@ -470,8 +535,10 @@ it.effect(
 it.effect("PR integration: an acknowledgement attempt only reads, whatever it finds", () =>
   Effect.gen(function* () {
     const waiting = {
-      state: "waiting" as const,
       reason: `main on origin does not contain the reviewed head ${reviewed}; nothing was published`,
+      kind: "dependency",
+      actor: "the maintainers of main on origin",
+      resume: `main on origin contains ${reviewed}`,
     };
     for (const state of [
       { contains: false, tip: "b".repeat(40) },
@@ -485,7 +552,7 @@ it.effect("PR integration: an acknowledgement attempt only reads, whatever it fi
       { pull: open({ state: "closed" }), contains: false, tip: "b".repeat(40) },
     ]) {
       const remote = recordingRemote(state);
-      assert.deepStrictEqual(yield* remote.attempt(acknowledgement), waiting);
+      assert.deepStrictEqual(shown(yield* remote.attempt(acknowledgement)), waiting);
       assert.deepStrictEqual(remote.writes, []);
     }
   }),
@@ -518,10 +585,48 @@ it.effect(
   () =>
     Effect.gen(function* () {
       const remote = recordingRemote({ contains: false, tip: "b".repeat(40) });
-      assert.deepStrictEqual(yield* remote.attempt(ordinary), {
-        state: "waiting",
-        reason: "pull request #41 awaits checks: ci / test",
-      });
+      assert.strictEqual(
+        shown(yield* remote.attempt(ordinary)).reason,
+        "pull request #41 awaits checks: ci / test",
+      );
       assert.deepStrictEqual(remote.writes, ["publish", "create", "status"]);
+    }),
+);
+
+it.effect(
+  "PR integration: a refused merge waits on who can allow it; a lost answer is read back, never resent",
+  () =>
+    Effect.gen(function* () {
+      const mergeable = open({ mergeableState: "clean" });
+      const refused = recordingRemote({ pull: mergeable, contains: false, tip: "b".repeat(40) });
+      assert.deepStrictEqual(shown(yield* refused.attempt(ordinary)), {
+        reason: "GitHub refused the merge of pull request #41 (405)",
+        kind: "dependency",
+        actor: `the administrators of ${repository} and its protection on main`,
+        resume: "GitHub accepts the merge; each attempt reads pull request #41 first",
+      });
+      const lost = recordingRemote({
+        pull: mergeable,
+        contains: false,
+        tip: "b".repeat(40),
+        merge: "lost",
+      });
+      // The readback right after the lost answer already shows the merge: it lands, once.
+      const landed = yield* lost.attempt(ordinary);
+      assert.deepStrictEqual(landed, {
+        state: "applied",
+        receipt: {
+          kind: "pull_request_merge",
+          repository,
+          number: 41,
+          branch: "main",
+          commit: mergeCommit,
+          parents: ["b".repeat(40), reviewed],
+          tree: "f".repeat(40),
+          attribution: "operation",
+        },
+      });
+      assert.deepStrictEqual(yield* lost.attempt(ordinary), landed);
+      assert.deepStrictEqual(lost.writes, ["publish", "status", "merge"]);
     }),
 );
