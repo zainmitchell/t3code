@@ -452,3 +452,33 @@ it.effect("Quota: a pass over unchanged issues revalidates every read and is cha
     }).pipe(Effect.provide(layer));
   }),
 );
+
+it.effect("a parent's sub-issues are read on every page, each in its own repository", () =>
+  Effect.gen(function* () {
+    const children = Array.from({ length: 101 }, (_, index) => ({
+      number: index + 2,
+      state: index % 2 === 0 ? "open" : "closed",
+      repository_url:
+        index === 100
+          ? "https://api.github.com/repos/acme/other"
+          : "https://api.github.com/repos/acme/web",
+    }));
+    const paged = (path: string) => {
+      const page = Number(/[?&]page=(\d+)/.exec(path)![1]);
+      return children.slice((page - 1) * 100, page * 100);
+    };
+    const listed = yield* withSession(
+      (input) => Effect.succeed(paged(input.path)),
+      (session) => session.listSubIssues!({ repository: "acme/web", issueNumber: 1 }),
+    );
+    assert.strictEqual(listed.length, 101);
+    assert.deepStrictEqual(listed[0], { repository: "acme/web", number: 2, state: "open" });
+    assert.deepStrictEqual(listed[100], { repository: "acme/other", number: 102, state: "open" });
+    // A child whose state the listing omits is unread, never taken as open.
+    const stateless = yield* withSession(
+      () => Effect.succeed([{ number: 2 }]),
+      (session) => session.listSubIssues!({ repository: "acme/web", issueNumber: 1 }),
+    ).pipe(Effect.flip);
+    assert.strictEqual(stateless._tag, "FactoryTrackerError");
+  }),
+);

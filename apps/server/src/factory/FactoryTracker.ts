@@ -171,6 +171,21 @@ export interface TrackerSession {
     readonly repository: string;
     readonly issueNumber: number;
   }) => Effect.Effect<TrackerIssue, FactoryTrackerError>;
+  /**
+   * Every sub-issue of the issue, open or closed, read page by page; each in its own repository.
+   * A session without it cannot say who a parent's children are.
+   */
+  readonly listSubIssues?: (input: {
+    readonly repository: string;
+    readonly issueNumber: number;
+  }) => Effect.Effect<
+    ReadonlyArray<{
+      readonly repository: string;
+      readonly number: number;
+      readonly state: "open" | "closed";
+    }>,
+    FactoryTrackerError
+  >;
   /** Open issues in issue-number order, never pull requests. */
   readonly listOpenIssues: (input: {
     readonly repository: string;
@@ -668,6 +683,36 @@ const make = Effect.gen(function* () {
               };
             },
             Effect.mapError(fail("read-issue")),
+          ),
+          listSubIssues: Effect.fn("FactoryTracker.listSubIssues")(
+            function* (input: { readonly repository: string; readonly issueNumber: number }) {
+              const children: Array<{
+                readonly repository: string;
+                readonly number: number;
+                readonly state: "open" | "closed";
+              }> = [];
+              for (let page = 1; ; page++) {
+                const decoded = yield* decodeRelatedList(
+                  yield* get(
+                    "factory.listSubIssues",
+                    `repos/${input.repository}/issues/${input.issueNumber}/sub_issues?per_page=100&page=${page}`,
+                  ),
+                );
+                for (const child of decoded) {
+                  // An issue whose state the listing omits is unread, never open by default.
+                  if (child.state === undefined) {
+                    return yield* Effect.fail(`sub-issue #${child.number} has no state`);
+                  }
+                  children.push({
+                    repository: repositoryOf(child, input.repository),
+                    number: child.number,
+                    state: child.state,
+                  });
+                }
+                if (decoded.length < 100) return children;
+              }
+            },
+            Effect.mapError(fail("list-sub-issues")),
           ),
           listOpenIssues: Effect.fn("FactoryTracker.listOpenIssues")(
             function* (input: { readonly repository: string }) {

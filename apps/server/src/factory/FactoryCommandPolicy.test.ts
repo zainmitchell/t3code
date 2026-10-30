@@ -347,6 +347,43 @@ it("Policy input: closed blockers carry their outcomes as facts; other items are
       ],
     },
   ]);
+  // The outcome's own native origin is not forwarded; only one T3 matched to its applied receipt.
+  const landing = { type: "native" as const, operationId: "operation-11" };
+  const parent = FactoryCommandPolicy.policyInput({
+    configuration: configuration(),
+    items: [
+      {
+        ...item,
+        blockers: [{ itemKey: blocker, outcomes: [{ ...integrated, landingOrigin: landing }] }],
+        children: [
+          {
+            itemKey: blocker,
+            outcomes: [{ ...integrated, landingOrigin: landing }],
+            state: "closed",
+          },
+          { itemKey: refused, outcomes: [], events, state: "open" },
+        ],
+      },
+      { ...item, childrenUnread: { reason: "listed 1 of 2", foreign: [] } },
+    ],
+    active: [],
+  });
+  assert.deepStrictEqual(parent.items[0]!.blockers?.[0]?.outcomes[0]?.origin, landing);
+  assert.deepStrictEqual(
+    parent.items[0]!.children?.map((child) => [
+      child.itemKey,
+      child.state,
+      child.outcomes.map((outcome) => outcome.origin),
+      child.events?.length ?? 0,
+    ]),
+    [
+      [blocker, "closed", [landing], 0],
+      [refused, "open", [], 2],
+    ],
+  );
+  // Unread membership is said, never sent as an empty list.
+  assert.isFalse("children" in parent.items[1]!);
+  assert.deepStrictEqual(parent.items[1]!.childrenUnread, { reason: "listed 1 of 2", foreign: [] });
   // An item without blockers serializes exactly as it did before they existed.
   assert.deepStrictEqual(Object.keys(input.items[1]!), [
     "decisionKey",

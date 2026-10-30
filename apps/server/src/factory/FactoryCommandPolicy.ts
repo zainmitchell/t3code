@@ -235,6 +235,23 @@ const outcomeFacts = (outcome: FactoryLifecycle.FactoryPolicyOutcome) => ({
   ...(outcome.itemVersion === undefined ? {} : { itemVersion: outcome.itemVersion }),
   ...(outcome.policyRevision === undefined ? {} : { policyRevision: outcome.policyRevision }),
   ...(outcome.decisionKey === undefined ? {} : { decisionKey: outcome.decisionKey }),
+  // Only an integration whose own applied receipt T3 matched; a report alone carries no origin.
+  ...(outcome.landingOrigin === undefined ? {} : { origin: outcome.landingOrigin }),
+});
+
+/** Another item's outcomes and validity events, exactly as recorded. */
+const itemFacts = (facts: FactoryLifecycle.FactoryPolicyItemFacts) => ({
+  itemKey: facts.itemKey,
+  outcomes: facts.outcomes.map(outcomeFacts),
+  ...(facts.events === undefined
+    ? {}
+    : {
+        events: facts.events.map((event) =>
+          event.type === "rejected"
+            ? { type: event.type, outcomeId: event.outcomeId, failureDigest: event.failureDigest }
+            : { type: event.type, closureOutcomeId: event.closureOutcomeId },
+        ),
+      }),
 });
 
 /** What the policy command reads on stdin: every decidable item, and the work under way. */
@@ -252,27 +269,11 @@ export const policyInput = (
     itemVersion: item.observation.itemVersion,
     item: issueFacts(item.observation.itemKey, item.issue),
     outcomes: item.outcomes.map(outcomeFacts),
-    ...(item.blockers === undefined
+    ...(item.blockers === undefined ? {} : { blockers: item.blockers.map(itemFacts) }),
+    ...(item.children === undefined
       ? {}
-      : {
-          blockers: item.blockers.map((blocker) => ({
-            itemKey: blocker.itemKey,
-            outcomes: blocker.outcomes.map(outcomeFacts),
-            ...(blocker.events === undefined
-              ? {}
-              : {
-                  events: blocker.events.map((event) =>
-                    event.type === "rejected"
-                      ? {
-                          type: event.type,
-                          outcomeId: event.outcomeId,
-                          failureDigest: event.failureDigest,
-                        }
-                      : { type: event.type, closureOutcomeId: event.closureOutcomeId },
-                  ),
-                }),
-          })),
-        }),
+      : { children: item.children.map((child) => ({ ...itemFacts(child), state: child.state })) }),
+    ...(item.childrenUnread === undefined ? {} : { childrenUnread: item.childrenUnread }),
     reserved: item.reserved,
     grants: item.grants,
     ...(item.legacy === undefined ? {} : { legacy: item.legacy }),

@@ -94,6 +94,7 @@ import { decisionGuidance } from "./factoryDecisionGuidance.ts";
 import * as FactoryEffects from "./FactoryEffects.ts";
 import * as FactoryIntegrator from "./FactoryIntegrator.ts";
 import * as FactoryOperationStore from "./FactoryOperationStore.ts";
+import { landingOrigin, reviewedHeadsOf, type LandingOrigin } from "./factoryCoordination.ts";
 import * as FactoryTransferStore from "./FactoryTransferStore.ts";
 import {
   type FactoryTransferInput,
@@ -381,7 +382,20 @@ export type FactoryPolicyOutcome = FactoryOutcomeStore.FactoryOutcome & {
   readonly policyRevision?: string;
   /** The decision its stage was admitted as: a triage result counts only for its own inputs. */
   readonly decisionKey?: FactoryDecisionKey;
+  /** For an integration: the operation whose own applied receipt proves exactly this landing. */
+  readonly landingOrigin?: LandingOrigin;
 };
+
+/** Another item's recorded outcomes and validity events, as policy reads them. */
+export interface FactoryPolicyItemFacts {
+  readonly itemKey: FactoryItemKey;
+  readonly outcomes: ReadonlyArray<FactoryPolicyOutcome>;
+  /** Each names the outcome it rejects or whose closure it invalidates, by outcome id. */
+  readonly events?: ReadonlyArray<
+    | { readonly type: "rejected"; readonly outcomeId: string; readonly failureDigest: string }
+    | { readonly type: "reopened"; readonly closureOutcomeId: string }
+  >;
+}
 
 /** One item a pass could decide, with every native fact policy may need for it. */
 export interface FactoryPolicyItem {
@@ -400,15 +414,18 @@ export interface FactoryPolicyItem {
    * recorded: tracker closure alone never shows that its work was reviewed and integrated.
    * Rejections and reopens are carried as recorded, never folded into an outcome's state.
    */
-  readonly blockers?: ReadonlyArray<{
-    readonly itemKey: FactoryItemKey;
-    readonly outcomes: ReadonlyArray<FactoryPolicyOutcome>;
-    /** Each names the blocker outcome it rejects or whose closure it invalidates, by outcome id. */
-    readonly events?: ReadonlyArray<
-      | { readonly type: "rejected"; readonly outcomeId: string; readonly failureDigest: string }
-      | { readonly type: "reopened"; readonly closureOutcomeId: string }
-    >;
-  }>;
+  readonly blockers?: ReadonlyArray<FactoryPolicyItemFacts>;
+  /**
+   * Every sub-issue of a parent in its own repository, open or closed, with this factory's
+   * outcomes for it: only when the whole membership was read. Membership is no evidence by itself.
+   */
+  readonly children?: ReadonlyArray<FactoryPolicyItemFacts & { readonly state: "open" | "closed" }>;
+  /** Why a parent's children are not given: its membership could not be read whole. */
+  readonly childrenUnread?: {
+    readonly reason: string;
+    /** Sub-issues in another repository, whose outcomes this factory does not hold. */
+    readonly foreign: ReadonlyArray<FactoryItemKey>;
+  };
   /** The decision a request for this stage would be, so its packet can name its work key. */
   readonly decisionKey: FactoryDecisionKey;
   /** The decision a triage of this item version would be; only before its first build. */
@@ -852,6 +869,8 @@ interface PolicyOutcomeReads {
     "get" | "itemEvents"
   >;
   readonly store: Pick<FactoryStore.FactoryStore["Service"], "getReservation">;
+  /** With it, an integration carries the operation whose own receipt proves its landing. */
+  readonly operations?: Pick<FactoryOperationStore.FactoryOperationStore["Service"], "get">;
 }
 
 /**
@@ -883,7 +902,53 @@ export const policyOutcomes = Effect.fnUntraced(function* (
         : outcome.value,
     );
   }
-  return outcomes;
+  if (reads.operations === undefined) return outcomes;
+  const rejected = new Set(
+    events.flatMap((event) => (event.type === "rejected" ? [event.outcomeId] : [])),
+  );
+  const reviewed = reviewedHeadsOf(outcomes, rejected);
+  const landed: Array<FactoryPolicyOutcome> = [];
+  for (const outcome of outcomes) {
+    const operationId = outcome.origin.type === "native" ? outcome.origin.operationId : undefined;
+    const origin =
+      operationId === undefined || outcome.report.outcome !== "integrated"
+        ? undefined
+        : landingOrigin(
+            outcome,
+            Option.getOrUndefined(yield* reads.operations.get(operationId)),
+            reviewed,
+          );
+    landed.push(origin === undefined ? outcome : { ...outcome, landingOrigin: origin });
+  }
+  return landed;
+});
+
+/** Another item's outcomes and validity events, read once per pass through `read`. */
+const policyItemFacts = Effect.fnUntraced(function* (
+  reads: PolicyOutcomeReads,
+  factoryId: FactoryId,
+  itemKey: FactoryItemKey,
+  read: Map<FactoryItemKey, FactoryPolicyItemFacts>,
+) {
+  const known = read.get(itemKey);
+  if (known !== undefined) return known;
+  const itemEvents = yield* reads.outcomeStore.itemEvents({ factoryId, itemKey });
+  const outcomes = yield* policyOutcomes(reads, itemEvents);
+  const events: Array<NonNullable<FactoryPolicyItemFacts["events"]>[number]> = [];
+  for (const event of itemEvents) {
+    if (event.type === "rejected") {
+      events.push({
+        type: "rejected",
+        outcomeId: event.outcomeId,
+        failureDigest: event.failureDigest,
+      });
+    } else if (event.type === "reopened") {
+      events.push({ type: "reopened", closureOutcomeId: event.closureOutcomeId });
+    }
+  }
+  const facts = { itemKey, outcomes, ...(events.length === 0 ? {} : { events }) };
+  read.set(itemKey, facts);
+  return facts;
 });
 
 /**
@@ -896,43 +961,77 @@ export const policyBlockers = Effect.fnUntraced(function* (
     readonly factoryId: FactoryId;
     readonly repository: string;
     readonly issue: TrackerIssue;
-    readonly read: Map<FactoryItemKey, NonNullable<FactoryPolicyItem["blockers"]>[number]>;
+    readonly read: Map<FactoryItemKey, FactoryPolicyItemFacts>;
   },
 ) {
-  const blockers: Array<NonNullable<FactoryPolicyItem["blockers"]>[number]> = [];
+  const blockers: Array<FactoryPolicyItemFacts> = [];
   for (const blocker of input.issue.blockedBy ?? []) {
     if (blocker.state !== "closed" || blocker.repository !== input.repository) continue;
     const itemKey = FactoryItemKeyFor({
       repository: blocker.repository,
       issueNumber: blocker.number,
     });
-    let facts = input.read.get(itemKey);
-    if (facts === undefined) {
-      const itemEvents = yield* reads.outcomeStore.itemEvents({
-        factoryId: input.factoryId,
-        itemKey,
-      });
-      const outcomes = yield* policyOutcomes(reads, itemEvents);
-      const events: Array<
-        NonNullable<NonNullable<FactoryPolicyItem["blockers"]>[number]["events"]>[number]
-      > = [];
-      for (const event of itemEvents) {
-        if (event.type === "rejected") {
-          events.push({
-            type: "rejected",
-            outcomeId: event.outcomeId,
-            failureDigest: event.failureDigest,
-          });
-        } else if (event.type === "reopened") {
-          events.push({ type: "reopened", closureOutcomeId: event.closureOutcomeId });
-        }
-      }
-      facts = { itemKey, outcomes, ...(events.length === 0 ? {} : { events }) };
-      input.read.set(itemKey, facts);
-    }
-    blockers.push(facts);
+    blockers.push(yield* policyItemFacts(reads, input.factoryId, itemKey, input.read));
   }
   return blockers.length === 0 ? {} : { blockers };
+});
+
+/**
+ * A parent's children with this factory's outcomes for each, when `membership` is its whole
+ * sub-issue list as the tracker counts it; otherwise why they are not given. A sub-issue in
+ * another repository is never given: this factory holds no outcomes for it.
+ */
+export const policyChildren = Effect.fnUntraced(function* (
+  reads: PolicyOutcomeReads,
+  input: {
+    readonly factoryId: FactoryId;
+    readonly repository: string;
+    readonly issue: TrackerIssue;
+    /** The sub-issues read, or why they could not be. */
+    readonly membership:
+      | ReadonlyArray<{
+          readonly repository: string;
+          readonly number: number;
+          readonly state: "open" | "closed";
+        }>
+      | { readonly unread: string };
+    readonly read: Map<FactoryItemKey, FactoryPolicyItemFacts>;
+  },
+): Effect.fn.Return<
+  Pick<FactoryPolicyItem, "children" | "childrenUnread">,
+  | FactoryOutcomeStore.FactoryOutcomeStoreError
+  | FactoryStore.FactoryStoreError
+  | FactoryOperationStore.FactoryOperationStoreError
+> {
+  const { membership } = input;
+  if (input.issue.subIssueCount === undefined || input.issue.subIssueCount === 0) return {};
+  if ("unread" in membership) {
+    return { childrenUnread: { reason: membership.unread, foreign: [] } };
+  }
+  const listed = membership;
+  const foreign = listed
+    .filter((child) => child.repository !== input.repository)
+    .map((child) => FactoryItemKeyFor({ repository: child.repository, issueNumber: child.number }));
+  if (listed.length !== input.issue.subIssueCount || foreign.length > 0) {
+    return {
+      childrenUnread: {
+        reason:
+          foreign.length > 0
+            ? "sub-issues in another repository have no outcomes here"
+            : `the tracker counts ${input.issue.subIssueCount} sub-issues but listed ${listed.length}`,
+        foreign,
+      },
+    };
+  }
+  const children: Array<FactoryPolicyItemFacts & { readonly state: "open" | "closed" }> = [];
+  for (const child of listed) {
+    const itemKey = FactoryItemKeyFor({ repository: child.repository, issueNumber: child.number });
+    children.push({
+      ...(yield* policyItemFacts(reads, input.factoryId, itemKey, input.read)),
+      state: child.state,
+    });
+  }
+  return { children };
 });
 
 /** The item's own content and evidence, without the claims on it. */
@@ -2534,11 +2633,8 @@ const make = Effect.gen(function* () {
         `legacy work under way on ${legacyUnscoped.join(", ")} has a scope T3 cannot establish`,
       );
     } else if (candidates.length > 0) {
-      const reads = { outcomeStore, store };
-      const blockerOutcomes = new Map<
-        FactoryItemKey,
-        NonNullable<FactoryPolicyItem["blockers"]>[number]
-      >();
+      const reads = { outcomeStore, store, operations: operationStore };
+      const itemFacts = new Map<FactoryItemKey, FactoryPolicyItemFacts>();
       const items: Array<FactoryPolicyItem> = [];
       for (const candidate of candidates) {
         const outcomes = yield* policyOutcomes(reads, candidate.events);
@@ -2546,7 +2642,14 @@ const make = Effect.gen(function* () {
           factoryId,
           repository: candidate.subject.repository,
           issue: candidate.issue,
-          read: blockerOutcomes,
+          read: itemFacts,
+        });
+        const children = yield* policyChildren(reads, {
+          factoryId,
+          repository: candidate.subject.repository,
+          issue: candidate.issue,
+          membership: yield* subIssuesOf(configuration, candidate.subject, candidate.issue),
+          read: itemFacts,
         });
         // Triage decomposes an item only before its first build.
         const triage =
@@ -2574,6 +2677,7 @@ const make = Effect.gen(function* () {
           grants: grants.filter((grant) => grant.itemKey === candidate.itemKey),
           outcomes,
           ...blockers,
+          ...children,
           decisionKey: decisionKeyOf(
             {
               factoryId,
@@ -2692,6 +2796,33 @@ const make = Effect.gen(function* () {
       ),
     );
     return { admissions, unread: unreadSubjects };
+  });
+
+  /** A parent's sub-issues as the tracker lists them now, or why they could not be read. */
+  const subIssuesOf = Effect.fnUntraced(function* (
+    configuration: FactoryStore.FactoryConfiguration,
+    subject: { readonly repository: string; readonly issueNumber: number },
+    issue: TrackerIssue,
+  ) {
+    if (issue.subIssueCount === undefined || issue.subIssueCount === 0) return [];
+    const claim = configuration.claim;
+    if (claim === undefined)
+      return { unread: "the factory has no tracker to read sub-issues from" };
+    const listed = yield* tracker
+      .withSession({ host: claim.host, cwd: configuration.artifactRoot }, (session) =>
+        session.listSubIssues === undefined
+          ? Effect.fail(
+              new FactoryTracker.FactoryTrackerError({
+                operation: "list-sub-issues",
+                cause: "this tracker does not list sub-issues",
+              }),
+            )
+          : session.listSubIssues(subject),
+      )
+      .pipe(Effect.result);
+    return listed._tag === "Success"
+      ? listed.success
+      : { unread: `its sub-issues could not be read: ${listed.failure.message}` };
   });
 
   /**
