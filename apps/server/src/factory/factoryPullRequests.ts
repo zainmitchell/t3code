@@ -198,7 +198,9 @@ export const pullRequestStep = (
 
 export type PullRequestAttempt =
   | FactoryOperationStore.FactoryOperationCompletion
-  | { readonly state: "waiting"; readonly reason: string; readonly wait: WaitFor };
+  | { readonly state: "waiting"; readonly reason: string; readonly wait: WaitFor }
+  /** A refusal proves only its own create's fate: it ends the operation only while that create is its latest. */
+  | { readonly state: "failed"; readonly reason: string; readonly createAttempt: number };
 
 /**
  * This operation's durable record of the pull request creates it sends: recorded before each one leaves,
@@ -408,6 +410,7 @@ export const attemptPullRequestMerge = Effect.fnUntraced(function* (
         ? {
             state: "failed",
             reason: `${PULL_REQUEST_NOT_CREATED} (${created.cause})`,
+            createAttempt: recorded.value.attempt,
           }
         : {
             state: "waiting",

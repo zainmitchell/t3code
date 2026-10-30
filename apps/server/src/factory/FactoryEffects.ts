@@ -501,7 +501,9 @@ const make = Effect.gen(function* () {
         ]);
         return;
       }
-      if (yield* operations.complete({ operationId, completion })) {
+      const fenced =
+        "createAttempt" in completion ? { createAttempt: completion.createAttempt } : {};
+      if (yield* operations.complete({ operationId, completion, ...fenced })) {
         yield* Queue.offer(wakes, { factoryId: intended.factoryId, trigger: "operation" });
       }
     },
