@@ -14,6 +14,14 @@ import * as Result from "effect/Result";
 import * as EffectOutbox from "../orchestration-v2/EffectOutbox.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as FactoryIntegrator from "./FactoryIntegrator.ts";
+import {
+  dependency,
+  redact,
+  renderWait,
+  uncertain,
+  waitBasis,
+  type WaitFor,
+} from "./factoryOperationWait.ts";
 import * as FactoryOperationStore from "./FactoryOperationStore.ts";
 import { attemptPullRequestMerge, type PullRequestAttempt } from "./factoryPullRequests.ts";
 import * as FactoryStore from "./FactoryStore.ts";
@@ -58,8 +66,38 @@ export const FactoryEffects = Context.Reference<{
 /** `held`: a ticket create already sent waits for its ticket to be asked for again; no retry of its own. */
 type Completion =
   | PullRequestAttempt
-  | { readonly state: "held"; readonly reason: string }
+  | { readonly state: "held"; readonly reason: string; readonly wait: WaitFor }
   | undefined;
+
+/** Why an attempt that neither ended the operation nor named its wait left it intended. */
+const unknownOutcome = (
+  intent: FactoryOperationStore.FactoryOperationIntent,
+  failure: unknown,
+): { readonly reason: string; readonly wait: WaitFor } => {
+  const cause =
+    typeof failure === "object" && failure !== null && "cause" in failure
+      ? `: ${String(failure.cause).slice(0, 600)}`
+      : "";
+  return {
+    reason:
+      failure === undefined
+        ? "the write was not confirmed"
+        : redact(`${String(failure)}${cause}`).slice(0, 2_000),
+    wait: uncertain({
+      actor: "T3",
+      action: `read the ${intent.kind} back by its stable identity before writing again`,
+      resume: "the next attempt reaches the tracker and Git and reads what landed",
+      facts: [
+        intent.kind,
+        failure === undefined
+          ? "unconfirmed"
+          : typeof failure === "object" && failure !== null && "_tag" in failure
+            ? String(failure._tag)
+            : "failure",
+      ],
+    }),
+  };
+};
 
 const make = Effect.gen(function* () {
   const operations = yield* FactoryOperationStore.FactoryOperationStore;
@@ -137,6 +175,13 @@ const make = Effect.gen(function* () {
         return {
           state: "held",
           reason: `unconfirmed_create: a create sent at ${pending.at} may have opened an issue carrying ${intent.marker}; none is found yet`,
+          wait: uncertain({
+            actor: "the factory owner, only while GitHub lists no issue carrying the marker",
+            action: `search ${intent.repository} for ${intent.marker}, then answer the ticket question; T3 sends no create meanwhile`,
+            resume:
+              "GitHub lists the issue carrying the marker, or the owner approves one more create",
+            facts: ["unconfirmed_create", String(pending.attempt)],
+          }),
         };
       } else {
         // Recorded before it is sent, so an attempt that ends unseen is never followed by another.
@@ -324,6 +369,17 @@ const make = Effect.gen(function* () {
             state: "failed",
             reason: `configuration: ${intent.branch} is checked out in a worktree`,
           };
+        case "refused":
+          return {
+            state: "waiting",
+            reason: `the write of ${intent.branch} was refused and it still holds ${intent.expected}: ${redact(applied.detail)}`,
+            wait: dependency({
+              actor: `whoever controls writes to ${intent.branch}${intent.remote === null ? "" : ` on ${intent.remote}`}`,
+              action: `let this account move ${intent.branch} from ${intent.expected}, or lift the rule that refused it`,
+              resume: `the write is accepted; each attempt reads ${intent.branch} first and a moved target ends it`,
+              facts: ["integrate_refused", intent.branch, intent.expected, intent.reviewedHead],
+            }),
+          };
       }
     }
     const configuration = yield* store.getConfiguration(operation.factoryId);
@@ -388,19 +444,34 @@ const make = Effect.gen(function* () {
       const intended = operation.value;
       const attempted = yield* Effect.result(attempt(intended));
       const completion = Result.isSuccess(attempted) ? attempted.success : undefined;
-      if (completion?.state === "held") {
-        yield* operations.noteUncertain({ operationId, error: completion.reason });
-        return;
+      if (
+        completion === undefined ||
+        completion.state === "waiting" ||
+        completion.state === "held"
+      ) {
+        const { reason, wait } =
+          completion === undefined
+            ? unknownOutcome(
+                intended.intent,
+                Result.isFailure(attempted) ? attempted.failure : undefined,
+              )
+            : completion;
+        yield* operations.noteWait({
+          operationId,
+          wait: {
+            kind: wait.kind,
+            basis: waitBasis(wait),
+            actor: wait.actor,
+            action: wait.action,
+            resume: wait.resume,
+          },
+          text: renderWait(reason, wait),
+        });
       }
+      if (completion?.state === "held") return;
       // Not known whether the write applied, or not yet allowed: the next attempt reads it back
       // first, a minute later.
       if (completion === undefined || completion.state === "waiting") {
-        yield* operations.noteUncertain({
-          operationId,
-          error: Result.isFailure(attempted)
-            ? String(attempted.failure).slice(0, 2_000)
-            : (completion?.reason ?? "the write was not confirmed"),
-        });
         const commandId = CommandId.make(`factory-operation:${operationId}`);
         const effects = yield* outbox.listByCommandId(commandId);
         yield* outbox.enqueue([

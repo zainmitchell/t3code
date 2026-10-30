@@ -36,7 +36,16 @@ export type IntegrationApplyResult =
   | { readonly type: "conflict"; readonly detail: string }
   | { readonly type: "not_fast_forward" }
   /** A local target branch checked out in a worktree is never moved under it. */
-  | { readonly type: "target_checked_out" };
+  | { readonly type: "target_checked_out" }
+  /** The write was refused and the target read back unchanged: nothing landed. */
+  | { readonly type: "refused"; readonly detail: string };
+
+/** Publishing's answer when the remote refused the push and its branch reads back unchanged. */
+interface PublishRefused {
+  readonly type: "refused";
+  readonly tip: string | null;
+  readonly detail: string;
+}
 
 /**
  * The Git side of integration. Every write is a compare-and-set on the target branch from the
@@ -54,7 +63,9 @@ export interface FactoryIntegratorShape {
     readonly branch: string;
     readonly commit: string;
   }) => Effect.Effect<
-    { readonly type: "published" } | { readonly type: "diverged"; readonly tip: string },
+    | { readonly type: "published" }
+    | { readonly type: "diverged"; readonly tip: string }
+    | PublishRefused,
     FactoryIntegratorError
   >;
   readonly tip: (input: {
@@ -311,9 +322,7 @@ const make = Effect.gen(function* () {
     if (advanced.exitCode !== 0) {
       const after = yield* tip({ cwd, target });
       // Still where it was decided: nothing landed, and the write can be tried again.
-      if (after === expected) {
-        return yield* new FactoryIntegratorError({ operation: "advance", cause: advanced.stderr });
-      }
+      if (after === expected) return { type: "refused", detail: advanced.stderr.trim() } as const;
       // A refused compare-and-set leaves the target as someone else made it.
       if (after !== commit) return { type: "moved", tip: after } as const;
     }
@@ -348,7 +357,7 @@ const make = Effect.gen(function* () {
     const after = yield* tip({ cwd, target });
     if (after === commit) return { type: "published" } as const;
     if (after === current) {
-      return yield* new FactoryIntegratorError({ operation: "publish", cause: pushed.stderr });
+      return { type: "refused", tip: current, detail: pushed.stderr.trim() } as const;
     }
     return after === null
       ? yield* new FactoryIntegratorError({ operation: "publish", cause: pushed.stderr })

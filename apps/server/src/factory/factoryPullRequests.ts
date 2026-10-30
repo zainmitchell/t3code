@@ -2,6 +2,7 @@ import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 
 import type * as FactoryIntegrator from "./FactoryIntegrator.ts";
+import { dependency, redact, uncertain, type WaitFor } from "./factoryOperationWait.ts";
 import type * as FactoryOperationStore from "./FactoryOperationStore.ts";
 import type * as FactoryTracker from "./FactoryTracker.ts";
 
@@ -11,7 +12,7 @@ export type PullRequestStep =
   | { readonly type: "landed"; readonly commit: string }
   | { readonly type: "merge" }
   /** Nothing is decided yet; the next attempt reads the pull request again. */
-  | { readonly type: "wait"; readonly reason: string }
+  | { readonly type: "wait"; readonly reason: string; readonly wait: WaitFor }
   | { readonly type: "fail"; readonly reason: string };
 
 export const REVIEW_CHANGES_REQUESTED = "review_changes_requested:";
@@ -96,6 +97,7 @@ export const pullRequestStep = (
   findings?: FactoryTracker.TrackerReviewFindings,
 ): PullRequestStep => {
   const name = `pull request #${pull.number}`;
+  const facts = [String(pull.number), pull.headSha, reviewedHead, pull.mergeableState ?? "unknown"];
   if (pull.merged) {
     // Equal content is not equal acceptance: only a review of exactly the merged head lands it.
     if (pull.headSha !== reviewedHead) {
@@ -115,9 +117,29 @@ export const pullRequestStep = (
     return { type: "fail", reason: `refused: ${name} was closed without merging` };
   }
   if (pull.headSha !== reviewedHead) {
-    return { type: "wait", reason: `${name} is at ${pull.headSha}, not yet the reviewed head` };
+    return {
+      type: "wait",
+      reason: `${name} is at ${pull.headSha}, not yet the reviewed head`,
+      wait: dependency({
+        actor: "GitHub",
+        action: `show ${name} at ${reviewedHead}, which its branch was published at`,
+        resume: `${name} reads at ${reviewedHead}; checks and approvals of another head never count`,
+        facts,
+      }),
+    };
   }
-  if (pull.draft) return { type: "wait", reason: `${name} is a draft` };
+  if (pull.draft) {
+    return {
+      type: "wait",
+      reason: `${name} is a draft`,
+      wait: dependency({
+        actor: "the pull request's author",
+        action: `mark ${name} ready for review`,
+        resume: `${name} is no longer a draft`,
+        facts,
+      }),
+    };
+  }
   switch (pull.mergeableState) {
     case "clean":
     case "unstable":
@@ -135,24 +157,48 @@ export const pullRequestStep = (
         return { type: "fail", reason: `checks_failed: ${checks.failed.join(", ")}` };
       }
       if (checks !== undefined && checks.pending.length > 0) {
-        return { type: "wait", reason: `${name} awaits checks: ${checks.pending.join(", ")}` };
+        return {
+          type: "wait",
+          reason: `${name} awaits checks: ${checks.pending.join(", ")}`,
+          wait: dependency({
+            actor: "the required checks",
+            action: `finish ${checks.pending.join(", ")} on ${reviewedHead}`,
+            resume: `the checks on ${reviewedHead} finish; a failure goes back to the work`,
+            facts: [...facts, ...checks.pending.toSorted()],
+          }),
+        };
       }
       if (findings !== undefined) {
         const requested = reviewChangesRequested(pull, findings, reviewedHead);
         if (requested !== undefined) return { type: "fail", reason: requested };
       }
-      return { type: "wait", reason: `${name} awaits its required approvals or conversations` };
+      return {
+        type: "wait",
+        reason: `${name} awaits its required approvals or conversations`,
+        wait: dependency({
+          actor: "the repository's required reviewers",
+          action: `approve ${name} at ${reviewedHead} or resolve its required conversations`,
+          resume: `GitHub's protection lets ${name} merge at ${reviewedHead}; changes requested on it go back to the work`,
+          facts,
+        }),
+      };
     default:
       return {
         type: "wait",
         reason: `GitHub has not decided whether ${name} can merge (${pull.mergeableState ?? "unknown"})`,
+        wait: dependency({
+          actor: "GitHub",
+          action: `decide whether ${name} can merge at ${reviewedHead}`,
+          resume: `GitHub reports a merge state for ${name}`,
+          facts,
+        }),
       };
   }
 };
 
 export type PullRequestAttempt =
   | FactoryOperationStore.FactoryOperationCompletion
-  | { readonly state: "waiting"; readonly reason: string };
+  | { readonly state: "waiting"; readonly reason: string; readonly wait: WaitFor };
 
 type Intent = Extract<
   FactoryOperationStore.FactoryOperationIntent,
@@ -240,6 +286,12 @@ export const attemptPullRequestMerge = Effect.fnUntraced(function* (
     return Option.getOrElse(yield* inBase, () => ({
       state: "waiting" as const,
       reason: `${intent.base} on ${intent.remote} does not contain the reviewed head ${intent.reviewedHead}; nothing was published`,
+      wait: dependency({
+        actor: `the maintainers of ${intent.base} on ${intent.remote}`,
+        action: `land ${intent.reviewedHead} on ${intent.base}; this attempt only acknowledges it`,
+        resume: `${intent.base} on ${intent.remote} contains ${intent.reviewedHead}`,
+        facts: ["acknowledge", intent.base, intent.reviewedHead],
+      }),
     }));
   }
   if (Option.isNone(found)) {
@@ -255,6 +307,12 @@ export const attemptPullRequestMerge = Effect.fnUntraced(function* (
       return {
         state: "waiting",
         reason: `integration target ${intent.base} does not exist on ${intent.remote}; nothing was published`,
+        wait: dependency({
+          actor: `the owner of ${repository}`,
+          action: `create ${intent.base} on ${intent.remote}, or configure an integration branch that exists`,
+          resume: `${intent.base} exists on ${intent.remote}`,
+          facts: ["base_missing", intent.base],
+        }),
       };
     }
   }
@@ -269,6 +327,18 @@ export const attemptPullRequestMerge = Effect.fnUntraced(function* (
       return {
         state: "failed",
         reason: `not_fast_forward: ${intent.head} holds ${published.tip}, which the reviewed head does not descend from`,
+      };
+    }
+    if (published.type === "refused") {
+      return {
+        state: "waiting",
+        reason: `${intent.remote} refused the push of ${intent.reviewedHead} to ${intent.head}, which still holds ${published.tip ?? "nothing"}: ${redact(published.detail)}`,
+        wait: dependency({
+          actor: `whoever controls push access to ${intent.head} on ${intent.remote}`,
+          action: `let this account create or fast-forward ${intent.head}, or lift the rule that refused it`,
+          resume: `${intent.remote} accepts the push; each attempt reads ${intent.head} first and never forces it`,
+          facts: ["publish_refused", intent.head, published.tip ?? "", intent.reviewedHead],
+        }),
       };
     }
   }
@@ -288,7 +358,16 @@ export const attemptPullRequestMerge = Effect.fnUntraced(function* (
             state: "failed",
             reason: `${PULL_REQUEST_NOT_CREATED} (${created.cause})`,
           }
-        : { state: "waiting", reason: "the pull request was not confirmed" };
+        : {
+            state: "waiting",
+            reason: "the pull request was not confirmed",
+            wait: uncertain({
+              actor: "T3",
+              action: `find the pull request from ${intent.head} into ${intent.base} before opening another`,
+              resume: `GitHub lists a pull request from ${intent.head}, or confirms none was opened`,
+              facts: ["create_pull_request", intent.head, intent.base],
+            }),
+          };
     }
   }
   // The protection's record of independent acceptance goes on the exact reviewed head first.
@@ -303,6 +382,12 @@ export const attemptPullRequestMerge = Effect.fnUntraced(function* (
       return {
         state: "waiting",
         reason: `the ${intent.acceptanceStatus.context} status on ${intent.reviewedHead} was not confirmed`,
+        wait: uncertain({
+          actor: "T3",
+          action: `read the ${intent.acceptanceStatus.context} status on ${intent.reviewedHead} back before posting it again`,
+          resume: `GitHub shows the ${intent.acceptanceStatus.context} status on ${intent.reviewedHead}`,
+          facts: ["acceptance_status", intent.acceptanceStatus.context, intent.reviewedHead],
+        }),
       };
     }
   }
@@ -330,7 +415,7 @@ export const attemptPullRequestMerge = Effect.fnUntraced(function* (
     case "landed":
       return yield* landed(pull.number, step.commit);
     case "wait":
-      return { state: "waiting", reason: step.reason };
+      return { state: "waiting", reason: step.reason, wait: step.wait };
     case "fail":
       return { state: "failed", reason: step.reason };
     case "merge":
@@ -348,11 +433,26 @@ export const attemptPullRequestMerge = Effect.fnUntraced(function* (
   const after = yield* session.readPullRequest({ repository, number: pull.number });
   const settled = pullRequestStep(after, intent.reviewedHead, undefined);
   if (settled.type === "landed") return yield* landed(after.number, settled.commit);
-  return {
-    state: "waiting",
-    reason:
-      merged.type === "refused"
-        ? `GitHub refused the merge of pull request #${pull.number} (${merged.status})`
-        : `the merge of pull request #${pull.number} was not confirmed`,
-  };
+  const facts = [String(after.number), after.headSha, after.mergeableState ?? "unknown"];
+  return merged.type === "refused"
+    ? {
+        state: "waiting",
+        reason: `GitHub refused the merge of pull request #${pull.number} (${merged.status})`,
+        wait: dependency({
+          actor: `the administrators of ${repository} and its protection on ${intent.base}`,
+          action: `let this account merge pull request #${pull.number} at ${intent.reviewedHead}, which GitHub answered ${merged.status}`,
+          resume: `GitHub accepts the merge; each attempt reads pull request #${pull.number} first`,
+          facts: ["merge_refused", String(merged.status), ...facts],
+        }),
+      }
+    : {
+        state: "waiting",
+        reason: `the merge of pull request #${pull.number} was not confirmed`,
+        wait: uncertain({
+          actor: "T3",
+          action: `read pull request #${pull.number} back before any second merge`,
+          resume: `pull request #${pull.number} reads as merged, or as open at ${intent.reviewedHead}`,
+          facts: ["merge_unconfirmed", ...facts],
+        }),
+      };
 });
