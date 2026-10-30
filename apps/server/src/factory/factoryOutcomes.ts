@@ -60,6 +60,39 @@ export const subjectOf = (itemKey: string) => {
   return match === null ? undefined : { repository: match[1]!, issueNumber: Number(match[2]) };
 };
 
+/**
+ * The ref T3 reads the line it integrates onto from: the project's own branch, or its copy of the
+ * remote's branch, as last fetched.
+ */
+const integrationLine = (configuration: FactoryStore.FactoryConfiguration) => {
+  const integration = configuration.integration;
+  if (integration === undefined) return undefined;
+  return integration.remote === null
+    ? `refs/heads/${integration.branch}`
+    : `refs/remotes/${integration.remote}/${integration.branch}`;
+};
+
+/**
+ * Why prepared work may not start from a candidate base, as read now, or undefined: the base must
+ * exist and lie on the line T3 integrates onto. A line T3 cannot read validates nothing.
+ */
+export const candidateBaseProblem = Effect.fnUntraced(function* (
+  git: FactoryGitReadback.FactoryGitReadbackShape,
+  configuration: FactoryStore.FactoryConfiguration,
+  base: string,
+) {
+  const projectId = configuration.projectId;
+  if (!(yield* git.commitExists({ projectId, commit: base }))) return `base ${base} does not exist`;
+  const line = integrationLine(configuration);
+  if (line === undefined) return `no integration branch is configured to read base ${base} against`;
+  if (!(yield* git.commitExists({ projectId, commit: line }))) {
+    return `the integration line ${line} cannot be read`;
+  }
+  return (yield* git.isAncestor({ projectId, ancestor: base, descendant: line }))
+    ? undefined
+    : `base ${base} is not on the integration line ${line}`;
+});
+
 const TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set([
   "completed",
   "interrupted",
@@ -306,11 +339,19 @@ export const makeFactoryOutcomes = (deps: FactoryOutcomeDependencies) => {
       case "unit_proposed": {
         // A proposal counts only for the exact item text the triage read.
         const proposed = report.proposal?.basis;
-        return proposed === reservation.value.itemVersion
+        if (proposed !== reservation.value.itemVersion) {
+          return {
+            rejected: `the proposal names item version ${proposed ?? "none"}, not ${reservation.value.itemVersion}`,
+          } as const;
+        }
+        // The candidate base is a claim like any other: the work starts from it only if T3 reads it.
+        const base = report.subject?.baseCommit;
+        if (base === undefined)
+          return { rejected: "the proposal names no candidate base" } as const;
+        const problem = yield* candidateBaseProblem(git, configuration, base);
+        return problem === undefined
           ? ({ accepted: true } as const)
-          : ({
-              rejected: `the proposal names item version ${proposed ?? "none"}, not ${reservation.value.itemVersion}`,
-            } as const);
+          : ({ rejected: problem } as const);
       }
       case "integrated":
       case "closed":

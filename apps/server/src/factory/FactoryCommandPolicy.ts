@@ -38,6 +38,11 @@ const PolicyDecision = Schema.Union([
     grant: Schema.optional(Schema.Struct({ reason: Bounded(2_000), evidence: Bounded(200_000) })),
     /** One of the configuration's named executions, such as a builder effort. */
     execution: Schema.optional(Bounded(200)),
+    /**
+     * The triage outcome whose proposal this first build adopts. T3 starts it only while that
+     * proposal is the item's current preparation and the build starts exactly at its base.
+     */
+    prepared: Schema.optional(Bounded(64)),
   }),
   /**
    * Decomposition for an item at its first stage that has no unit spec yet: a worker proposes
@@ -81,7 +86,7 @@ const PolicyDecision = Schema.Union([
     /**
      * Why nothing starts, as a class the owner can count: `needs_routing` (no unit spec, no
      * triage yet), `triage_pending`, `not_actionable`, `proposal_pending_owner`, `waiting`,
-     * `held`, `excluded` or `other`.
+     * `held`, `excluded` or `other`. T3 itself records `prepared_stale`.
      */
     class: Schema.optional(Bounded(64)),
   }),
@@ -109,9 +114,20 @@ const REPORT_REQUIREMENTS: Record<string, string> = {
     "review_failed with the exact subject.headCommit you reviewed and the findings as failure",
   correction_spec: "correction_spec with the specification as summary",
   unit_proposed:
-    "unit_proposed with proposal.basis = the item version named above, proposal.unit = the exact unit spec text for the issue, proposal.ownedFiles, proposal.resources and proposal.effort, and the reasoning as summary",
+    "unit_proposed with proposal.basis = the item version named above, proposal.unit = the exact unit spec text for the issue with its checks and any dependency, proposal.ownedFiles, proposal.resources and proposal.effort, subject.repository and subject.baseCommit = the commit the unit starts from, and the evidence you relied on as summary",
   not_actionable:
-    "not_actionable with failure = why no bounded unit can be proposed (a missing input, a reserved decision, or a split the owner must choose)",
+    "not_actionable only for what a person must settle, with failure led by its kind: `decision:` (the one question, its consequence and the exact action that answers it), `permission:`, `private_data:`, `ownership:` or `hold:`, then what is missing",
+};
+
+/** The last preparation's failure, so a retry on it can correct what it names. */
+const previousPreparation = (item: FactoryLifecycle.FactoryPolicyItem) => {
+  const last = item.outcomes.findLast((outcome) => outcome.stage === "triage");
+  return last?.state === "verified" && last.report.outcome === "failed"
+    ? [
+        "The last preparation of this item ended without a usable result; correct what it names:",
+        last.report.failure ?? last.report.summary,
+      ]
+    : [];
 };
 
 /**
@@ -126,7 +142,9 @@ const evidenceInstructions = (
   if (taskKind === "triage") {
     return [
       `Item version: ${item.observation.itemVersion}. Report it as proposal.basis; a proposal for any other version is rejected.`,
-      "Propose only from the issue's own text, its parent and its verified outcomes; change no file and no tracker record. The proposal is evidence for the policy, not a start.",
+      "Prepare from what you can verify: the issue, its blockers and parent, its verified outcomes, the project's rules and the repository at its integration base. Change no file and no tracker record. Settle routine gaps yourself from that evidence; a missing permission, product decision or owner hold is never yours to settle.",
+      "Name subject.baseCommit: the build starts exactly there. T3 reads it back now and again when the build is admitted: it must exist and lie on the branch T3 integrates onto, as T3 reads that branch, so a proposal without a base, or with one T3 cannot read there, is rejected. The proposal is evidence for the policy, not a start or a grant.",
+      ...previousPreparation(item),
     ];
   }
   const stage = item.stage;
@@ -215,6 +233,8 @@ const outcomeFacts = (outcome: FactoryLifecycle.FactoryPolicyOutcome) => ({
   state: outcome.state,
   report: outcome.report,
   ...(outcome.itemVersion === undefined ? {} : { itemVersion: outcome.itemVersion }),
+  ...(outcome.policyRevision === undefined ? {} : { policyRevision: outcome.policyRevision }),
+  ...(outcome.decisionKey === undefined ? {} : { decisionKey: outcome.decisionKey }),
 });
 
 /** What the policy command reads on stdin: every decidable item, and the work under way. */
@@ -431,6 +451,7 @@ export const layer = Layer.effect(
             artifactPaths: [],
             ...(decision.workspace === undefined ? {} : { workspaceStrategy: decision.workspace }),
             ...(decision.execution === undefined ? {} : { execution: decision.execution }),
+            ...(decision.prepared === undefined ? {} : { prepared: decision.prepared }),
             ...(decision.grant === undefined
               ? {}
               : {
