@@ -212,16 +212,26 @@ describe("runMigrations", () => {
       assert.deepStrictEqual(yield* runMigrations(), [
         [75, "PeerLinkFence"],
         [76, "WaitingLinkRequestIndex"],
+        [77, "FactoryPreparedCriteria"],
       ]);
       assert.deepStrictEqual(yield* history, migrationManifest);
       assert.deepStrictEqual(yield* factoryRows, rowsBefore);
-      assert.deepStrictEqual((yield* schema).filter(isFactoryObject), factorySchemaBefore);
+      assert.deepStrictEqual(
+        (yield* schema).filter(
+          (row) => isFactoryObject(row) && row.tbl_name !== "factory_prepared_criteria",
+        ),
+        factorySchemaBefore,
+      );
+      assert.deepStrictEqual(yield* sql`SELECT * FROM factory_prepared_criteria`, []);
       assert.deepStrictEqual(
         yield* sql`SELECT environment_id, fenced FROM peer_environment_links`,
         [{ environment_id: "peer", fenced: 0 }],
       );
       // Patched builds check and run ids up to 74, so they still start on the upgraded database.
       assert.deepStrictEqual(yield* runMigrations({ toMigrationInclusive: 74 }), []);
+      assert.deepStrictEqual(yield* runMigrations(), []);
+      assert.deepStrictEqual(yield* history, migrationManifest);
+      assert.deepStrictEqual(yield* factoryRows, rowsBefore);
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
   );
 
@@ -244,8 +254,7 @@ describe("runMigrations", () => {
   );
 });
 
-// Patched ledger ids 68-76 keep upstream file prefixes, so only names are compared. The npm
-// launcher's file-derived head (73) therefore trails BUILD_MIGRATION_HEAD (76).
+// Historical patched ledger ids 68-76 keep upstream file prefixes, so only names are compared.
 it.effect("registers every migration file", () =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;

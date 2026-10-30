@@ -56,6 +56,7 @@ describe("V2 preview upgrade", () => {
         [74, "ThreadMessageSearch"],
         [75, "PeerLinkFence"],
         [76, "WaitingLinkRequestIndex"],
+        [77, "FactoryPreparedCriteria"],
       ]);
       assert.deepStrictEqual(yield* runMigrations(), []);
       assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_v2_legacy_imports`, imports);
@@ -155,6 +156,7 @@ describe("V2 preview upgrade", () => {
         [74, "ThreadMessageSearch"],
         [75, "PeerLinkFence"],
         [76, "WaitingLinkRequestIndex"],
+        [77, "FactoryPreparedCriteria"],
       ]);
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
   );
