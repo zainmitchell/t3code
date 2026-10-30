@@ -347,6 +347,8 @@ export interface FactoryAdmissionRequest {
   readonly requiresGrant?: { readonly reason: string; readonly evidenceDigest: string };
   /** A configured execution the policy chose by name for this decision. */
   readonly execution?: string;
+  /** Named single-capacity resources the work holds while it runs; sorted, distinct. */
+  readonly resources?: ReadonlyArray<string>;
   /**
    * The triage outcome whose proposal this first build adopts. It starts only while that proposal
    * is the item's current preparation and its base reads back where the build starts.
@@ -455,6 +457,10 @@ export interface FactoryPassMetrics {
 export type FactoryReconcileResult =
   | FactoryCollectionResult
   | { readonly type: "idle"; readonly reason: "not_configured" | "no_claim" };
+
+/** The stage-basis suffix naming the single-capacity resources a decision holds. */
+const resourceBasis = (resources: ReadonlyArray<string> | undefined) =>
+  resources === undefined || resources.length === 0 ? "" : `|res:${resources.join(",")}`;
 
 /** The most evidence items one adopted criteria document has projected for the policy. */
 const CRITERIA_EVIDENCE_LIMIT = 200;
@@ -2194,7 +2200,10 @@ const make = Effect.gen(function* () {
     }),
     readArtifact: Effect.fnUntraced(function* (artifactRoot, artifactPath) {
       if (!(yield* insideArtifactRoot(artifactRoot, artifactPath))) return undefined;
-      return Option.getOrUndefined(yield* fs.readFileString(artifactPath).pipe(Effect.option));
+      const bytes = yield* fs.readFile(artifactPath).pipe(Effect.option);
+      return Option.isNone(bytes)
+        ? undefined
+        : { text: new TextDecoder().decode(bytes.value), sha256: sha256(bytes.value) };
     }),
     settleThread: (reservation) =>
       orchestrator.dispatch({
@@ -4809,7 +4818,8 @@ const make = Effect.gen(function* () {
             packet,
             stage: {
               type: stage.type,
-              basis: `${stageBasis(stage)}${bound?.basis ?? ""}${noEdit?.basis ?? ""}`,
+              // The binding's output root stays last: the store reads it at the end.
+              basis: `${stageBasis(stage)}${resourceBasis(decision.resources)}${noEdit?.basis ?? ""}${bound?.basis ?? ""}`,
             },
             ...(candidate.owner === undefined ? {} : { continues: candidate.owner.reservationId }),
             ...(grant === undefined ? {} : { grant }),
@@ -4817,6 +4827,32 @@ const make = Effect.gen(function* () {
         : decision,
       collected,
     );
+    // A resource another reservation holds is a wait that names it and its holder.
+    if (admission.type === "refused" && admission.reason === "resource_held") {
+      const wanted = new Set(decision.resources ?? []);
+      const holder = (yield* store.listReservations(factoryId)).find(
+        (held) =>
+          held.state === "held" &&
+          held.origin === "admitted" &&
+          (held.resources ?? []).some((resource) => wanted.has(resource)),
+      );
+      const resource =
+        holder?.origin === "admitted"
+          ? (holder.resources ?? []).find((each) => wanted.has(each))
+          : undefined;
+      return {
+        disposition: "nothing_proposed",
+        detail: waitText({
+          issue: subject.issueNumber,
+          what: `resource ${resource ?? [...wanted].join(", ")} is held by ${holder?.itemKey ?? "another reservation"}`,
+          actor: "T3",
+          action: "admit the work once that reservation releases the resource",
+          consequence: "the work does not start while the resource is held",
+          resume: "the holder's reservation is released",
+        }),
+        reasonClass: "resource_held",
+      };
+    }
     // An unchanged basis is never decided twice; when its last attempt failed, say how, so the
     // item does not wait silently on a repeat of the same failure.
     const last = candidate.events.at(-1);

@@ -771,7 +771,7 @@ it.effect("verifies a parent's criteria only as exact quotes of the text its tri
   }),
 );
 
-it.effect("verifies a no-edit unit only by its exact receipt among the artifacts T3 verified", () =>
+it.effect("verifies a no-edit unit only by its exact receipt and the logs T3 read itself", () =>
   Effect.gen(function* () {
     const requirement: NoEditRequirement = {
       schema: "factory-noedit/1",
@@ -780,13 +780,11 @@ it.effect("verifies a no-edit unit only by its exact receipt among the artifacts
       ownedFiles: [],
       checks: ["vp test run src/a.test.ts", "vp run typecheck"],
       instructionRevision: "e04d4b92",
-      clauseBinding: "parent 5 clause C05",
+      clauseBinding: "#5/C05",
     };
     const reservation = { ...admitted, stageBasis: `implement:none${noEditBasis(requirement)}` };
-    const logOf = (check: string) => ({
-      path: `/artifacts/${check.length}.log`,
-      sha256: "a".repeat(64),
-    });
+    const logSha = "a".repeat(64);
+    const logOf = (check: string) => ({ path: `/artifacts/${check.length}.log`, sha256: logSha });
     const receiptPath = "/artifacts/receipt.json";
     const receipt = (change: Record<string, unknown> = {}) =>
       JSON.stringify({
@@ -803,6 +801,8 @@ it.effect("verifies a no-edit unit only by its exact receipt among the artifacts
       readonly verified?: boolean;
       readonly baseCommit?: string;
       readonly logs?: ReadonlyArray<{ readonly path: string; readonly sha256: string }>;
+      /** The sha256 T3 computes for a log's bytes, when it differs from the claim. */
+      readonly logBytesSha?: string;
       readonly expected: string;
     }> = [
       { name: "the exact receipt", receipt: receipt(), expected: "verified" },
@@ -810,13 +810,20 @@ it.effect("verifies a no-edit unit only by its exact receipt among the artifacts
         name: "artifacts T3 could not verify",
         receipt: receipt(),
         verified: false,
-        expected: "a no-edit unit's artifacts are missing or unverified",
+        expected: "noedit_artifacts_unverified: ",
       },
-      { name: "no receipt", receipt: undefined, expected: "the report lists 0 no-edit receipts" },
+      { name: "no receipt", receipt: undefined, expected: "noedit_receipt_missing: " },
       {
         name: "a receipt for another requirement",
         receipt: receipt({ requirement: { ...requirement, checks: ["vp run typecheck"] } }),
-        expected: "its receipt names another requirement",
+        expected: "noedit_requirement_mismatch: ",
+      },
+      {
+        name: "results for another check list",
+        receipt: receipt({
+          results: [{ check: "vp run lint", exitCode: 0, log: logOf("vp run lint") }],
+        }),
+        expected: "noedit_checks_mismatch: ",
       },
       {
         name: "a failed check",
@@ -827,24 +834,30 @@ it.effect("verifies a no-edit unit only by its exact receipt among the artifacts
             log: logOf(check),
           })),
         }),
-        expected: "check vp run typecheck failed with exit code 1",
+        expected: "noedit_check_failed: check vp run typecheck failed with exit code 1",
       },
       {
-        name: "a log T3 did not verify",
+        name: "a log not among the artifacts",
         receipt: receipt(),
         logs: [logOf(requirement.checks[0]!)],
-        expected: "check vp run typecheck's log is not among the report's verified artifacts",
+        expected: "noedit_log_unverified: ",
+      },
+      {
+        name: "a log whose bytes T3 hashes otherwise",
+        receipt: receipt(),
+        logBytesSha: "f".repeat(64),
+        expected: "noedit_log_unverified: ",
       },
       {
         name: "a changed head",
         receipt: receipt(),
         baseCommit: realBase,
-        expected: `a no-edit unit reports base and head ${head}, unchanged`,
+        expected: `noedit_head_mismatch: a no-edit unit reports base and head ${head}, unchanged`,
       },
       {
         name: "another item version",
         receipt: receipt({ itemVersion: "version:0" }),
-        expected: "its receipt is for another item or item version",
+        expected: "noedit_item_mismatch: ",
       },
     ];
     for (const row of cases) {
@@ -853,7 +866,13 @@ it.effect("verifies a no-edit unit only by its exact receipt among the artifacts
           reservation,
           verifyEvidence: () => Effect.succeed(row.verified === false ? undefined : "digest"),
           readArtifact: (_root, path) =>
-            Effect.succeed(path === receiptPath ? row.receipt : undefined),
+            Effect.succeed(
+              path === receiptPath
+                ? row.receipt === undefined
+                  ? undefined
+                  : { text: row.receipt, sha256: "b".repeat(64) }
+                : { text: "log", sha256: row.logBytesSha ?? logSha },
+            ),
         });
         const { outcomeId } = yield* fixture.ops.report({
           threadId,
@@ -878,7 +897,56 @@ it.effect("verifies a no-edit unit only by its exact receipt among the artifacts
           row.expected,
           row.name,
         );
+        // An accepted unit carries what T3 itself read: each check's result and log sha256.
+        if (outcome.state === "verified") {
+          assert.deepStrictEqual(outcome.receipt.noEdit, {
+            requirementDigest: noEditBasis(requirement).slice("|ne:".length),
+            candidate: head,
+            results: requirement.checks.map((check) => ({
+              check,
+              exitCode: 0,
+              logPath: logOf(check).path,
+              logSha256: logSha,
+            })),
+          });
+        }
       }).pipe(Effect.provide(layerTest));
     }
+  }),
+);
+
+it.effect("reads a stage's own basis beneath the resources it holds", () =>
+  Effect.gen(function* () {
+    // A correction holding a resource still answers its failure, by that failure's digest.
+    yield* Effect.gen(function* () {
+      const fixture = yield* makeFixture(btc131(), {
+        reservation: { ...admitted, taskKind: "correct", stageBasis: "correct:digest-1|res:ocr" },
+      });
+      const { outcomeId } = yield* fixture.ops.report({
+        threadId,
+        report: { outcome: "correction_spec", summary: "Retry with the lock released." },
+      });
+      const outcome = Option.getOrThrow(yield* fixture.outcomes.get(outcomeId));
+      assert.strictEqual(outcome.corrects, "digest-1");
+    }).pipe(Effect.provide(layerTest));
+    // A review holding a resource still names the exact head it was admitted for.
+    yield* Effect.gen(function* () {
+      const fixture = yield* makeFixture(btc131(), {
+        reservation: { ...admitted, taskKind: "review", stageBasis: `review:${head}|res:ocr` },
+      });
+      const { outcomeId } = yield* fixture.ops.report({
+        threadId,
+        report: {
+          outcome: "review_passed",
+          summary: "Passes.",
+          subject: { repository: "example/connector", headCommit: head },
+        },
+      });
+      yield* fixture.ops.reconcile(factoryId);
+      assert.strictEqual(
+        Option.getOrThrow(yield* fixture.outcomes.get(outcomeId)).state,
+        "verified",
+      );
+    }).pipe(Effect.provide(layerTest));
   }),
 );

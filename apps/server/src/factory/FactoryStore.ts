@@ -404,6 +404,8 @@ const AdmittedReservation = Schema.Struct({
   quarantine: Schema.optional(ReservationQuarantine),
   quarantineHistory: Schema.optional(Schema.Array(EndedQuarantine)),
   historicalTermination: Schema.optional(HistoricalTermination),
+  /** The single-capacity resources it holds while held, from its stage basis. */
+  resources: Schema.optional(Schema.Array(Bounded)),
 });
 
 /** A counted descendant of a native execution, admitted under the configuration current then. */
@@ -575,6 +577,8 @@ export const FactoryReservationRefusal = Schema.Literals([
   "custody_changed",
   /** Another admitted decision already reserved this verification output directory. */
   "output_root_reserved",
+  /** Another held reservation holds a single-capacity resource the decision names. */
+  "resource_held",
 ]);
 export type FactoryReservationRefusal = typeof FactoryReservationRefusal.Type;
 
@@ -1420,6 +1424,20 @@ const make = Effect.gen(function* () {
     if (occupied + admission.units > pool.capacityUnits) {
       return { type: "refused", refusal: "capacity_exhausted" } as const;
     }
+    // Each named resource is held by one reservation at a time, decided in this commit.
+    const resources =
+      /\|res:([a-z0-9_,-]+)/.exec(admission.stageBasis ?? "")?.[1]?.split(",") ?? [];
+    if (resources.length > 0) {
+      const holding = yield* sql<{ readonly resources: string }>`
+        SELECT json_extract(record_json, '$.resources') AS resources FROM factory_reservations
+        WHERE factory_id = ${admission.factoryId} AND state = 'held' AND origin = 'admitted'
+          AND json_extract(record_json, '$.resources') IS NOT NULL
+      `;
+      const held = new Set(holding.flatMap((row) => JSON.parse(row.resources) as Array<string>));
+      if (resources.some((resource) => held.has(resource))) {
+        return { type: "refused", refusal: "resource_held" } as const;
+      }
+    }
     const reservationId = makeReservationId(`reservation:${input.commandId}`);
     if (admission.grant !== undefined) {
       const spent = yield* spendGrant({
@@ -1459,6 +1477,7 @@ const make = Effect.gen(function* () {
       ...(admission.stageBasis === undefined ? {} : { stageBasis: admission.stageBasis }),
       observationId: admission.observationId,
       ...(admission.grant === undefined ? {} : { grantId: admission.grant.grantId }),
+      ...(resources.length === 0 ? {} : { resources }),
     };
     yield* insertReservation(reservation);
     // The same commit records the admission in the item's lifecycle order.

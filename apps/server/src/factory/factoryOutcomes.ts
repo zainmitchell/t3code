@@ -38,6 +38,9 @@ import type * as FactoryStore from "./FactoryStore.ts";
 
 const sha256 = (text: string) => NodeCrypto.createHash("sha256").update(text).digest("hex");
 
+/** A stage basis without the `|`-led suffixes that bind a decision's resources or bindings. */
+const coreBasis = (basis: string) => basis.split("|")[0]!;
+
 /** The outcome id prefix of a stage's recorded missing result. */
 const MISSING_RESULT = "no-result:";
 
@@ -152,8 +155,11 @@ export interface FactoryOutcomeDependencies {
     artifactRoot: string,
     artifacts: ReadonlyArray<{ readonly path: string; readonly sha256: string }>,
   ) => Effect.Effect<string | undefined>;
-  /** An artifact's text when it lies inside the artifact root, else undefined. */
-  readonly readArtifact: (artifactRoot: string, path: string) => Effect.Effect<string | undefined>;
+  /** An artifact's text and the sha256 of its bytes when it lies inside the artifact root. */
+  readonly readArtifact: (
+    artifactRoot: string,
+    path: string,
+  ) => Effect.Effect<{ readonly text: string; readonly sha256: string } | undefined>;
   /** Asks for the pass that verifies a new report; a lost request leaves it for the next pass. */
   readonly onReported: (item: {
     readonly factoryId: FactoryId;
@@ -261,7 +267,7 @@ export const makeFactoryOutcomes = (deps: FactoryOutcomeDependencies) => {
       ).slice(0, 40);
       const corrects =
         stage === "correct" && reservation.stageBasis?.startsWith("correct:") === true
-          ? reservation.stageBasis.slice("correct:".length).split(":retry:")[0]
+          ? coreBasis(reservation.stageBasis).slice("correct:".length).split(":retry:")[0]
           : undefined;
       const inserted = yield* outcomes.insertReported({
         outcomeId,
@@ -336,16 +342,17 @@ export const makeFactoryOutcomes = (deps: FactoryOutcomeDependencies) => {
         const noEdit = /\|ne:[0-9a-f]{32}/.exec(basis)?.[0];
         if (noEdit !== undefined) {
           if (evidenceDigest === undefined) {
-            return { rejected: "a no-edit unit's artifacts are missing or unverified" } as const;
+            return {
+              rejected:
+                "noedit_artifacts_unverified: a no-edit unit's artifacts are missing or unverified",
+            } as const;
           }
           const artifacts = [];
           for (const artifact of report.artifacts ?? []) {
-            artifacts.push({
-              ...artifact,
-              text: yield* deps.readArtifact(configuration.artifactRoot, artifact.path),
-            });
+            const read = yield* deps.readArtifact(configuration.artifactRoot, artifact.path);
+            artifacts.push({ path: artifact.path, sha256: read?.sha256, text: read?.text });
           }
-          const problem = noEditReceiptProblem({
+          const proved = noEditReceiptProblem({
             basis: noEdit,
             itemKey: outcome.itemKey,
             itemVersion: reservation.value.itemVersion,
@@ -353,7 +360,10 @@ export const makeFactoryOutcomes = (deps: FactoryOutcomeDependencies) => {
             headCommit: head,
             artifacts,
           });
-          if (problem !== undefined) return { rejected: problem } as const;
+          if ("refused" in proved) {
+            return { rejected: `${proved.refused}: ${proved.why}` } as const;
+          }
+          return { accepted: true, evidenceDigest, noEdit: proved.receipt } as const;
         }
         return { accepted: true, evidenceDigest } as const;
       }
@@ -361,7 +371,8 @@ export const makeFactoryOutcomes = (deps: FactoryOutcomeDependencies) => {
       case "review_failed": {
         // An independent review counts only for the exact head its decision was admitted for.
         const head = report.subject!.headCommit!;
-        return basis === `review:${head}` || basis.startsWith(`review:${head}:`)
+        return coreBasis(basis) === `review:${head}` ||
+          coreBasis(basis).startsWith(`review:${head}:`)
           ? ({ accepted: true } as const)
           : ({ rejected: `the review names ${head}, not the head it was admitted for` } as const);
       }
@@ -517,6 +528,7 @@ export const makeFactoryOutcomes = (deps: FactoryOutcomeDependencies) => {
         ...(recorded.trackerCommentId === undefined
           ? {}
           : { trackerCommentId: recorded.trackerCommentId }),
+        ...("noEdit" in checked && checked.noEdit !== undefined ? { noEdit: checked.noEdit } : {}),
       },
     });
     const reservationId = outcome.origin.reservationId;

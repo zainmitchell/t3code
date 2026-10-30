@@ -45,6 +45,15 @@ const PolicyDecision = Schema.Union([
     /** One of the configuration's named executions, such as a builder effort. */
     execution: Schema.optional(Bounded(200)),
     /**
+     * Named single-capacity resources the work holds while it runs, such as `ocr`. T3 admits it
+     * only while no other held reservation of the factory holds any of them.
+     */
+    resources: Schema.optional(
+      Schema.Array(Schema.String.check(Schema.isPattern(/^[a-z0-9][a-z0-9_-]{0,63}$/))).check(
+        Schema.isMaxLength(8),
+      ),
+    ),
+    /**
      * The triage outcome whose proposal this first build adopts. T3 starts it only while that
      * proposal is the item's current preparation and the build starts exactly at its base.
      */
@@ -556,6 +565,9 @@ export const layer = Layer.effect(
               ? {}
               : { verificationBinding: decision.verificationBinding }),
             ...(decision.noEdit === undefined ? {} : { noEdit: decision.noEdit }),
+            ...(decision.resources === undefined || decision.resources.length === 0
+              ? {}
+              : { resources: [...new Set(decision.resources)].toSorted() }),
             ...(decision.grant === undefined
               ? {}
               : {

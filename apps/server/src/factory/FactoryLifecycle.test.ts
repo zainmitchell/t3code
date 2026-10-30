@@ -22229,6 +22229,54 @@ it.effect(
     ),
 );
 
+it.effect(
+  "Resources/R1: a named resource is held by one reservation at a time; the next waits naming it and starts once",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* configureLifecycleFactory;
+          yield* configureFactory(lifecycleConfiguration({ pools: pool(2) }));
+          // Only builds hold the OCR engine; their reviews do not.
+          yield* usePolicy((input) =>
+            Effect.map(stageRequest(input), (decision) =>
+              decision !== undefined && "taskKind" in decision && decision.taskKind === "implement"
+                ? { ...decision, resources: ["ocr"] }
+                : decision,
+            ),
+          );
+          yield* seedIssue(7941);
+          yield* seedIssue(7942);
+          const first = admittedBy(yield* advance("tracker_event", 1));
+          if (first.reservation.origin !== "admitted") return assert.fail("expected an admission");
+          const [holder, waiter] =
+            first.reservation.itemKey === itemKeyFor(7941) ? [7941, 7942] : [7942, 7941];
+          assert.deepStrictEqual(first.reservation.resources, ["ocr"]);
+          const waiting = yield* recordOf(waiter);
+          assert.strictEqual(waiting?.reasonClass, "resource_held");
+          assert.include(
+            waiting?.detail ?? "",
+            `resource ocr is held by ${itemKeyFor(holder)}. Actor: T3.`,
+          );
+          // Unchanged passes keep it waiting and start nothing else on the resource.
+          assert.deepStrictEqual(admittedOnly(yield* advance("clock", 2)), []);
+          // The holder's build is verified, which releases its reservation: the waiter starts.
+          yield* recordCommit("c0007941", [lifecycleBase]);
+          yield* workStage(first, {
+            outcome: "implemented",
+            subject: subjectFor("c0007941", lifecycleBase),
+            summary: "Built.",
+          });
+          const next = admittedOnly(yield* advance("outcome", 3)).map(stageOf);
+          assert.deepStrictEqual(
+            next.filter((stage) => stage?.[1] === "implement"),
+            [[itemKeyFor(waiter), "implement"]],
+          );
+        }),
+      ),
+    ),
+);
+
 it.effect("Decompose/D3: a proposal for other text is rejected and builds nothing", () =>
   runIsolated(
     Effect.scoped(

@@ -956,11 +956,35 @@ const NoEditReceipt = Schema.Struct({
 });
 const decodeNoEditReceipt = Schema.decodeUnknownOption(Schema.fromJsonString(NoEditReceipt));
 
+/** Why T3 refused a no-edit report: the code leads the outcome's rejection, before a colon. */
+export type NoEditRefusal =
+  | "noedit_artifacts_unverified"
+  | "noedit_receipt_missing"
+  | "noedit_requirement_mismatch"
+  | "noedit_head_mismatch"
+  | "noedit_item_mismatch"
+  | "noedit_checks_mismatch"
+  | "noedit_check_failed"
+  | "noedit_log_unverified";
+
+/** What T3 itself read back for an accepted no-edit report, recorded on its verified outcome. */
+export interface NoEditNativeReceipt {
+  readonly requirementDigest: string;
+  readonly candidate: string;
+  readonly results: ReadonlyArray<{
+    readonly check: string;
+    readonly exitCode: number;
+    readonly logPath: string;
+    /** The sha256 of the log's bytes as T3 read them, not as the worker claimed. */
+    readonly logSha256: string;
+  }>;
+}
+
 /**
- * Why an implemented report does not prove the no-edit unit its stage was admitted for, or
- * undefined. The receipt is read back from the report's own verified artifacts: it must name the
- * admitted requirement exactly, its candidate must be both reported commits, and every required
- * check must have passed with its log among the verified artifacts.
+ * Whether an implemented report proves the no-edit unit its stage was admitted for. The receipt is
+ * read back from the report's own artifacts, each with the sha256 of the bytes T3 read: it must
+ * name the admitted requirement exactly, its candidate must be both reported commits, and each
+ * required check must have exactly one passing result whose log T3 read with that sha256.
  */
 export const noEditReceiptProblem = (input: {
   readonly basis: string;
@@ -970,42 +994,72 @@ export const noEditReceiptProblem = (input: {
   readonly headCommit: string;
   readonly artifacts: ReadonlyArray<{
     readonly path: string;
-    readonly sha256: string;
+    /** The sha256 of the bytes T3 read, or undefined when it could not read them. */
+    readonly sha256: string | undefined;
     readonly text: string | undefined;
   }>;
-}): string | undefined => {
+}):
+  | { readonly refused: NoEditRefusal; readonly why: string }
+  | { readonly receipt: NoEditNativeReceipt } => {
+  const refuse = (refused: NoEditRefusal, why: string) => ({ refused, why });
   const receipts = input.artifacts.flatMap((artifact) => {
     const receipt = artifact.text === undefined ? undefined : decodeNoEditReceipt(artifact.text);
     return receipt === undefined || receipt._tag === "None" ? [] : [receipt.value];
   });
-  if (receipts.length !== 1) return `the report lists ${receipts.length} no-edit receipts, not one`;
+  if (receipts.length !== 1) {
+    return refuse(
+      "noedit_receipt_missing",
+      `the report lists ${receipts.length} no-edit receipts, not one`,
+    );
+  }
   const receipt = receipts[0]!;
   const { requirement } = receipt;
   if (noEditBasis(requirement) !== input.basis) {
-    return "its receipt names another requirement than the one admitted";
+    return refuse(
+      "noedit_requirement_mismatch",
+      "its receipt names another requirement than the one admitted",
+    );
   }
   if (input.baseCommit !== requirement.candidate || input.headCommit !== requirement.candidate) {
-    return `a no-edit unit reports base and head ${requirement.candidate}, unchanged`;
+    return refuse(
+      "noedit_head_mismatch",
+      `a no-edit unit reports base and head ${requirement.candidate}, unchanged`,
+    );
   }
   if (receipt.itemKey !== input.itemKey || receipt.itemVersion !== input.itemVersion) {
-    return "its receipt is for another item or item version";
+    return refuse("noedit_item_mismatch", "its receipt is for another item or item version");
   }
-  const listed = new Set(
-    input.artifacts.map((artifact) => `${artifact.path}\n${artifact.sha256.toLowerCase()}`),
-  );
+  const reported = receipt.results.map((result) => result.check).toSorted();
+  if (reported.join("\n") !== [...requirement.checks].toSorted().join("\n")) {
+    return refuse(
+      "noedit_checks_mismatch",
+      `its results name checks ${reported.join(", ") || "none"}, not exactly the admitted ${requirement.checks.join(", ")}`,
+    );
+  }
+  const read = new Map(input.artifacts.map((artifact) => [artifact.path, artifact.sha256]));
+  const results: Array<NoEditNativeReceipt["results"][number]> = [];
   for (const check of requirement.checks) {
-    const results = receipt.results.filter((result) => result.check === check);
-    const [result] = results;
-    if (results.length !== 1 || result === undefined) {
-      return `check ${check} has ${results.length} results, not one`;
+    const result = receipt.results.find((each) => each.check === check)!;
+    if (result.exitCode !== 0) {
+      return refuse(
+        "noedit_check_failed",
+        `check ${check} failed with exit code ${result.exitCode}`,
+      );
     }
-    if (result.exitCode !== 0) return `check ${check} failed with exit code ${result.exitCode}`;
-    if (!listed.has(`${result.log.path}\n${result.log.sha256.toLowerCase()}`)) {
-      return `check ${check}'s log is not among the report's verified artifacts`;
+    const logSha256 = read.get(result.log.path);
+    if (logSha256 === undefined || logSha256 !== result.log.sha256.toLowerCase()) {
+      return refuse(
+        "noedit_log_unverified",
+        `check ${check}'s log is not among the artifacts T3 read with that sha256`,
+      );
     }
+    results.push({ check, exitCode: result.exitCode, logPath: result.log.path, logSha256 });
   }
-  if (receipt.results.length !== requirement.checks.length) {
-    return "its receipt reports checks the requirement does not name";
-  }
-  return undefined;
+  return {
+    receipt: {
+      requirementDigest: input.basis.slice("|ne:".length),
+      candidate: requirement.candidate,
+      results,
+    },
+  };
 };

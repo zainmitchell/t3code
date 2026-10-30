@@ -99,6 +99,21 @@ const OutcomeFields = {
 const Receipt = Schema.Struct({
   verifiedAt: Schema.String,
   trackerCommentId: Schema.optional(Schema.Number),
+  /** For a no-edit unit: each admitted check's result and the sha256 of its log as T3 read it. */
+  noEdit: Schema.optional(
+    Schema.Struct({
+      requirementDigest: Schema.String,
+      candidate: Schema.String,
+      results: Schema.Array(
+        Schema.Struct({
+          check: Schema.String,
+          exitCode: Schema.Int,
+          logPath: Schema.String,
+          logSha256: Schema.String,
+        }),
+      ),
+    }),
+  ),
 });
 
 export const FactoryOutcome = Schema.Union([
