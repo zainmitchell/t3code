@@ -100,6 +100,8 @@ import * as FactoryIntegrator from "./FactoryIntegrator.ts";
 import * as FactoryOperationStore from "./FactoryOperationStore.ts";
 import {
   bindingBasis,
+  criteriaProposalProblems,
+  type Criteria,
   decodeCriteria,
   decodeVerificationDocument,
   defectChild,
@@ -109,7 +111,9 @@ import {
   landingOrigin,
   namesPolicy,
   outputRootName,
+  parseJson,
   type PinnedFile,
+  preparedCriteriaProblems,
   reconcileCriteria,
   reviewedHeadsOf,
   waitText,
@@ -442,7 +446,13 @@ export interface FactoryPolicyItem {
    * Every sub-issue of a parent in its own repository, open or closed, with this factory's
    * outcomes for it: only when the whole membership was read. Membership is no evidence by itself.
    */
-  readonly children?: ReadonlyArray<FactoryPolicyItemFacts & { readonly state: "open" | "closed" }>;
+  readonly children?: ReadonlyArray<
+    FactoryPolicyItemFacts & {
+      readonly state: "open" | "closed";
+      /** Its current body from the same membership read; absent when that read carried none. */
+      readonly body?: string;
+    }
+  >;
   /** Why a parent's children are not given: its membership could not be read whole. */
   readonly childrenUnread?: {
     readonly reason: string;
@@ -480,7 +490,20 @@ export interface FactoryProceed {
   readonly type: "proceed";
   /** A parent to close on its adopted criteria, which T3 reconciles itself before it closes. */
   readonly parentClosure?: {
-    readonly criteria: PinnedFile;
+    /** Root-adopted criteria for the current body. */
+    readonly criteria?: PinnedFile | undefined;
+    /**
+     * Criteria the project's policy prepared from the parent's verified criteria proposal, with
+     * the adopted document it carried forward. T3 revalidates every clause against its own reads
+     * and keeps the bytes under the criteria root before it closes on them.
+     */
+    readonly prepared?:
+      | {
+          readonly bytes: string;
+          readonly sha256: string;
+          readonly adopted?: PinnedFile | undefined;
+        }
+      | undefined;
     readonly ownerDecisionId?: string | undefined;
   };
 }
@@ -1023,6 +1046,7 @@ export const policyChildren = Effect.fnUntraced(function* (
           readonly repository: string;
           readonly number: number;
           readonly state: "open" | "closed";
+          readonly body?: string;
         }>
       | { readonly unread: string };
     readonly read: Map<FactoryItemKey, FactoryPolicyItemFacts>;
@@ -1053,12 +1077,13 @@ export const policyChildren = Effect.fnUntraced(function* (
       },
     };
   }
-  const children: Array<FactoryPolicyItemFacts & { readonly state: "open" | "closed" }> = [];
+  const children: Array<NonNullable<FactoryPolicyItem["children"]>[number]> = [];
   for (const child of listed) {
     const itemKey = FactoryItemKeyFor({ repository: child.repository, issueNumber: child.number });
     children.push({
       ...(yield* policyItemFacts(reads, input.factoryId, itemKey, input.read)),
       state: child.state,
+      ...(child.body === undefined ? {} : { body: child.body }),
     });
   }
   return { children };
@@ -3548,6 +3573,63 @@ const make = Effect.gen(function* () {
   });
 
   /**
+   * Prepared criteria kept under the criteria root by their own sha256, so a closure names bytes
+   * anyone can reread. Already there with those bytes, they are not written again.
+   */
+  const keepPrepared = Effect.fnUntraced(function* (
+    root: string,
+    issue: number,
+    digest: string,
+    bytes: string,
+  ) {
+    const target = path.join(root, `parent-${issue}-${digest}.json`);
+    if (!(yield* insideArtifactRoot(root, target))) return "the target is outside the root";
+    const existing = yield* fs.readFile(target).pipe(Effect.option);
+    if (Option.isSome(existing)) {
+      return sha256(existing.value) === digest ? undefined : `${target} holds other bytes`;
+    }
+    const partial = `${target}.${NodeCrypto.randomUUID()}.partial`;
+    const written = yield* fs
+      .writeFileString(partial, bytes)
+      .pipe(Effect.andThen(fs.rename(partial, target)), Effect.result);
+    if (written._tag === "Success") return undefined;
+    yield* fs.remove(partial).pipe(Effect.ignore);
+    return written.failure.message;
+  });
+
+  /**
+   * Every Root-adopted criteria document for `issue` under the criteria root, by real path. T3's
+   * own kept copies (`parent-<n>-<sha256>.json` with those bytes) are not adoptions.
+   */
+  const adoptedCriteriaOf = Effect.fnUntraced(function* (root: string, issue: number) {
+    const listed = yield* fs.readDirectory(root, { recursive: true }).pipe(Effect.result);
+    if (listed._tag === "Failure") return { unread: listed.failure.message };
+    const found: Array<string> = [];
+    for (const entry of listed.success.toSorted()) {
+      if (!entry.toLowerCase().endsWith(".json")) continue;
+      const read = yield* fs.realPath(path.join(root, entry)).pipe(
+        Effect.flatMap((target) => Effect.map(fs.readFile(target), (bytes) => ({ target, bytes }))),
+        Effect.result,
+      );
+      if (read._tag === "Failure") return { unread: `${entry}: ${read.failure.message}` };
+      const { target, bytes } = read.success;
+      if (path.basename(entry) === `parent-${issue}-${sha256(bytes)}.json`) continue;
+      const document = parseJson(new TextDecoder().decode(bytes));
+      if (
+        typeof document === "object" &&
+        document !== null &&
+        "schema" in document &&
+        document.schema === "factory-parent-criteria/1" &&
+        "issue" in document &&
+        document.issue === issue
+      ) {
+        found.push(target);
+      }
+    }
+    return { found };
+  });
+
+  /**
    * A parent's closure on its adopted criteria, under the factory's configured parent authority.
    * T3 rereads the criteria and judges every clause from its own records and the parent's whole
    * membership; the policy's word that they are met counts for nothing. Its plan, or one wait.
@@ -3586,28 +3668,163 @@ const make = Effect.gen(function* () {
         "that authority is installed",
       );
     }
-    const pinned = closure.criteria;
-    const target = path.resolve(pinned.root, pinned.path);
-    const bytes =
-      (yield* insideArtifactRoot(authority.criteriaRoot, pinned.root)) &&
-      (yield* insideArtifactRoot(pinned.root, target))
-        ? yield* fs.readFile(target).pipe(Effect.option)
-        : Option.none<Uint8Array>();
-    const criteria =
-      Option.isSome(bytes) && sha256(bytes.value) === pinned.sha256
-        ? decodeCriteria(new TextDecoder().decode(bytes.value))
-        : Option.none();
-    if (
-      Option.isNone(criteria) ||
-      criteria.value.issue !== issue ||
-      criteria.value.bodySha256 !== sha256(candidate.issue.body)
-    ) {
+    const readPinned = Effect.fnUntraced(function* (pinned: PinnedFile) {
+      const target = path.resolve(pinned.root, pinned.path);
+      const bytes =
+        (yield* insideArtifactRoot(authority.criteriaRoot, pinned.root)) &&
+        (yield* insideArtifactRoot(pinned.root, target))
+          ? yield* fs.readFile(target).pipe(Effect.option)
+          : Option.none<Uint8Array>();
+      return Option.isSome(bytes) && sha256(bytes.value) === pinned.sha256
+        ? Option.some(new TextDecoder().decode(bytes.value))
+        : Option.none<string>();
+    });
+    const reads = { outcomeStore, store, operations: operationStore };
+    const records = new Map<FactoryItemKey, FactoryPolicyItemFacts>();
+    const membership = yield* Effect.cached(
+      Effect.flatMap(subIssuesOf(configuration, candidate.subject, candidate.issue), (listed) =>
+        policyChildren(reads, {
+          factoryId: configuration.factoryId,
+          repository: candidate.subject.repository,
+          issue: candidate.issue,
+          membership: listed,
+          read: records,
+        }),
+      ),
+    );
+    const parentOutcomes = yield* policyOutcomes(reads, candidate.events);
+    const bodySha256 = sha256(candidate.issue.body);
+    let criteria: Option.Option<Criteria>;
+    let criteriaSha256: string;
+    let prepared: string | undefined;
+    if ((closure.criteria === undefined) === (closure.prepared === undefined)) {
       return wait(
-        `criteria ${pinned.path} is unreadable, outside ${authority.criteriaRoot}, malformed or for another issue body`,
-        "Root coordinator",
-        `adopt criteria for the current body sha256 ${sha256(candidate.issue.body)}`,
-        "current criteria are installed",
+        "the parent closure names neither or both of adopted and prepared criteria",
+        "project policy",
+        "name exactly one criteria document for the closure",
+        "a closure naming one",
       );
+    }
+    if (closure.criteria !== undefined) {
+      const pinned = closure.criteria;
+      criteria = Option.flatMap(yield* readPinned(pinned), decodeCriteria);
+      criteriaSha256 = pinned.sha256;
+      if (
+        Option.isNone(criteria) ||
+        criteria.value.issue !== issue ||
+        criteria.value.bodySha256 !== bodySha256
+      ) {
+        return wait(
+          `criteria ${pinned.path} is unreadable, outside ${authority.criteriaRoot}, malformed or for another issue body`,
+          "Root coordinator",
+          `adopt criteria for the current body sha256 ${bodySha256}`,
+          "current criteria are installed",
+        );
+      }
+    } else {
+      const given = closure.prepared!;
+      criteriaSha256 = given.sha256;
+      const document = sha256(given.bytes) === given.sha256 ? parseJson(given.bytes) : undefined;
+      const adopted =
+        given.adopted === undefined
+          ? undefined
+          : Option.flatMap(yield* readPinned(given.adopted), (text) =>
+              Option.fromUndefinedOr(parseJson(text)),
+            );
+      if (document === undefined || (adopted !== undefined && Option.isNone(adopted))) {
+        return wait(
+          document === undefined
+            ? "the prepared criteria are not the JSON their sha256 names"
+            : `the adopted criteria ${given.adopted?.path} are unreadable, outside ${authority.criteriaRoot} or not as pinned`,
+          "project policy",
+          "prepare the parent's criteria again from the current facts",
+          "prepared criteria T3 can read",
+        );
+      }
+      // Root's adoption for this parent is T3's own lookup: a closure that leaves it out, or pins
+      // another document, would drop the holds it carries.
+      const adoptions = yield* adoptedCriteriaOf(authority.criteriaRoot, issue);
+      if ("unread" in adoptions) {
+        return wait(
+          `T3 could not read Root's adopted criteria for #${issue} under ${authority.criteriaRoot}: ${adoptions.unread}`,
+          "T3",
+          "read the criteria root back",
+          "the criteria root reads whole",
+        );
+      }
+      if (adoptions.found.length > 1) {
+        return wait(
+          `#${issue} has ${adoptions.found.length} Root-adopted criteria documents under ${authority.criteriaRoot}`,
+          "Root coordinator",
+          `keep exactly one factory-parent-criteria/1 document for #${issue} there`,
+          "one adopted document",
+        );
+      }
+      const pinnedAdoption =
+        given.adopted === undefined
+          ? undefined
+          : yield* fs
+              .realPath(path.resolve(given.adopted.root, given.adopted.path))
+              .pipe(Effect.option, Effect.map(Option.getOrUndefined));
+      const sameFile = (left: string | undefined, right: string | undefined) =>
+        path.sep === "\\" ? left?.toLowerCase() === right?.toLowerCase() : left === right;
+      if (!sameFile(pinnedAdoption, adoptions.found[0])) {
+        return wait(
+          adoptions.found[0] === undefined
+            ? `the prepared closure pins adopted criteria ${given.adopted?.path} that are not #${issue}'s`
+            : `the prepared closure does not carry #${issue}'s adopted criteria ${path.relative(authority.criteriaRoot, adoptions.found[0])}`,
+          "project policy",
+          `prepare #${issue} with exactly its adopted criteria and pin them`,
+          "a prepared closure carrying them",
+        );
+      }
+      // The latest verified proposal on the current text, under the current policy, is its basis.
+      const proposal = parentOutcomes.findLast(
+        (outcome) =>
+          outcome.stage === "triage" &&
+          outcome.state === "verified" &&
+          outcome.report.outcome === "criteria_proposed" &&
+          outcome.report.criteria?.basis.itemVersion === candidate.observation.itemVersion &&
+          outcome.report.criteria.basis.bodySha256 === bodySha256 &&
+          outcome.policyRevision === configuration.policyRevision,
+      )?.report.criteria;
+      if (proposal === undefined) {
+        return wait(
+          `#${issue} has no verified criteria proposal for its current text (item version ${candidate.observation.itemVersion}) under the current policy`,
+          "T3 (preparation)",
+          "triage the parent on its current text",
+          "a verified criteria_proposed for that text",
+        );
+      }
+      const children = yield* membership;
+      if (children.childrenUnread !== undefined) {
+        return wait(
+          `its children are unread: ${children.childrenUnread.reason}`,
+          "T3",
+          "read the parent's whole sub-issue membership",
+          "the membership reads whole",
+        );
+      }
+      const problems = preparedCriteriaProblems({
+        document,
+        issue,
+        repository: candidate.subject.repository,
+        body: candidate.issue.body,
+        comments: candidate.issue.comments,
+        children: children.children ?? [],
+        adopted: adopted === undefined ? undefined : Option.getOrUndefined(adopted),
+        proposal,
+      });
+      criteria = problems.length === 0 ? decodeCriteria(given.bytes) : Option.none();
+      if (Option.isNone(criteria)) {
+        return wait(
+          `the prepared criteria do not match T3's reads: ${problems[0] ?? "they do not decode"}`,
+          "project policy",
+          "prepare the parent's criteria again from the current facts",
+          "prepared criteria that match the parent's current text, membership and adoption",
+        );
+      }
+      prepared = given.bytes;
     }
     if (authority.close === "owner") {
       const decided = (yield* outcomeStore.reservedDecisions(configuration.factoryId)).find(
@@ -3628,15 +3845,7 @@ const make = Effect.gen(function* () {
         );
       }
     }
-    const reads = { outcomeStore, store, operations: operationStore };
-    const records = new Map<FactoryItemKey, FactoryPolicyItemFacts>();
-    const children = yield* policyChildren(reads, {
-      factoryId: configuration.factoryId,
-      repository: candidate.subject.repository,
-      issue: candidate.issue,
-      membership: yield* subIssuesOf(configuration, candidate.subject, candidate.issue),
-      read: records,
-    });
+    const children = yield* membership;
     if (children.childrenUnread !== undefined) {
       return wait(
         `its children are unread: ${children.childrenUnread.reason}`,
@@ -3654,12 +3863,25 @@ const make = Effect.gen(function* () {
     const clauses = reconcileCriteria({
       criteria: criteria.value,
       repository: candidate.subject.repository,
-      parentOutcomes: yield* policyOutcomes(reads, candidate.events),
+      parentOutcomes,
       records,
     });
     const unmet = clauses.find(
       (clause) => clause.required && clause.status !== "satisfied" && clause.status !== "revised",
     );
+    // A reserved clause waits on the actor its own hold names.
+    const hold =
+      unmet?.status === "reserved"
+        ? criteria.value.clauses.find((clause) => clause.id === unmet.id)?.reserved
+        : undefined;
+    if (unmet !== undefined && hold !== undefined) {
+      return wait(
+        `clause ${unmet.id} is reserved (${clauses.map((clause) => `${clause.id}=${clause.status}`).join(", ")})`,
+        hold.actor,
+        hold.action,
+        hold.resume,
+      );
+    }
     if (unmet !== undefined) {
       return wait(
         `clause ${unmet.id} is ${unmet.status}${unmet.why === undefined ? "" : `: ${unmet.why}`} (${clauses.map((clause) => `${clause.id}=${clause.status}`).join(", ")})`,
@@ -3668,10 +3890,21 @@ const make = Effect.gen(function* () {
         "every required clause is proved",
       );
     }
+    if (prepared !== undefined) {
+      const kept = yield* keepPrepared(authority.criteriaRoot, issue, criteriaSha256, prepared);
+      if (kept !== undefined) {
+        return wait(
+          `T3 could not keep the prepared criteria under ${authority.criteriaRoot}: ${kept}`,
+          "T3",
+          "write the prepared criteria under the criteria root",
+          "they are kept as prepared",
+        );
+      }
+    }
     return yield* nativeStages.planParentClosure({
       configuration,
       itemKey: candidate.itemKey,
-      criteriaSha256: pinned.sha256,
+      criteriaSha256,
       reopenOf: candidate.stage.type === "implement" ? candidate.stage.reopenOf : undefined,
       evidence: clauses.flatMap((clause) =>
         clause.landed.map(
@@ -3864,11 +4097,33 @@ const make = Effect.gen(function* () {
     // Triage decomposes an item before its first build, on the inputs the policy was shown.
     if (decision.taskKind === "triage") {
       if (stage.type !== "implement") return { disposition: "stage_mismatch" };
-      const triage = yield* triageDecisionFor(
-        configuration,
-        candidate,
-        yield* policyOutcomes({ outcomeStore, store }, candidate.events),
+      const outcomes = yield* policyOutcomes({ outcomeStore, store }, candidate.events);
+      // A parent's criteria proposal still quoting its current text and comments is not paid for
+      // again: a comment no clause cites changes the triage key, not the preparation.
+      const preparedOn = outcomes.findLast(
+        (outcome) =>
+          outcome.state === "verified" &&
+          outcome.report.outcome === "criteria_proposed" &&
+          outcome.report.criteria?.basis.itemVersion === candidate.observation.itemVersion &&
+          outcome.policyRevision === configuration.policyRevision,
       );
+      if (
+        (candidate.issue.subIssueCount ?? 0) > 0 &&
+        preparedOn?.report.criteria !== undefined &&
+        criteriaProposalProblems({
+          proposal: preparedOn.report.criteria,
+          issue: subject.issueNumber,
+          body: candidate.issue.body,
+          comments: candidate.issue.comments,
+        }).length === 0
+      ) {
+        return {
+          disposition: "nothing_proposed",
+          detail: `#${subject.issueNumber} is already prepared on its current text by ${preparedOn.outcomeId}`,
+          reasonClass: "prepared",
+        };
+      }
+      const triage = yield* triageDecisionFor(configuration, candidate, outcomes);
       if (triage === undefined || "unread" in triage) {
         const unread = triage?.unread;
         return {

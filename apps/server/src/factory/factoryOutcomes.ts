@@ -28,6 +28,7 @@ import {
   owedWakes,
   preparationFailures,
 } from "./factoryCustody.ts";
+import { criteriaProposalProblems } from "./factoryCoordination.ts";
 import type * as FactoryExecutionGenerations from "./FactoryExecutionGenerations.ts";
 import type * as FactoryGitReadback from "./FactoryGitReadback.ts";
 import type * as FactoryOperationStore from "./FactoryOperationStore.ts";
@@ -234,11 +235,18 @@ export const makeFactoryOutcomes = (deps: FactoryOutcomeDependencies) => {
         ((kind === "failed" || kind === "review_failed" || kind === "not_actionable") &&
           input.report.failure === undefined) ||
         (kind === "unit_proposed" &&
-          (input.report.proposal === undefined || input.report.proposal.unit.trim() === ""));
+          (input.report.proposal === undefined || input.report.proposal.unit.trim() === "")) ||
+        (kind === "criteria_proposed" && input.report.criteria === undefined);
       if (missing) {
         return yield* reportFailure(
           "subject_missing",
           `A ${kind} report names exactly what it produced or examined.`,
+        );
+      }
+      if (kind !== "criteria_proposed" && input.report.criteria !== undefined) {
+        return yield* reportFailure(
+          "outcome_not_expected",
+          "Criteria are reported only with criteria_proposed.",
         );
       }
       const execution = yield* currentExecution(input.threadId);
@@ -302,6 +310,7 @@ export const makeFactoryOutcomes = (deps: FactoryOutcomeDependencies) => {
     const projectId = configuration.projectId;
     const { report } = outcome;
     const basis = reservation.value.stageBasis ?? "";
+    const admittedBasis = reservation.value.stageBasis;
     switch (report.outcome) {
       case "implemented": {
         const head = report.subject!.headCommit!;
@@ -352,6 +361,34 @@ export const makeFactoryOutcomes = (deps: FactoryOutcomeDependencies) => {
         return problem === undefined
           ? ({ accepted: true } as const)
           : ({ rejected: problem } as const);
+      }
+      case "criteria_proposed": {
+        // Untrusted quotes: each must be exactly the acceptance of the text the triage read.
+        const criteria = report.criteria!;
+        if (criteria.basis.itemVersion !== reservation.value.itemVersion) {
+          return {
+            rejected: `the criteria name item version ${criteria.basis.itemVersion}, not ${reservation.value.itemVersion}`,
+          } as const;
+        }
+        const admitted = (yield* outcomes.itemRecords({
+          factoryId: outcome.factoryId,
+          itemKey: outcome.itemKey,
+        })).findLast(
+          // The admission of exactly this stage: its kept text is what the triage read.
+          ({ record }) =>
+            record.type === "admitted" &&
+            record.reservationId === reservation.value.reservationId &&
+            record.stageBasis === admittedBasis,
+        )?.record;
+        const text = admitted?.type === "admitted" ? admitted.issueText : undefined;
+        const issue = subjectOf(outcome.itemKey)?.issueNumber;
+        if (text === undefined || issue === undefined) {
+          return { rejected: "T3 kept no text of the issue this triage read" } as const;
+        }
+        const problems = criteriaProposalProblems({ proposal: criteria, issue, body: text.body });
+        return problems.length === 0
+          ? ({ accepted: true } as const)
+          : ({ rejected: problems.slice(0, 5).join("; ").slice(0, 2_000) } as const);
       }
       case "integrated":
       case "closed":

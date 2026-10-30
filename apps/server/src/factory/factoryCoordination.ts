@@ -1,6 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off - every identity here is a sha256 digest.
 import * as NodeCrypto from "node:crypto";
 
+import type { FactoryCriteriaProposal } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
 import type * as FactoryOperationStore from "./FactoryOperationStore.ts";
@@ -337,6 +338,12 @@ const Criteria = Schema.Struct({
       evidence: Schema.optional(
         Schema.Array(Schema.Struct({ itemKey: Schema.String, scope: Schema.String })),
       ),
+      /** Who must act for a reserved clause; decoded, so a hold is never stripped as excess. */
+      reserved: Schema.optional(
+        Schema.Struct({ actor: Schema.String, action: Schema.String, resume: Schema.String }),
+      ),
+      revision: Schema.optional(Schema.String),
+      unit: Schema.optional(Schema.Unknown),
     }),
   ),
 });
@@ -396,3 +403,495 @@ export const reconcileCriteria = (input: {
     }
     return { ...base, status: "satisfied", landed };
   });
+
+// Parent criteria preparation (factory-parent-preparation/1). Offsets are Unicode code points and
+// whitespace is Python's, so these reads equal the preparation module's for the same text.
+const SPACE =
+  "[\\t\\n\\v\\f\\r\\x1c-\\x1f \\x85\\xa0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]";
+const SPACES = new RegExp(`${SPACE}+`, "u");
+const EDGE_SPACES = new RegExp(`^${SPACE}+|${SPACE}+$`, "gu");
+const strip = (text: string) => text.replace(EDGE_SPACES, "");
+const normalized = (text: string) =>
+  text
+    .split(SPACES)
+    .filter((part) => part !== "")
+    .join(" ");
+const codePoints = (text: string) => [...text];
+
+const ACCEPTANCE_TITLE = /^(?:acceptance(?: checks| criteria)?|completion criteria):?$/i;
+const HEADING = /^(#{1,6})[ \t]+([^\n]*?)[ \t]*#*[ \t]*$/u;
+const FENCE = /^ {0,3}(`{3,}|~{3,})/;
+const ITEM = /^ {0,3}(?:[-*+]|\p{Nd}{1,3}[.)])[ \t]+(?:\[([ xX])\][ \t]+)?/u;
+const BOLD_LABEL = /^\*\*([^*\n]{1,80}?)\*\*/u;
+const PLAIN_LABEL = /^([A-Za-z0-9][\p{L}\p{N}_/-]*(?: [\p{L}\p{N}_/-]+){0,3}):[ \t]/u;
+const CITATION = /\/issues\/([0-9]+)#issuecomment-([0-9]+)(?![\p{L}\p{N}_])/gu;
+
+export interface AcceptanceItem {
+  readonly start: number;
+  readonly end: number;
+  readonly checked: boolean;
+  readonly excerpt: string;
+  readonly sha256: string;
+  readonly anchor: string;
+}
+
+/**
+ * The current acceptance of an issue body: each top-level list item under an Acceptance,
+ * Acceptance checks, Acceptance criteria or Completion criteria heading, with its exact span.
+ * `<details>` and fenced text are never read; text after a first item that belongs to none is
+ * `unlisted`.
+ */
+export const parentAcceptance = (body: string) => {
+  interface Section {
+    readonly anchor: string;
+    readonly items: Array<{ start: number; end: number; checked: boolean }>;
+    readonly unlisted: Array<string>;
+  }
+  const sections: Array<Section> = [];
+  let current: Section | undefined;
+  let item: { start: number; end: number; checked: boolean } | undefined;
+  let fence: string | undefined;
+  let depth = 0;
+  let blank = false;
+  const closeItem = () => {
+    if (item !== undefined) current?.items.push(item);
+    item = undefined;
+  };
+  let at = 0;
+  let offset = 0;
+  while (at < body.length) {
+    const newline = body.indexOf("\n", at);
+    const raw = newline < 0 ? body.slice(at) : body.slice(at, newline + 1);
+    const start = offset;
+    at += raw.length;
+    offset += codePoints(raw).length;
+    const line = raw.replace(/[\r\n]+$/, "");
+    const end = start + codePoints(line).length;
+    const opened = FENCE.exec(line);
+    if (fence !== undefined) {
+      if (opened !== null && opened[1]![0] === fence[0] && opened[1]!.length >= fence.length) {
+        fence = undefined;
+      }
+      continue;
+    }
+    if (opened !== null) {
+      fence = opened[1]!;
+      continue;
+    }
+    const lowered = line.toLowerCase();
+    depth += lowered.split("<details").length - lowered.split("</details>").length;
+    if (depth > 0 || lowered.includes("</details>")) {
+      depth = Math.max(depth, 0);
+      if (current !== undefined) {
+        closeItem();
+        current = undefined;
+      }
+      continue;
+    }
+    const heading = HEADING.exec(line);
+    if (heading !== null) {
+      if (current !== undefined) closeItem();
+      current = undefined;
+      const title = strip(heading[2]!);
+      if (ACCEPTANCE_TITLE.test(title)) {
+        const anchor = strip(
+          title
+            .replace(/:+$/, "")
+            .toLowerCase()
+            .replace(/[^a-z0-9 -]/g, ""),
+        ).replaceAll(" ", "-");
+        current = { anchor, items: [], unlisted: [] };
+        sections.push(current);
+      }
+      continue;
+    }
+    if (current === undefined) continue;
+    if (strip(line) === "") {
+      blank = true;
+      continue;
+    }
+    const marker = line.length - line.replace(/^ +/, "").length <= 1 ? ITEM.exec(line) : null;
+    if (marker !== null) {
+      closeItem();
+      item = {
+        start: start + codePoints(marker[0]).length,
+        end,
+        checked: /x/i.test(marker[1] ?? ""),
+      };
+    } else if (item !== undefined && (!blank || line.startsWith(" ") || line.startsWith("\t"))) {
+      item.end = end;
+    } else if (item === undefined && current.items.length === 0) {
+      // A preamble before the first item is not acceptance.
+    } else {
+      closeItem();
+      current.unlisted.push(strip(line));
+    }
+    blank = false;
+  }
+  if (current !== undefined) closeItem();
+  const characters = codePoints(body);
+  return {
+    items: sections.flatMap((section) =>
+      section.items.map((found): AcceptanceItem => {
+        const excerpt = characters.slice(found.start, found.end).join("");
+        return { ...found, excerpt, sha256: sha256(excerpt), anchor: section.anchor };
+      }),
+    ),
+    unlisted: sections.flatMap((section) => section.unlisted),
+  };
+};
+
+const labelOf = (excerpt: string) => {
+  const found = BOLD_LABEL.exec(excerpt) ?? PLAIN_LABEL.exec(excerpt);
+  if (found === null) return undefined;
+  const slug = strip(found[1]!)
+    .replace(/[:.]+$/, "")
+    .replace(/[^A-Za-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64)
+    .replace(/^-+|-+$/g, "");
+  return slug === "" ? undefined : slug;
+};
+
+/** The comments an acceptance item cites on its own issue, by complete receipt, in id order. */
+const citedBy = (excerpt: string, issue: number) => [
+  ...new Set(
+    [...excerpt.matchAll(CITATION)]
+      .filter((match) => match[1] === String(issue))
+      .map((match) => match[2]!),
+  ),
+];
+
+const isText = (value: unknown): value is string =>
+  typeof value === "string" && strip(value) !== "";
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+const hasTexts = (value: unknown, keys: ReadonlyArray<string>) =>
+  isRecord(value) && keys.every((key) => isText(value[key]));
+
+type RawClause = Record<string, unknown> & { readonly id: string };
+
+/**
+ * Root-adopted criteria as the preparation reads them, every hold and annotation kept: the raw
+ * document, not `decodeCriteria`'s view, which drops `reserved`, `revision` and `unit`.
+ */
+export const adoptedClauses = (document: unknown, issue: number) => {
+  const clauseOk = (clause: unknown): clause is RawClause => {
+    if (!isRecord(clause)) return false;
+    const state = clause.state ?? "open";
+    const unit = clause.unit;
+    return (
+      isText(clause.id) &&
+      typeof clause.required === "boolean" &&
+      hasTexts(clause.source, ["kind", "ref"]) &&
+      (state === "open" || state === "reserved" || state === "revised") &&
+      (state !== "reserved" || hasTexts(clause.reserved, ["actor", "action", "resume"])) &&
+      (state !== "revised" || isText(clause.revision)) &&
+      Array.isArray(clause.evidence ?? []) &&
+      ((clause.evidence ?? []) as ReadonlyArray<unknown>).every((evidence) =>
+        hasTexts(evidence, ["itemKey", "scope"]),
+      ) &&
+      (unit === undefined ||
+        unit === null ||
+        (hasTexts(unit, ["title", "contract"]) &&
+          Array.isArray((unit as Record<string, unknown>).paths ?? [])))
+    );
+  };
+  if (
+    !isRecord(document) ||
+    document.schema !== "factory-parent-criteria/1" ||
+    document.issue !== issue ||
+    !Array.isArray(document.clauses) ||
+    document.clauses.length === 0 ||
+    !document.clauses.every(clauseOk)
+  ) {
+    return undefined;
+  }
+  const clauses = document.clauses as ReadonlyArray<RawClause>;
+  return new Set(clauses.map((clause) => clause.id)).size === clauses.length ? clauses : undefined;
+};
+
+interface Evidence {
+  readonly itemKey: string;
+  readonly scope: string;
+}
+const evidenceOf = (clause: RawClause) => (clause.evidence ?? []) as ReadonlyArray<Evidence>;
+
+/**
+ * Each current acceptance item as the prepared clause it must become: the adopted clause's id,
+ * state and annotations for the same text, else its label or text digest; and the evidence it may
+ * cite, which is the adopted evidence for that text and the members whose own acceptance quotes
+ * it verbatim. With the adopted reserved clauses no longer in the body, which stay.
+ */
+const derivedClauses = (input: {
+  readonly items: ReadonlyArray<AcceptanceItem>;
+  readonly adopted: ReadonlyArray<RawClause>;
+  readonly children: ReadonlyArray<{ readonly itemKey: string; readonly body?: string }>;
+}) => {
+  const known = input.adopted.map((clause) => {
+    const texts = new Set(evidenceOf(clause).map((evidence) => normalized(evidence.scope)));
+    const excerpt = isRecord(clause.source) ? clause.source.excerpt : undefined;
+    if (typeof excerpt === "string") texts.add(normalized(excerpt));
+    return { clause, texts };
+  });
+  const carriers = input.children.flatMap((child) =>
+    child.body === undefined
+      ? []
+      : [
+          {
+            itemKey: child.itemKey,
+            texts: new Set(
+              parentAcceptance(child.body).items.map((item) => normalized(item.excerpt)),
+            ),
+          },
+        ],
+  );
+  const used = new Set<number>();
+  const derived = input.items.map((item) => {
+    const text = normalized(item.excerpt);
+    const label = labelOf(item.excerpt) ?? `clause-${sha256(text).slice(0, 12)}`;
+    const index = known.findIndex(
+      ({ clause, texts }, at) =>
+        !used.has(at) &&
+        (texts.has(text) ||
+          // An adopted reservation recorded without its text still holds the clause bearing its id.
+          (texts.size === 0 && clause.id === label && (clause.state ?? "open") === "reserved")),
+    );
+    const adopted = index < 0 ? undefined : known[index]!.clause;
+    if (index >= 0) used.add(index);
+    const evidence = [...(adopted === undefined ? [] : evidenceOf(adopted))];
+    for (const carrier of carriers) {
+      if (carrier.texts.has(text) && !evidence.some((each) => each.itemKey === carrier.itemKey)) {
+        evidence.push({ itemKey: carrier.itemKey, scope: text });
+      }
+    }
+    return { item, id: adopted?.id ?? label, adopted, evidence };
+  });
+  const kept = input.adopted.filter(
+    (clause, at) => !used.has(at) && (clause.state ?? "open") === "reserved",
+  );
+  const taken = new Map<string, number>();
+  for (const clause of derived) taken.set(clause.id, (taken.get(clause.id) ?? 0) + 1);
+  const keptIds = new Set(kept.map((clause) => clause.id));
+  return {
+    derived: derived.map((clause) =>
+      clause.adopted === undefined && ((taken.get(clause.id) ?? 0) > 1 || keptIds.has(clause.id))
+        ? { ...clause, id: `${clause.id}-${clause.item.sha256.slice(0, 6)}` }
+        : clause,
+    ),
+    kept,
+  };
+};
+
+export interface IssueComment {
+  readonly id: number | string;
+  readonly body: string;
+}
+
+const sliceOf = (text: string, start: number, end: number) =>
+  codePoints(text).slice(start, end).join("");
+
+/**
+ * Every way a criteria proposal departs from the exact acceptance of `body`: one clause per
+ * item in order, each quoting its item exactly and the comments it cites. Comment quotes are
+ * checked against `comments` when T3 holds them.
+ */
+export const criteriaProposalProblems = (input: {
+  readonly proposal: FactoryCriteriaProposal;
+  readonly issue: number;
+  readonly body: string;
+  readonly comments?: ReadonlyArray<IssueComment>;
+}): ReadonlyArray<string> => {
+  const { proposal, issue, body } = input;
+  if (proposal.issue !== issue) return [`the proposal is for #${proposal.issue}, not #${issue}`];
+  if (proposal.basis.bodySha256 !== sha256(body)) {
+    return [`the proposal names body ${proposal.basis.bodySha256}, not ${sha256(body)}`];
+  }
+  const accepted = parentAcceptance(body);
+  if (accepted.items.length === 0) return [`the body of #${issue} states no acceptance list`];
+  if (accepted.unlisted.length > 0) {
+    return [`#${issue}'s acceptance has text outside its list items`];
+  }
+  const problems: Array<string> = [];
+  if (proposal.clauses.length !== accepted.items.length) {
+    problems.push(
+      `the proposal names ${proposal.clauses.length} clauses; the acceptance has ${accepted.items.length} items`,
+    );
+  }
+  if (new Set(proposal.clauses.map((clause) => clause.id)).size !== proposal.clauses.length) {
+    problems.push("the proposal names a clause id twice");
+  }
+  const comments = new Map((input.comments ?? []).map((comment) => [String(comment.id), comment]));
+  accepted.items.forEach((item, at) => {
+    const clause = proposal.clauses[at];
+    if (clause === undefined) return;
+    const { source } = clause;
+    if (
+      source.start !== item.start ||
+      source.end !== item.end ||
+      source.sha256 !== item.sha256 ||
+      source.excerpt !== item.excerpt
+    ) {
+      problems.push(
+        `clause ${clause.id} does not quote the item at ${item.start}-${item.end} (sha256 ${item.sha256})`,
+      );
+    }
+    const cited = citedBy(item.excerpt, issue);
+    const quoted = clause.comments ?? [];
+    if (
+      quoted
+        .map((comment) => comment.id)
+        .toSorted()
+        .join(",") !== cited.toSorted().join(",")
+    ) {
+      problems.push(
+        `clause ${clause.id} quotes other comments than its text cites (${cited.join(", ")})`,
+      );
+      return;
+    }
+    if (input.comments === undefined) return;
+    for (const quote of quoted) {
+      const comment = comments.get(quote.id);
+      if (
+        comment === undefined ||
+        sha256(comment.body) !== quote.sha256 ||
+        quote.end > codePoints(comment.body).length ||
+        sliceOf(comment.body, quote.start, quote.end) !== quote.excerpt
+      ) {
+        problems.push(`clause ${clause.id} does not quote comment ${quote.id} as T3 read it`);
+      }
+    }
+  });
+  return problems;
+};
+
+/** JSON text as a value, or undefined when it is not JSON. */
+export const parseJson = (text: string): unknown => {
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return undefined;
+  }
+};
+
+const sameJson = (left: unknown, right: unknown) => canonical(left) === canonical(right);
+
+/**
+ * Every way prepared criteria depart from what T3 derives from its own reads of the body,
+ * comments, complete membership, adoption and verified proposal. Each clause keeps its source,
+ * id, state and adopted holds; its evidence is only adopted for that text or a member quoting it.
+ */
+export const preparedCriteriaProblems = (input: {
+  readonly document: unknown;
+  readonly issue: number;
+  readonly repository: string;
+  readonly body: string;
+  readonly comments: ReadonlyArray<IssueComment>;
+  readonly children: ReadonlyArray<{ readonly itemKey: string; readonly body?: string }>;
+  readonly adopted: unknown;
+  readonly proposal: FactoryCriteriaProposal;
+}): ReadonlyArray<string> => {
+  const { document, issue } = input;
+  const adopted = input.adopted === undefined ? [] : adoptedClauses(input.adopted, issue);
+  if (adopted === undefined) {
+    return [
+      `the adopted criteria are not a usable factory-parent-criteria/1 document for #${issue}`,
+    ];
+  }
+  const proposed = criteriaProposalProblems(input);
+  if (proposed.length > 0) return proposed;
+  if (
+    !isRecord(document) ||
+    document.schema !== "factory-parent-criteria/1" ||
+    document.issue !== issue ||
+    document.bodySha256 !== sha256(input.body) ||
+    !Array.isArray(document.clauses)
+  ) {
+    return [`the prepared document is not factory-parent-criteria/1 for #${issue}'s current body`];
+  }
+  const accepted = parentAcceptance(input.body).items;
+  const { derived, kept } = derivedClauses({ items: accepted, adopted, children: input.children });
+  const clauses = document.clauses as ReadonlyArray<unknown>;
+  if (clauses.length !== derived.length + kept.length) {
+    return [
+      `the prepared document has ${clauses.length} clauses; ${derived.length} acceptance items and ${kept.length} kept holds need ${derived.length + kept.length}`,
+    ];
+  }
+  const comments = new Map(input.comments.map((comment) => [String(comment.id), comment]));
+  const problems: Array<string> = [];
+  derived.forEach((expected, at) => {
+    const clause = clauses[at];
+    const { item } = expected;
+    const proposal = input.proposal.clauses[at]!;
+    if (!isRecord(clause) || clause.id !== expected.id) {
+      problems.push(`clause ${at + 1} is not ${expected.id}`);
+      return;
+    }
+    const source = clause.source;
+    if (
+      clause.required !== true ||
+      !isRecord(source) ||
+      source.kind !== "issue_acceptance" ||
+      source.ref !== `https://github.com/${input.repository}/issues/${issue}#${item.anchor}` ||
+      source.start !== item.start ||
+      source.end !== item.end ||
+      source.sha256 !== item.sha256 ||
+      source.excerpt !== item.excerpt
+    ) {
+      problems.push(
+        `clause ${expected.id} is not the required acceptance item at ${item.start}-${item.end}`,
+      );
+    }
+    const cited = citedBy(item.excerpt, issue);
+    const quotes = isRecord(source) && Array.isArray(source.comments) ? source.comments : [];
+    if (
+      quotes.length !== cited.length ||
+      !quotes.every((quote: unknown) => {
+        if (!isRecord(quote) || typeof quote.id !== "string" || !cited.includes(quote.id)) {
+          return false;
+        }
+        const comment = comments.get(quote.id);
+        return (
+          comment !== undefined &&
+          quote.sha256 === sha256(comment.body) &&
+          typeof quote.start === "number" &&
+          typeof quote.end === "number" &&
+          sliceOf(comment.body, quote.start, quote.end) === quote.excerpt
+        );
+      })
+    ) {
+      problems.push(`clause ${expected.id} does not quote the comments it cites as T3 reads them`);
+    }
+    const adoptedState = (expected.adopted?.state ?? "open") as string;
+    const state =
+      adoptedState === "open" && proposal.needs !== undefined ? "reserved" : adoptedState;
+    if ((clause.state ?? "open") !== state) {
+      problems.push(`clause ${expected.id} is ${String(clause.state ?? "open")}, not ${state}`);
+    }
+    for (const key of ["reserved", "revision", "unit"] as const) {
+      const held = expected.adopted?.[key];
+      if (held !== undefined && held !== null && !sameJson(clause[key], held)) {
+        problems.push(`clause ${expected.id} does not keep its adopted ${key}`);
+      }
+    }
+    if (state === "reserved" && !hasTexts(clause.reserved, ["actor", "action", "resume"])) {
+      problems.push(`clause ${expected.id} is reserved without its actor, action and resume`);
+    }
+    const evidence = Array.isArray(clause.evidence)
+      ? (clause.evidence as ReadonlyArray<unknown>)
+      : [];
+    for (const each of evidence) {
+      if (!expected.evidence.some((allowed) => sameJson(allowed, each))) {
+        problems.push(
+          `clause ${expected.id} cites evidence ${canonical(each).slice(0, 200)} that neither adoption nor a member's own acceptance supports`,
+        );
+      }
+    }
+  });
+  kept.forEach((hold, at) => {
+    if (!sameJson(clauses[derived.length + at], hold)) {
+      problems.push(`the adopted hold ${hold.id} is not kept as adopted`);
+    }
+  });
+  return problems;
+};

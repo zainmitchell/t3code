@@ -43,6 +43,8 @@ export type FactoryOutcomeKind =
   | "closed"
   /** Triage proposed a unit spec for the item version it read. */
   | "unit_proposed"
+  /** A parent's triage quoted its current acceptance as criteria clauses. */
+  | "criteria_proposed"
   /** Triage found no bounded unit to propose; the reason needs a person. */
   | "not_actionable"
   /** T3 opened a correction ticket a verification-only item's spec asked for. */
@@ -295,6 +297,7 @@ export const nextStage = (events: ReadonlyArray<ItemEvent>): FactoryStage => {
         break;
       // Evidence for the policy, not a lifecycle transition.
       case "unit_proposed":
+      case "criteria_proposed":
       case "not_actionable":
       case "ticket_opened":
         break;
@@ -366,7 +369,7 @@ export const expectedOutcomes: Record<FactoryStageType, ReadonlyArray<FactoryOut
   correct: ["correction_spec", "failed"],
   integrate: ["integrated", "failed"],
   close: ["closed", "failed"],
-  triage: ["unit_proposed", "not_actionable"],
+  triage: ["unit_proposed", "criteria_proposed", "not_actionable"],
 };
 
 /**

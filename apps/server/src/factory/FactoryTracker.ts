@@ -183,6 +183,8 @@ export interface TrackerSession {
       readonly repository: string;
       readonly number: number;
       readonly state: "open" | "closed";
+      /** Its current body from the same listing; absent when the listing did not carry one. */
+      readonly body?: string;
     }>,
     FactoryTrackerError
   >;
@@ -328,6 +330,7 @@ const RelatedIssue = Schema.Struct({
   number: Schema.Int,
   state: Schema.optional(Schema.Literals(["open", "closed"])),
   repository_url: Schema.optional(Schema.String),
+  body: Schema.optional(Schema.NullOr(Schema.String)),
 });
 const decodeRelated = Schema.decodeUnknownEffect(Schema.fromJsonString(RelatedIssue));
 const decodeRelatedList = Schema.decodeUnknownEffect(
@@ -690,6 +693,7 @@ const make = Effect.gen(function* () {
                 readonly repository: string;
                 readonly number: number;
                 readonly state: "open" | "closed";
+                readonly body?: string;
               }> = [];
               for (let page = 1; ; page++) {
                 const decoded = yield* decodeRelatedList(
@@ -707,6 +711,8 @@ const make = Effect.gen(function* () {
                     repository: repositoryOf(child, input.repository),
                     number: child.number,
                     state: child.state,
+                    // GitHub sends null for an empty body; an omitted body stays unknown.
+                    ...(child.body === undefined ? {} : { body: child.body ?? "" }),
                   });
                 }
                 if (decoded.length < 100) return children;

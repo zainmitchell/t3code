@@ -19,6 +19,7 @@ import {
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 
 import * as ProcessRunner from "../processRunner.ts";
 import * as FactoryCommandPolicy from "./FactoryCommandPolicy.ts";
@@ -82,6 +83,7 @@ interface ItemInput {
   readonly stage?: FactoryLifecycle.FactoryPolicyItem["stage"];
   readonly reserved?: ReadonlyArray<FactoryOutcomeStore.ReservedDecision>;
   readonly outcomes?: ReadonlyArray<FactoryOutcomeStore.FactoryOutcome>;
+  readonly subIssueCount?: number;
 }
 
 const decide = (items: ReadonlyArray<ItemInput>, config = configuration()) =>
@@ -97,7 +99,14 @@ const decide = (items: ReadonlyArray<ItemInput>, config = configuration()) =>
       configuration: config,
       items: items.map((item, index) => ({
         observation: observationOf(item.key ?? itemKey, index + 1),
-        issue: { state: "open", title: "Issue", body: "", labels: item.labels, comments: [] },
+        issue: {
+          state: "open",
+          title: "Issue",
+          body: "",
+          labels: item.labels,
+          comments: [],
+          ...(item.subIssueCount === undefined ? {} : { subIssueCount: item.subIssueCount }),
+        },
         stage: item.stage ?? { type: "implement" },
         reserved: item.reserved ?? [],
         grants: [],
@@ -360,6 +369,7 @@ it("Policy input: closed blockers carry their outcomes as facts; other items are
             itemKey: blocker,
             outcomes: [{ ...integrated, landingOrigin: landing }],
             state: "closed",
+            body: "## Acceptance\n- B1: carried.",
           },
           { itemKey: refused, outcomes: [], events, state: "open" },
         ],
@@ -375,10 +385,12 @@ it("Policy input: closed blockers carry their outcomes as facts; other items are
       child.state,
       child.outcomes.map((outcome) => outcome.origin),
       child.events?.length ?? 0,
+      // A body the membership read did not carry stays absent: unknown, never empty.
+      "body" in child ? child.body : "unread",
     ]),
     [
-      [blocker, "closed", [landing], 0],
-      [refused, "open", [], 2],
+      [blocker, "closed", [landing], 0, "## Acceptance\n- B1: carried."],
+      [refused, "open", [], 2, "unread"],
     ],
   );
   // Unread membership is said, never sent as an empty list.
@@ -493,7 +505,16 @@ it.live(
       // The worker is told the exact item version its proposal must name.
       assert.include(triage.packet.text, "Item version: v1.");
       assert.include(triage.packet.text, "unit_proposed");
+      assert.notInclude(triage.packet.text, "criteria_proposed");
       assert.strictEqual(triage.packet.sha256, sha256(triage.packet.text));
+      // A parent is prepared as criteria on its exact text, never as a unit.
+      const parent = only(yield* decide([{ labels: ["policy:triage"], subIssueCount: 2 }]));
+      if (parent === undefined || "type" in parent)
+        return assert.fail("expected a triage admission");
+      assert.include(parent.packet.text, `Item version: v1. Body sha256: ${sha256("")}.`);
+      assert.include(parent.packet.text, "- criteria_proposed with criteria.basis");
+      assert.notInclude(parent.packet.text, "unit_proposed");
+      assert.notInclude(parent.packet.text, "subject.baseCommit");
       assert.deepStrictEqual(only(yield* decide([{ labels: ["policy:spawn"] }])), {
         type: "spawn",
         reason: "the verification found a product defect",
@@ -566,5 +587,24 @@ it.live("Policy: every worker packet names the factory's configured host tooling
   }).pipe(
     Effect.ensuring(Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true }))),
     Effect.provide(layer),
+  );
+});
+
+it("Policy answer: a parent closure names adopted or prepared criteria as its policy sent them", () => {
+  const decode = Schema.decodeUnknownOption(FactoryCommandPolicy.PolicyAnswer);
+  const pinned = { root: "C:/criteria", path: "adopted/27.json", sha256: "a".repeat(64) };
+  const prepared = {
+    bytes: '{"schema":"factory-parent-criteria/1"}',
+    sha256: "b".repeat(64),
+    adopted: pinned,
+  };
+  const answer = (parentClosure: unknown) => ({
+    decisions: [{ itemKey, decision: { decision: "proceed", parentClosure } }],
+  });
+  const decided: unknown = Option.getOrThrow(decode(answer({ prepared }))).decisions[0]!.decision;
+  assert.deepStrictEqual(decided, { decision: "proceed", parentClosure: { prepared } });
+  assert.isTrue(Option.isSome(decode(answer({ criteria: pinned }))));
+  assert.isTrue(
+    Option.isNone(decode(answer({ prepared: { ...prepared, bytes: "x".repeat(1_000_001) } }))),
   );
 });

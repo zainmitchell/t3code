@@ -86,11 +86,23 @@ const PolicyDecision = Schema.Union([
   Schema.Struct({
     decision: Schema.Literal("proceed"),
     /**
-     * A parent to close on its adopted criteria. T3 reconciles every clause from its own records
-     * and closes only under the factory's configured parent authority.
+     * A parent to close on its adopted criteria, or on criteria prepared from its verified
+     * criteria proposal (exactly one). T3 revalidates prepared criteria against its own reads,
+     * reconciles every clause from its own records and closes only under the factory's
+     * configured parent authority.
      */
     parentClosure: Schema.optional(
-      Schema.Struct({ criteria: PinnedFile, ownerDecisionId: Schema.optional(Bounded(64)) }),
+      Schema.Struct({
+        criteria: Schema.optional(PinnedFile),
+        prepared: Schema.optional(
+          Schema.Struct({
+            bytes: Bounded(1_000_000),
+            sha256: Bounded(64),
+            adopted: Schema.optional(PinnedFile),
+          }),
+        ),
+        ownerDecisionId: Schema.optional(Bounded(64)),
+      }),
     ),
   }),
   Schema.Struct({
@@ -134,6 +146,8 @@ const REPORT_REQUIREMENTS: Record<string, string> = {
   correction_spec: "correction_spec with the specification as summary",
   unit_proposed:
     "unit_proposed with proposal.basis = the item version named above, proposal.unit = the exact unit spec text for the issue with its checks and any dependency, proposal.ownedFiles, proposal.resources and proposal.effort, subject.repository and subject.baseCommit = the commit the unit starts from, and the evidence you relied on as summary",
+  criteria_proposed:
+    "criteria_proposed with criteria.basis = the body sha256 and item version named above, and one clause per acceptance list item, quoted exactly with its offsets and sha256, each in body order",
   not_actionable:
     "not_actionable only for what a person must settle, with failure led by its kind: `decision:` (the one question, its consequence and the exact action that answers it), `permission:`, `private_data:`, `ownership:` or `hold:`, then what is missing",
 };
@@ -158,6 +172,14 @@ const evidenceInstructions = (
   artifactRoot: string,
   taskKind: FactoryStageType,
 ) => {
+  if (taskKind === "triage" && isParent(item)) {
+    return [
+      `Item version: ${item.observation.itemVersion}. Body sha256: ${sha256(item.issue.body)}. Report them as criteria.basis; criteria for any other text are rejected.`,
+      "This item is a parent: its work is its sub-issues, so prepare its criteria, not a unit. Report criteria.schema factory-parent-criteria-proposal/1 and criteria.issue, then one clause per top-level list item under each Acceptance, Acceptance checks, Acceptance criteria or Completion criteria heading of the current body, in body order. Skip <details> and fenced text. Each clause quotes its item as source: start and end are Unicode code point offsets into the body (end exclusive), excerpt is exactly that slice and sha256 is the sha256 of its UTF-8 bytes. A clause whose item cites a comment of this issue by complete link quotes that comment the same way, with the sha256 of the whole comment.",
+      "Add needs (product_meaning or qualification, with what) only where a person must settle the clause. Claim no evidence, status, landing or child: T3 and the policy prove those from their own records. Change no file and no tracker record.",
+      ...previousPreparation(item),
+    ];
+  }
   if (taskKind === "triage") {
     return [
       `Item version: ${item.observation.itemVersion}. Report it as proposal.basis; a proposal for any other version is rejected.`,
@@ -212,6 +234,9 @@ const hostTooling = (policyExecutable: string) => [
   `- The T3 server's Node executable: ${JSON.stringify(process.execPath)}`,
 ];
 
+/** A parent's work is its sub-issues: it is prepared as criteria, never as a unit. */
+const isParent = (item: FactoryLifecycle.FactoryPolicyItem) => (item.issue.subIssueCount ?? 0) > 0;
+
 /** The footer T3 owns on every packet: how this stage's worker reports, whatever the brief. */
 const reportFooter = (
   item: FactoryLifecycle.FactoryPolicyItem,
@@ -223,7 +248,13 @@ const reportFooter = (
     "---",
     ...hostTooling(policyExecutable),
     `This is a ${taskKind} stage of a T3 factory item. When its work is done, make your final action one call to the t3_factory_report tool reporting one of:`,
-    ...expectedOutcomes[taskKind].map((outcome) => `- ${REPORT_REQUIREMENTS[outcome] ?? outcome}`),
+    ...expectedOutcomes[taskKind]
+      .filter(
+        (outcome) =>
+          taskKind !== "triage" ||
+          outcome !== (isParent(item) ? "unit_proposed" : "criteria_proposed"),
+      )
+      .map((outcome) => `- ${REPORT_REQUIREMENTS[outcome] ?? outcome}`),
     ...evidenceInstructions(item, artifactRoot, taskKind),
     "T3 reads the repository and tracker back to verify the report before any later stage starts. Settling or ending the thread is not a report.",
   ].join("\n");
@@ -291,7 +322,14 @@ export const policyInput = (
     ...(item.blockers === undefined ? {} : { blockers: item.blockers.map(itemFacts) }),
     ...(item.children === undefined
       ? {}
-      : { children: item.children.map((child) => ({ ...itemFacts(child), state: child.state })) }),
+      : {
+          children: item.children.map((child) => ({
+            ...itemFacts(child),
+            state: child.state,
+            // Absent when the membership read carried no body: unknown, never empty.
+            ...(child.body === undefined ? {} : { body: child.body }),
+          })),
+        }),
     ...(item.childrenUnread === undefined ? {} : { childrenUnread: item.childrenUnread }),
     reserved: item.reserved,
     grants: item.grants,

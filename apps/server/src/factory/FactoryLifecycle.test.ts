@@ -139,7 +139,12 @@ import {
   HostBootReader,
   HostBootUnreadable,
 } from "./factoryHistoricalTermination.ts";
-import { criterionToken, outputRootName } from "./factoryCoordination.ts";
+import {
+  criterionToken,
+  outputRootName,
+  parentAcceptance,
+  type PinnedFile,
+} from "./factoryCoordination.ts";
 import * as FactoryTracker from "./FactoryTracker.ts";
 import * as FactoryTransferStore from "./FactoryTransferStore.ts";
 import type { FactoryTransferInput } from "./factoryTransfers.ts";
@@ -1053,7 +1058,11 @@ const layerGitHubRestFake = Layer.effect(
                   ([key, issue]) =>
                     key.startsWith(`${repository}#`) && issue.parentNumber === target.number,
                 )
-                .map(([, issue]) => relatedJson(repository, issue.number));
+                // GitHub lists each sub-issue whole, its current body included.
+                .map(([, issue]) => ({
+                  ...relatedJson(repository, issue.number),
+                  body: issue.body,
+                }));
               return ok((query.get("page") ?? "1") === "1" ? children : []);
             }
             if (relationMatch[3] === "sub_issues" && method === "POST") {
@@ -12916,6 +12925,377 @@ it.effect(
           yield* advance("restart");
           assert.strictEqual((yield* closeRequests) - patchesBefore, 3);
           assert.strictEqual(yield* dispositionOf(7601), "done");
+        }),
+      ),
+    ),
+);
+
+/** A parent's criteria proposal as a competent triage worker reports it: its acceptance, quoted. */
+const criteriaProposalFor = (
+  issue: number,
+  body: string,
+  itemVersion: string,
+  ids: ReadonlyArray<string>,
+  needs: Record<string, { readonly kind: "qualification"; readonly what: string }> = {},
+) => ({
+  schema: "factory-parent-criteria-proposal/1" as const,
+  issue,
+  basis: { bodySha256: sha256(body), itemVersion },
+  clauses: parentAcceptance(body).items.map((item, at) => ({
+    id: ids[at]!,
+    source: { start: item.start, end: item.end, sha256: item.sha256, excerpt: item.excerpt },
+    ...(needs[ids[at]!] === undefined ? {} : { needs: needs[ids[at]!]! }),
+  })),
+});
+
+/** Criteria a project policy prepared for a parent's body, as the exact bytes it sends. */
+const preparedCriteriaFor = (
+  issue: number,
+  body: string,
+  clauses: ReadonlyArray<{ readonly id: string } & Record<string, unknown>>,
+  kept: ReadonlyArray<unknown> = [],
+) => {
+  const document = {
+    schema: "factory-parent-criteria/1",
+    issue,
+    version: "auto-test",
+    bodySha256: sha256(body),
+    clauses: [
+      ...parentAcceptance(body).items.map((item, at) => ({
+        required: true,
+        state: "open",
+        source: {
+          kind: "issue_acceptance",
+          ref: `https://github.com/${claimRepository}/issues/${issue}#${item.anchor}`,
+          start: item.start,
+          end: item.end,
+          sha256: item.sha256,
+          excerpt: item.excerpt,
+        },
+        evidence: [],
+        ...clauses[at],
+      })),
+      ...kept,
+    ],
+    preparation: { schema: "factory-parent-preparation/1", ignored: [] },
+  };
+  const bytes = `${JSON.stringify(document, null, 2)}\n`;
+  return { bytes, sha256: sha256(bytes) };
+};
+
+type Prepared = ReturnType<typeof preparedCriteriaFor>;
+
+/**
+ * A policy for one parent with no Root route, as the auto-preparing helper decides it: triage
+ * while no verified proposal names the parent's current text, then closure on the criteria it
+ * prepared. Other items work only once the test lets them.
+ */
+const preparingPolicy = (
+  parent: number,
+  state: {
+    ready: Set<number>;
+    prepared: (Prepared & { readonly adopted?: PinnedFile }) | undefined;
+    retriage: boolean;
+  },
+): ProposeFn => {
+  return (input) => {
+    const issue = Number(input.observation.itemKey.split("#")[1]);
+    if (issue !== parent) {
+      return state.ready.has(issue)
+        ? stageRequest(input)
+        : Effect.succeed({ type: "none" as const, reason: "not yet" });
+    }
+    if (!state.ready.has(parent)) return Effect.succeed({ type: "none" as const, reason: "later" });
+    const current = input.outcomes.some(
+      (outcome) =>
+        outcome.state === "verified" &&
+        outcome.report.outcome === "criteria_proposed" &&
+        outcome.report.criteria?.basis.itemVersion === input.observation.itemVersion,
+    );
+    if (state.retriage || (!current && state.prepared === undefined)) return triageRequest(input);
+    return state.prepared === undefined
+      ? Effect.succeed({ type: "none" as const, reason: "prepared; reconciling" })
+      : Effect.succeed({ type: "proceed" as const, parentClosure: { prepared: state.prepared } });
+  };
+};
+
+const parentWaitsOn = (issue: number, detail: string) =>
+  Effect.gen(function* () {
+    const record = yield* recordOf(issue);
+    assert.include(record?.detail ?? "", detail, JSON.stringify(record));
+    assert.strictEqual(record?.disposition, "nothing_proposed");
+    assert.strictEqual(
+      (yield* GitHubFake).issues.get(issueKey(claimRepository, issue))!.state,
+      "open",
+    );
+  });
+
+it.effect(
+  "Parent/P2: a parent with no Root route is prepared once, its untrusted criteria revalidated by T3, and closed once on its own landings",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          yield* configureLifecycleFactory;
+          const criteriaRoot = yield* fs.realPath(yield* fs.makeTempDirectoryScoped());
+          yield* configureFactory(
+            lifecycleConfiguration({ parents: { close: "project", criteriaRoot } }),
+          );
+          const e1 = "**E1:** the export writes one row per settlement.";
+          const e2 = "**E2:** the export names its source file.";
+          const body = `Export settlements.\n\n## Acceptance\n- ${e1}\n- ${e2}\n`;
+          const parent = yield* seedIssue(7701, { body });
+          // Each member's own acceptance quotes the clause it carries; 7704 quotes none.
+          yield* seedIssue(7702, { parentNumber: 7701, body: `Rows.\n\n## Acceptance\n- ${e1}\n` });
+          const carrier = yield* seedIssue(7703, {
+            parentNumber: 7701,
+            body: `Names.\n\n## Acceptance\n- ${e2}\n`,
+          });
+          yield* seedIssue(7704, { parentNumber: 7701, body: "Tidy the logs." });
+          const state = {
+            ready: new Set([7702]),
+            prepared: undefined as (Prepared & { readonly adopted?: PinnedFile }) | undefined,
+            retriage: false,
+          };
+          yield* usePolicy(preparingPolicy(7701, state));
+          yield* landThroughT3(7702, "c0007702");
+          state.ready = new Set([7704]);
+          yield* landThroughT3(7704, "c0007704");
+          const [k2, k3, k4] = [7702, 7703, 7704].map((n) => `github:${claimRepository}#${n}`);
+
+          // One preparation through the existing triage stage; unchanged passes add none.
+          state.ready = new Set([7701]);
+          const triage = admittedBy(yield* advance("clock"));
+          assert.deepStrictEqual(stageOf(triage), [itemKeyFor(7701), "triage"]);
+          for (const trigger of ["restart", "clock"] as const) {
+            assert.deepStrictEqual(admittedOnly(yield* advance(trigger)), []);
+          }
+          yield* workStage(triage, {
+            outcome: "criteria_proposed",
+            summary: "Two clauses, quoted from the current acceptance.",
+            criteria: criteriaProposalFor(7701, body, admittedVersion(triage), ["E1", "E2"]),
+          });
+          assert.deepStrictEqual(admittedOnly(yield* advance("outcome")), []);
+          assert.deepStrictEqual(yield* itemHistory(7701), ["triage", "criteria_proposed"]);
+          // A policy asking again on the same text is not paid for.
+          state.retriage = true;
+          assert.deepStrictEqual(admittedOnly(yield* advance("clock")), []);
+          assert.strictEqual((yield* recordOf(7701))?.reasonClass, "prepared");
+          state.retriage = false;
+
+          // T3 judges the prepared clauses only by its own records: 7702 landed, 7703 did not.
+          const good = preparedCriteriaFor(7701, body, [
+            { id: "E1", evidence: [{ itemKey: k2, scope: e1 }] },
+            { id: "E2", evidence: [{ itemKey: k3, scope: e2 }] },
+          ]);
+          state.prepared = good;
+          yield* advance("clock");
+          yield* parentWaitsOn(
+            7701,
+            `clause E2 is missing: ${k3}: it has no verified implemented head`,
+          );
+          // A closed member without a landing proves nothing.
+          carrier.state = "closed";
+          yield* advance("clock");
+          yield* parentWaitsOn(
+            7701,
+            `clause E2 is missing: ${k3}: it has no verified implemented head`,
+          );
+          carrier.state = "open";
+
+          // Spoofed criteria: a landed member that does not quote the clause, or a moved span.
+          state.prepared = preparedCriteriaFor(7701, body, [
+            { id: "E1", evidence: [{ itemKey: k2, scope: e1 }] },
+            { id: "E2", evidence: [{ itemKey: k4, scope: e2 }] },
+          ]);
+          yield* advance("clock");
+          yield* parentWaitsOn(
+            7701,
+            "the prepared criteria do not match T3's reads: clause E2 cites evidence",
+          );
+          const moved = JSON.parse(good.bytes) as { clauses: Array<{ source: { start: number } }> };
+          moved.clauses[0]!.source.start += 1;
+          const movedBytes = JSON.stringify(moved);
+          state.prepared = { bytes: movedBytes, sha256: sha256(movedBytes) };
+          yield* advance("clock");
+          yield* parentWaitsOn(7701, "clause E1 is not the required acceptance item");
+          state.prepared = { bytes: good.bytes, sha256: sha256("other bytes") };
+          yield* advance("clock");
+          yield* parentWaitsOn(7701, "the prepared criteria are not the JSON their sha256 names");
+
+          // An edit of the parent makes its preparation stale: closure waits, then one new triage.
+          state.prepared = good;
+          parent.body = body.replace("settlements.", "settlements. A coordination note.");
+          yield* advance("clock");
+          yield* parentWaitsOn(7701, "has no verified criteria proposal for its current text");
+          state.prepared = undefined;
+          const again = admittedBy(yield* advance("clock"));
+          assert.deepStrictEqual(stageOf(again), [itemKeyFor(7701), "triage"]);
+          yield* workStage(again, {
+            outcome: "criteria_proposed",
+            summary: "Same clauses on the edited text.",
+            criteria: criteriaProposalFor(7701, parent.body, admittedVersion(again), ["E1", "E2"]),
+          });
+          yield* advance("outcome");
+          const current = preparedCriteriaFor(7701, parent.body, [
+            { id: "E1", evidence: [{ itemKey: k2, scope: e1 }] },
+            { id: "E2", evidence: [{ itemKey: k3, scope: e2 }] },
+          ]);
+          state.prepared = current;
+          yield* advance("clock");
+          yield* parentWaitsOn(7701, `clause E2 is missing: ${k3}`);
+
+          // E2's carrier lands: T3 keeps the exact bytes under the criteria root and closes once.
+          state.ready = new Set([7701, 7703]);
+          yield* landThroughT3(7703, "c0007703");
+          yield* advance("clock");
+          const github = yield* GitHubFake;
+          const closed = github.issues.get(issueKey(claimRepository, 7701))!;
+          assert.strictEqual(closed.state, "closed");
+          const kept = path.join(criteriaRoot, `parent-7701-${current.sha256}.json`);
+          assert.strictEqual(yield* fs.readFileString(kept), current.bytes);
+          const closing = closed.comments.filter((comment) =>
+            comment.body.includes(`adopted criteria (sha256 ${current.sha256})`),
+          );
+          assert.strictEqual(closing.length, 1);
+          assert.include(closing[0]!.body, `Clause E1 (${e1}): ${k2} landed`);
+          assert.include(closing[0]!.body, `Clause E2 (${e2}): ${k3} landed`);
+          const requests = yield* closeRequests;
+          for (const trigger of ["restart", "clock", "owner_decision"] as const) {
+            yield* advance(trigger);
+          }
+          assert.strictEqual(yield* closeRequests, requests);
+          assert.strictEqual(yield* dispositionOf(7701), "done");
+          assert.deepStrictEqual(
+            (yield* itemHistory(7701)).filter((entry) => entry === "triage"),
+            ["triage", "triage"],
+          );
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Parent/P3: prepared criteria keep every hold: Root's adoption is T3's own lookup, and a reserved clause waits on its own actor",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          yield* configureLifecycleFactory;
+          const criteriaRoot = yield* fs.realPath(yield* fs.makeTempDirectoryScoped());
+          yield* configureFactory(
+            lifecycleConfiguration({ parents: { close: "project", criteriaRoot } }),
+          );
+          const h1 = "**H1:** the importer keeps one row per source line.";
+          const h2 = "**H2:** the export is certified.";
+          const body = `Import and export.\n\n## Completion criteria\n- [x] ${h1}\n- [ ] ${h2}\n`;
+          yield* seedIssue(7711, { body });
+          yield* seedIssue(7712, { parentNumber: 7711, body: `Rows.\n\n## Acceptance\n- ${h1}\n` });
+          const wholeParent = {
+            id: "whole-parent",
+            required: true,
+            source: { kind: "owner_decision", ref: "q" },
+            state: "reserved",
+            reserved: {
+              actor: "owner",
+              action: "approve the whole parent",
+              resume: "the owner approves",
+            },
+          };
+          const adoptedText = JSON.stringify({
+            schema: "factory-parent-criteria/1",
+            issue: 7711,
+            version: "root-1",
+            bodySha256: "0".repeat(64),
+            clauses: [wholeParent],
+          });
+          yield* fs.makeDirectory(path.join(criteriaRoot, "adopted"));
+          yield* fs.writeFileString(path.join(criteriaRoot, "adopted", "7711.json"), adoptedText);
+          const adopted = {
+            root: criteriaRoot,
+            path: "adopted/7711.json",
+            sha256: sha256(adoptedText),
+          };
+          const state = {
+            ready: new Set([7712]),
+            prepared: undefined as (Prepared & { readonly adopted?: PinnedFile }) | undefined,
+            retriage: false,
+          };
+          yield* usePolicy(preparingPolicy(7711, state));
+          yield* landThroughT3(7712, "c0007712");
+          state.ready = new Set([7711]);
+          const triage = admittedBy(yield* advance("clock"));
+          yield* workStage(triage, {
+            outcome: "criteria_proposed",
+            summary: "H2 needs a qualified certifier.",
+            criteria: criteriaProposalFor(7711, body, admittedVersion(triage), ["H1", "H2"], {
+              H2: { kind: "qualification", what: "who certifies the export" },
+            }),
+          });
+          yield* advance("outcome");
+          const k12 = `github:${claimRepository}#7712`;
+          const h2Hold = {
+            actor: "owner or the qualified authority the project names",
+            action: "settle qualification for clause H2: who certifies the export",
+            resume: "#7711's acceptance or an adopted decision states it, prepared again",
+          };
+          const clauses = [
+            { id: "H1", evidence: [{ itemKey: k12, scope: h1 }] },
+            { id: "H2", state: "reserved", reserved: h2Hold },
+          ];
+          const exact = preparedCriteriaFor(7711, body, clauses, [wholeParent]);
+          const tries: ReadonlyArray<
+            readonly [Prepared & { readonly adopted?: PinnedFile }, string]
+          > = [
+            // Leaving Root's adoption out cannot drop its whole-parent hold.
+            [exact, "the prepared closure does not carry #7711's adopted criteria adopted"],
+            [{ ...preparedCriteriaFor(7711, body, clauses), adopted }, "1 kept holds need 3"],
+            [
+              {
+                ...preparedCriteriaFor(7711, body, [clauses[0]!, { id: "H2" }], [wholeParent]),
+                adopted,
+              },
+              "clause H2 is open, not reserved",
+            ],
+            [
+              {
+                ...preparedCriteriaFor(
+                  7711,
+                  body,
+                  [clauses[0]!, { id: "H2", state: "revised", revision: "dropped" }],
+                  [wholeParent],
+                ),
+                adopted,
+              },
+              "clause H2 is revised, not reserved",
+            ],
+            // Every hold kept: H1 is proved, and H2 waits on the actor its own hold names.
+            [{ ...exact, adopted }, "Actor: owner or the qualified authority the project names"],
+          ];
+          for (const [prepared, detail] of tries) {
+            state.prepared = prepared;
+            yield* advance("clock");
+            yield* parentWaitsOn(7711, detail);
+          }
+          yield* parentWaitsOn(
+            7711,
+            "clause H2 is reserved (H1=satisfied, H2=reserved, whole-parent=reserved)",
+          );
+          // Two adoptions for one parent are Root's to settle, never the policy's choice.
+          yield* fs.writeFileString(
+            path.join(criteriaRoot, "second.json"),
+            adoptedText.replace("root-1", "root-2"),
+          );
+          yield* advance("clock");
+          yield* parentWaitsOn(7711, "#7711 has 2 Root-adopted criteria documents");
+          assert.deepStrictEqual(
+            (yield* fs.readDirectory(criteriaRoot)).filter((name) => name.startsWith("parent-")),
+            [],
+          );
         }),
       ),
     ),

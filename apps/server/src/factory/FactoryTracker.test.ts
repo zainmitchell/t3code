@@ -474,6 +474,21 @@ it.effect("a parent's sub-issues are read on every page, each in its own reposit
     assert.strictEqual(listed.length, 101);
     assert.deepStrictEqual(listed[0], { repository: "acme/web", number: 2, state: "open" });
     assert.deepStrictEqual(listed[100], { repository: "acme/other", number: 102, state: "open" });
+    // Each child's current body comes with the listing; GitHub's null is an empty body, and a
+    // body the listing omits stays unknown.
+    const bodies = yield* withSession(
+      () =>
+        Effect.succeed([
+          { number: 2, state: "open", body: "## Acceptance\n- N1: kept." },
+          { number: 3, state: "closed", body: null },
+          { number: 4, state: "open" },
+        ]),
+      (session) => session.listSubIssues!({ repository: "acme/web", issueNumber: 1 }),
+    );
+    assert.deepStrictEqual(
+      bodies.map((child) => ("body" in child ? child.body : "unknown")),
+      ["## Acceptance\n- N1: kept.", "", "unknown"],
+    );
     // A child whose state the listing omits is unread, never taken as open.
     const stateless = yield* withSession(
       () => Effect.succeed([{ number: 2 }]),

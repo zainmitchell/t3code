@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off - disposable repositories built with the git CLI.
 import * as NodeChildProcess from "node:child_process";
+import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
@@ -8,6 +9,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
   CommandId,
+  type FactoryCriteriaProposal,
   FactoryDecisionKey,
   FactoryId,
   FactoryItemKey,
@@ -23,6 +25,7 @@ import {
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as SqlClient from "effect/sql/SqlClient";
 
 import * as ServerConfig from "../config.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
@@ -31,9 +34,11 @@ import type * as ProviderSessionManager from "../orchestration-v2/ProviderSessio
 import * as ProjectService from "../project/ProjectService.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
+import { parentAcceptance } from "./factoryCoordination.ts";
 import type { FactoryCustody } from "./factoryCustody.ts";
 import type * as FactoryExecutionGenerations from "./FactoryExecutionGenerations.ts";
 import * as FactoryGitReadback from "./FactoryGitReadback.ts";
+import { encodeItemEvent } from "./factoryItemEvents.ts";
 import * as FactoryOutcomeStore from "./FactoryOutcomeStore.ts";
 import { makeFactoryOutcomes } from "./factoryOutcomes.ts";
 import type * as FactoryStore from "./FactoryStore.ts";
@@ -619,5 +624,146 @@ it.effect("verifies a proposal's candidate base only as T3 reads it on the integ
         assert.deepStrictEqual(fixture.ancestryReads, row.ancestryReads, row.name);
       }).pipe(Effect.provide(layerTest));
     }
+  }),
+);
+
+const parentBody =
+  "Parent.\n\n## Acceptance\n- **P1:** the import keeps order.\n- **P2:** the rule in [this](https://github.com/example/connector/issues/131#issuecomment-9) holds.\n";
+const parentItems = parentAcceptance(parentBody).items;
+const criteriaReport = (change: (proposal: FactoryCriteriaProposal) => FactoryCriteriaProposal) =>
+  ({
+    outcome: "criteria_proposed",
+    summary: "Two clauses.",
+    criteria: change({
+      schema: "factory-parent-criteria-proposal/1",
+      issue: 131,
+      basis: {
+        bodySha256: NodeCrypto.createHash("sha256").update(parentBody).digest("hex"),
+        itemVersion: "version:1",
+      },
+      clauses: parentItems.map((item, at) => ({
+        id: `P${at + 1}`,
+        source: { start: item.start, end: item.end, sha256: item.sha256, excerpt: item.excerpt },
+        ...(at === 1
+          ? { comments: [{ id: "9", start: 0, end: 4, sha256: "a".repeat(64), excerpt: "Rule" }] }
+          : {}),
+      })),
+    }),
+  }) as const;
+
+it.effect("verifies a parent's criteria only as exact quotes of the text its triage read", () =>
+  Effect.gen(function* () {
+    const cases: ReadonlyArray<{
+      readonly name: string;
+      readonly change?: (proposal: FactoryCriteriaProposal) => FactoryCriteriaProposal;
+      readonly admittedBody?: string | null;
+      readonly expected: string;
+    }> = [
+      { name: "the exact acceptance", expected: "verified" },
+      {
+        name: "another item version",
+        change: (proposal) => ({
+          ...proposal,
+          basis: { ...proposal.basis, itemVersion: "version:0" },
+        }),
+        expected: "the criteria name item version version:0, not version:1",
+      },
+      {
+        name: "another issue",
+        change: (proposal) => ({ ...proposal, issue: 132 }),
+        expected: "the proposal is for #132, not #131",
+      },
+      {
+        name: "text the triage did not read",
+        admittedBody: `${parentBody}\n`,
+        expected: "the proposal names body",
+      },
+      {
+        name: "a dropped clause",
+        change: (proposal) => ({ ...proposal, clauses: proposal.clauses.slice(0, 1) }),
+        expected: "the proposal names 1 clauses; the acceptance has 2 items",
+      },
+      {
+        name: "a shifted quote",
+        change: (proposal) => ({
+          ...proposal,
+          clauses: proposal.clauses.map((clause, at) =>
+            at === 0
+              ? {
+                  ...clause,
+                  source: {
+                    ...clause.source,
+                    start: clause.source.start + 1,
+                    end: clause.source.end + 1,
+                  },
+                }
+              : clause,
+          ),
+        }),
+        expected: "clause P1 does not quote the item at",
+      },
+      {
+        name: "a cited comment left unquoted",
+        change: (proposal) => ({
+          ...proposal,
+          clauses: proposal.clauses.map(({ comments: _comments, ...clause }) => clause),
+        }),
+        expected: "clause P2 quotes other comments than its text cites (9)",
+      },
+      {
+        name: "no kept text of the admitted triage",
+        admittedBody: null,
+        expected: "T3 kept no text of the issue this triage read",
+      },
+    ];
+    for (const row of cases) {
+      yield* Effect.gen(function* () {
+        const fixture = yield* makeFixture(btc131(), { reservation: triage });
+        if (row.admittedBody !== null) {
+          const sql = yield* SqlClient.SqlClient;
+          const record = yield* encodeItemEvent({
+            type: "admitted",
+            stage: "triage",
+            reservationId,
+            stageBasis: triage.stageBasis!,
+            issueText: { title: "Parent", body: row.admittedBody ?? parentBody },
+          });
+          yield* sql`INSERT INTO factory_item_events (factory_id, item_key, record_json)
+            VALUES (${factoryId}, ${triage.itemKey}, ${record})`;
+        }
+        const { outcomeId } = yield* fixture.ops.report({
+          threadId,
+          report: criteriaReport(row.change ?? ((proposal) => proposal)),
+        });
+        yield* fixture.ops.reconcile(factoryId);
+        const outcome = Option.getOrThrow(yield* fixture.outcomes.get(outcomeId));
+        assert.include(
+          outcome.state === "rejected" ? outcome.rejection : outcome.state,
+          row.expected,
+          row.name,
+        );
+      }).pipe(Effect.provide(layerTest));
+    }
+    // The payload is required with its outcome, and refused with any other.
+    yield* Effect.gen(function* () {
+      const fixture = yield* makeFixture(btc131(), { reservation: triage });
+      const { criteria } = criteriaReport((proposal) => proposal);
+      const missing = yield* Effect.flip(
+        fixture.ops.report({
+          threadId,
+          report: { outcome: "criteria_proposed", summary: "None." },
+        }),
+      );
+      const stray = yield* Effect.flip(
+        fixture.ops.report({
+          threadId,
+          report: { outcome: "not_actionable", summary: "Held.", failure: "hold: owner", criteria },
+        }),
+      );
+      assert.deepStrictEqual(
+        [missing.code, stray.code],
+        ["subject_missing", "outcome_not_expected"],
+      );
+    }).pipe(Effect.provide(layerTest));
   }),
 );

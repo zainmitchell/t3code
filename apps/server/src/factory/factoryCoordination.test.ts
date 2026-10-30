@@ -1,3 +1,6 @@
+// @effect-diagnostics nodeBuiltinImport:off - clause digests are sha256.
+import * as NodeCrypto from "node:crypto";
+
 import { assert, describe, it } from "@effect/vitest";
 import { FactoryId, FactoryItemKey } from "@t3tools/contracts";
 import * as Option from "effect/Option";
@@ -11,6 +14,8 @@ import {
   landingOf,
   namesPolicy,
   outputRootName,
+  parentAcceptance,
+  preparedCriteriaProblems,
   reconcileCriteria,
 } from "./factoryCoordination.ts";
 import type * as FactoryOutcomeStore from "./FactoryOutcomeStore.ts";
@@ -281,5 +286,145 @@ describe("reconcileCriteria", () => {
     );
     assert.include(clauses[1]!.why ?? "", "accepted");
     assert.strictEqual(clauses[0]!.landed[0]!.commit, merge);
+  });
+});
+
+describe("parent criteria preparation", () => {
+  const sha = (text: string) => NodeCrypto.createHash("sha256").update(text).digest("hex");
+  const b1 = "**B1:** the importer keeps one row per source line.";
+  const b2 =
+    "B2: the export cites [the rule](https://github.com/example-org/btc/issues/40#issuecomment-77).";
+  const body = `Intro 🙂.\n\n## Completion criteria\n- [x] ${b1}\n- ${b2}\n\n<details>\n\n- old: not acceptance\n</details>\n`;
+  const rule = "Rule: a duplicate is refused.";
+  const comments = [{ id: 77, body: rule }];
+  const items = parentAcceptance(body).items;
+  const proposal = {
+    schema: "factory-parent-criteria-proposal/1" as const,
+    issue: 40,
+    basis: { bodySha256: sha(body), itemVersion: "v40" },
+    clauses: items.map((item, at) => ({
+      id: ["B1", "B2"][at]!,
+      source: { start: item.start, end: item.end, sha256: item.sha256, excerpt: item.excerpt },
+      ...(at === 1
+        ? { comments: [{ id: "77", start: 0, end: 5, sha256: sha(rule), excerpt: "Rule:" }] }
+        : {}),
+    })),
+  };
+  const hold = { actor: "owner", action: "approve the whole parent", resume: "the owner approves" };
+  const wholeParent = {
+    id: "whole-parent",
+    required: true,
+    source: { kind: "owner_decision", ref: "q" },
+    state: "reserved",
+    reserved: hold,
+  };
+  const adopted = {
+    schema: "factory-parent-criteria/1",
+    issue: 40,
+    version: "root-1",
+    bodySha256: "0".repeat(64),
+    clauses: [wholeParent],
+  };
+  const carrier = { itemKey: `github:${repository}#41`, body: `## Acceptance\n- ${b1}\n` };
+  const document = {
+    schema: "factory-parent-criteria/1",
+    issue: 40,
+    version: "auto",
+    bodySha256: sha(body),
+    clauses: [
+      ...items.map((item, at) => ({
+        id: ["B1", "B2"][at]!,
+        required: true,
+        state: "open",
+        source: {
+          kind: "issue_acceptance",
+          ref: `https://github.com/${repository}/issues/40#completion-criteria`,
+          start: item.start,
+          end: item.end,
+          sha256: item.sha256,
+          excerpt: item.excerpt,
+          ...(at === 1 ? { comments: proposal.clauses[1]!.comments } : {}),
+        },
+        evidence: at === 0 ? [{ itemKey: carrier.itemKey, scope: b1 }] : [],
+      })),
+      wholeParent,
+    ],
+  };
+  const problems = (change: Partial<Parameters<typeof preparedCriteriaProblems>[0]> = {}) =>
+    preparedCriteriaProblems({
+      document,
+      issue: 40,
+      repository,
+      body,
+      comments,
+      children: [carrier],
+      adopted,
+      proposal,
+      ...change,
+    });
+  const edited = (edit: (clauses: Array<Record<string, unknown>>) => void) => {
+    const copy = structuredClone(document) as { clauses: Array<Record<string, unknown>> };
+    edit(copy.clauses);
+    return copy;
+  };
+
+  it("reads the current acceptance by code points, never history or fences", () => {
+    assert.deepStrictEqual(
+      items.map((item) => [item.excerpt, item.checked, item.anchor]),
+      [
+        [b1, true, "completion-criteria"],
+        [b2, false, "completion-criteria"],
+      ],
+    );
+    // The emoji before it is one code point, so the offset is not the UTF-16 index.
+    assert.strictEqual(items[0]!.start, body.indexOf(b1) - 1);
+  });
+
+  it("accepts prepared criteria only where T3's own reads support every clause and hold", () => {
+    assert.deepStrictEqual(problems(), []);
+    const rows: ReadonlyArray<readonly [string, ReturnType<typeof problems>[number]]> = [
+      [
+        problems({ document: edited((clauses) => (clauses[0]!.id = "B9")) }).join(),
+        "clause 1 is not B1",
+      ],
+      [
+        problems({ document: edited((clauses) => clauses.pop()) }).join(),
+        "2 acceptance items and 1 kept holds need 3",
+      ],
+      [
+        problems({
+          document: edited((clauses) => (clauses[2]!.reserved = { ...hold, actor: "anyone" })),
+        }).join(),
+        "the adopted hold whole-parent is not kept as adopted",
+      ],
+      // A member whose body T3 did not read carries nothing.
+      [problems({ children: [{ itemKey: carrier.itemKey }] }).join(), "clause B1 cites evidence"],
+      [
+        problems({ comments: [{ id: 77, body: "Rule: a duplicate is merged." }] }).join(),
+        "does not quote comment 77 as T3 read it",
+      ],
+      [
+        problems({ adopted: { ...adopted, clauses: [] } }).join(),
+        "not a usable factory-parent-criteria/1",
+      ],
+      [
+        problems({ document: edited((clauses) => (clauses[1]!.state = "revised")) }).join(),
+        "clause B2 is revised, not open",
+      ],
+      [problems({ body: `${body}x` }).join(), "the proposal names body"],
+    ];
+    for (const [found, expected] of rows) assert.include(found, expected);
+  });
+
+  it("keeps a reserved clause's hold through the criteria decoder", () => {
+    const decoded = Option.getOrThrow(decodeCriteria(JSON.stringify(document)));
+    assert.deepStrictEqual(
+      decoded.clauses.map((clause) => [clause.id, clause.state, clause.reserved]),
+      [
+        ["B1", "open", undefined],
+        ["B2", "open", undefined],
+        ["whole-parent", "reserved", hold],
+      ],
+    );
   });
 });
