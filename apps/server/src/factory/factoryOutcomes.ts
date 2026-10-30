@@ -334,24 +334,32 @@ export const makeFactoryOutcomes = (deps: FactoryOutcomeDependencies) => {
           return { rejected: `base ${base} is not an ancestor of head ${head}` } as const;
         }
         // Unverifiable evidence is not refused, it is simply not evidence: it earns no new review.
-        const evidenceDigest =
-          report.artifacts === undefined || report.artifacts.length === 0
-            ? undefined
-            : yield* deps.verifyEvidence(configuration.artifactRoot, report.artifacts);
-        // A no-edit unit proves itself only by its receipt among artifacts T3 verified.
+        // A no-edit unit proves itself only by its receipt, judged on one read of each artifact:
+        // the bytes whose sha256 matches the report are the bytes the receipt is read from.
         const noEdit = /\|ne:[0-9a-f]{32}/.exec(basis)?.[0];
         if (noEdit !== undefined) {
-          if (evidenceDigest === undefined) {
-            return {
-              rejected:
-                "noedit_artifacts_unverified: a no-edit unit's artifacts are missing or unverified",
-            } as const;
-          }
-          const artifacts = [];
+          const artifacts: Array<{ path: string; sha256: string; text: string }> = [];
           for (const artifact of report.artifacts ?? []) {
             const read = yield* deps.readArtifact(configuration.artifactRoot, artifact.path);
-            artifacts.push({ path: artifact.path, sha256: read?.sha256, text: read?.text });
+            if (read === undefined || read.sha256 !== artifact.sha256.toLowerCase()) {
+              return {
+                rejected: `noedit_artifacts_unverified: ${artifact.path} is unreadable or not the bytes its sha256 names`,
+              } as const;
+            }
+            artifacts.push({ path: artifact.path, sha256: read.sha256, text: read.text });
           }
+          if (artifacts.length === 0) {
+            return {
+              rejected: "noedit_artifacts_unverified: a no-edit unit lists no artifacts",
+            } as const;
+          }
+          const evidenceDigest = sha256(
+            canonical(
+              artifacts
+                .map((artifact) => [artifact.path, artifact.sha256] as const)
+                .toSorted(([a], [b]) => a.localeCompare(b)),
+            ),
+          );
           const proved = noEditReceiptProblem({
             basis: noEdit,
             itemKey: outcome.itemKey,
@@ -365,6 +373,10 @@ export const makeFactoryOutcomes = (deps: FactoryOutcomeDependencies) => {
           }
           return { accepted: true, evidenceDigest, noEdit: proved.receipt } as const;
         }
+        const evidenceDigest =
+          report.artifacts === undefined || report.artifacts.length === 0
+            ? undefined
+            : yield* deps.verifyEvidence(configuration.artifactRoot, report.artifacts);
         return { accepted: true, evidenceDigest } as const;
       }
       case "review_passed":

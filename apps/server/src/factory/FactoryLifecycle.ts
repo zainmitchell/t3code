@@ -179,6 +179,17 @@ const isPolicyFailure = (
 ): proposal is FactoryPolicyFailure =>
   !Array.isArray(proposal) && "type" in proposal && proposal.type === "policy_failed";
 
+/** The identity of an owner gate asked on its evidence, as gates were before questions had names. */
+const evidenceGateId = (input: {
+  readonly factoryId: string;
+  readonly itemKey: string;
+  readonly stage: string;
+  readonly evidenceDigest: string;
+}) =>
+  sha256(
+    [input.factoryId, input.itemKey, input.stage, "gate", input.evidenceDigest, "0"].join("\n"),
+  ).slice(0, 40);
+
 /** The identity of an owner gate the policy names by its question rather than its evidence. */
 const gateDecisionId = (input: {
   readonly factoryId: string;
@@ -210,12 +221,14 @@ const overtakenBy = (
   if (isProceed(decision) && decision.parentClosure?.ownerDecisionId === pending.decisionId) {
     return undefined;
   }
-  if (
-    isReservationRequest(decision) &&
-    decision.question !== undefined &&
-    pending.decisionId === gateDecisionId({ ...pending, question: decision.question })
-  ) {
-    return undefined;
+  if (isReservationRequest(decision) && decision.question !== undefined) {
+    // The gate still asks when it is this question, or the same evidence asked before questions
+    // were named; any other pending gate is another question.
+    return pending.decisionId === gateDecisionId({ ...pending, question: decision.question }) ||
+      (pending.decisionId === evidenceGateId(pending) &&
+        pending.evidenceDigest === decision.evidenceDigest)
+      ? undefined
+      : "the policy now asks another question";
   }
   const asks = isReservationRequest(decision)
     ? { kind: "gate", evidenceDigest: decision.evidenceDigest }
@@ -1902,10 +1915,16 @@ export const preparationDueOf = (input: {
   readonly labels: ReadonlyArray<string>;
   readonly itemVersion: string;
   readonly outcomes: ReadonlyArray<FactoryPolicyOutcome>;
-  readonly triage: { readonly key: FactoryDecisionKey; readonly failed?: FactoryPolicyOutcome };
+  readonly triage: {
+    readonly keys: ReadonlySet<FactoryDecisionKey>;
+    readonly failed?: FactoryPolicyOutcome;
+  };
 }): FactoryPolicyItem["preparation"] => {
   const tried = input.outcomes.some(
-    (outcome) => outcome.stage === "triage" && outcome.decisionKey === input.triage.key,
+    (outcome) =>
+      outcome.stage === "triage" &&
+      outcome.decisionKey !== undefined &&
+      input.triage.keys.has(outcome.decisionKey),
   );
   if (tried) return undefined;
   const failed = input.triage.failed;
@@ -1929,14 +1948,35 @@ const triageDecisionOf = (
   outcomes: ReadonlyArray<FactoryPolicyOutcome>,
   readback?: string,
 ) => {
-  const keyOf = (basis: string, exactPolicy = false) =>
-    decisionKeyOf({ ...input, taskKind: "triage", stage: { type: "triage", basis } }, observation, {
-      exactPolicy,
-    });
+  const keyOf = (basis: string) =>
+    decisionKeyOf({ ...input, taskKind: "triage", stage: { type: "triage", basis } }, observation);
+  // Earlier builds keyed a preparation by its exact revision, configuration pin included. Each
+  // revision recorded on this item under the same policy identity names the same decision.
+  const identity = policyIdentityOf(input.policyRevision);
+  const revisions = new Set([
+    input.policyRevision,
+    ...outcomes.flatMap((outcome) =>
+      outcome.stage === "triage" &&
+      outcome.policyRevision !== undefined &&
+      policyIdentityOf(outcome.policyRevision) === identity
+        ? [outcome.policyRevision]
+        : [],
+    ),
+  ]);
+  const keysOf = (basis: string): ReadonlySet<FactoryDecisionKey> =>
+    new Set([
+      keyOf(basis),
+      ...[...revisions].map((policyRevision) =>
+        decisionKeyOf(
+          { ...input, policyRevision, taskKind: "triage", stage: { type: "triage", basis } },
+          observation,
+          { exactPolicy: true },
+        ),
+      ),
+    ]);
   const first = triageBasis(observation.itemVersion);
   const firstKey = keyOf(first);
-  // Preparations recorded while keys still named the configuration pin count as this one.
-  const firstKeys = new Set([firstKey, keyOf(first, true)]);
+  const firstKeys = keysOf(first);
   // A preparation that stopped on routine coordination ended without a usable result too: the
   // factory prepares it again, once per gap and readback, instead of parking it for a person.
   const failed = outcomes.findLast(
@@ -1949,11 +1989,9 @@ const triageDecisionOf = (
         (outcome.report.outcome === "not_actionable" && isRoutineGap(outcome.report.failure))) &&
       outcome.failureDigest !== undefined,
   );
-  if (failed?.failureDigest === undefined) {
-    return { basis: first, key: firstKey, exactKey: keyOf(first, true) };
-  }
+  if (failed?.failureDigest === undefined) return { basis: first, key: firstKey, keys: firstKeys };
   const basis = triageBasis(observation.itemVersion, failed.failureDigest, readback);
-  return { basis, key: keyOf(basis), exactKey: keyOf(basis, true), failed };
+  return { basis, key: keyOf(basis), keys: keysOf(basis), failed };
 };
 
 const make = Effect.gen(function* () {
@@ -3965,10 +4003,23 @@ const make = Effect.gen(function* () {
       const basis = retry.value.stageBasis;
       if (
         basis?.startsWith(retryBasis) !== true ||
-        decisionKeyOf(
-          { ...input, taskKind: "triage", stage: { type: "triage", basis } },
-          candidate.observation,
-        ) !== outcome.decisionKey
+        outcome.decisionKey === undefined ||
+        ![
+          decisionKeyOf(
+            { ...input, taskKind: "triage", stage: { type: "triage", basis } },
+            candidate.observation,
+          ),
+          decisionKeyOf(
+            {
+              ...input,
+              policyRevision: retry.value.policyRevision,
+              taskKind: "triage",
+              stage: { type: "triage", basis },
+            },
+            candidate.observation,
+            { exactPolicy: true },
+          ),
+        ].includes(outcome.decisionKey)
       ) {
         continue;
       }
@@ -4066,7 +4117,7 @@ const make = Effect.gen(function* () {
     const current = yield* triageDecisionFor(configuration, candidate, outcomes);
     if (current === undefined) return prepare(`${outcomeId}'s preparation cannot be read back now`);
     if ("unread" in current) return current.unread;
-    if (outcome.decisionKey !== current.key && outcome.decisionKey !== current.exactKey) {
+    if (outcome.decisionKey === undefined || !current.keys.has(outcome.decisionKey)) {
       return prepare(
         `${outcomeId} was prepared on other inputs than the item's current text, evidence and policy`,
       );
@@ -4630,6 +4681,14 @@ const make = Effect.gen(function* () {
                 grant.evidenceDigest === evidenceDigest,
             ).length
           : 0;
+      // A pending gate asked on the same evidence before its question had a name is that question.
+      if (question !== undefined && kind === "gate") {
+        const unnamed = evidenceGateId({ factoryId, itemKey, stage: stage.type, evidenceDigest });
+        const asked = (yield* outcomeStore.reservedDecisions(factoryId)).some(
+          (decision) => decision.decisionId === unnamed && decision.state === "pending",
+        );
+        if (asked) return;
+      }
       const reservedDecision = yield* outcomeStore.reserveDecision({
         // Its exact evidence identifies it, or the question the policy names: the same question
         // reworded is not asked again.
@@ -4776,6 +4835,16 @@ const make = Effect.gen(function* () {
           }),
           reasonClass: "waiting",
         };
+      }
+      for (const key of triage.keys) {
+        if (key === triage.key) continue;
+        const earlier = yield* store.findAdmission({ factoryId, decisionKey: key });
+        if (Option.isSome(earlier)) {
+          return {
+            admission: { type: "existing", reservation: earlier.value },
+            disposition: "existing",
+          };
+        }
       }
       const admission = yield* admit(
         {

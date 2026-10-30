@@ -925,7 +925,13 @@ export const NoEditRequirement = Schema.Struct({
   candidate: Sha40,
   base: Sha40,
   ownedFiles: Schema.Array(Schema.String).check(Schema.isMaxLength(0)),
-  checks: Schema.Array(NoEditText).check(Schema.isMinLength(1), Schema.isMaxLength(50)),
+  checks: Schema.Array(NoEditText).check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(50),
+    Schema.makeFilter((checks) => new Set(checks).size === checks.length, {
+      expected: "each check named once",
+    }),
+  ),
   // A policy may name no execution as null.
   execution: Schema.optional(Schema.NullOr(NoEditText)),
   instructionRevision: NoEditText,
@@ -1029,17 +1035,27 @@ export const noEditReceiptProblem = (input: {
   if (receipt.itemKey !== input.itemKey || receipt.itemVersion !== input.itemVersion) {
     return refuse("noedit_item_mismatch", "its receipt is for another item or item version");
   }
-  const reported = receipt.results.map((result) => result.check).toSorted();
-  if (reported.join("\n") !== [...requirement.checks].toSorted().join("\n")) {
+  // Exactly one result per admitted check, compared as values, never through a joined text.
+  const counts = new Map<string, number>();
+  for (const result of receipt.results) {
+    counts.set(result.check, (counts.get(result.check) ?? 0) + 1);
+  }
+  if (
+    receipt.results.length !== requirement.checks.length ||
+    !requirement.checks.every((check) => counts.get(check) === 1)
+  ) {
     return refuse(
       "noedit_checks_mismatch",
-      `its results name checks ${reported.join(", ") || "none"}, not exactly the admitted ${requirement.checks.join(", ")}`,
+      `its results name checks ${JSON.stringify(receipt.results.map((result) => result.check))}, not each of ${JSON.stringify(requirement.checks)} once`,
     );
   }
   const read = new Map(input.artifacts.map((artifact) => [artifact.path, artifact.sha256]));
   const results: Array<NoEditNativeReceipt["results"][number]> = [];
   for (const check of requirement.checks) {
-    const result = receipt.results.find((each) => each.check === check)!;
+    const result = receipt.results.find((each) => each.check === check);
+    if (result === undefined) {
+      return refuse("noedit_checks_mismatch", `check ${JSON.stringify(check)} has no result`);
+    }
     if (result.exitCode !== 0) {
       return refuse(
         "noedit_check_failed",

@@ -743,6 +743,8 @@ it("Policy answer: a parent closure names adopted or prepared criteria as its po
   assert.isTrue(Option.isNone(decode(admit({ ...noEdit, base: "b".repeat(40) }))));
   assert.isTrue(Option.isNone(decode(admit({ ...noEdit, ownedFiles: ["src/a.ts"] }))));
   assert.isTrue(Option.isNone(decode(admit({ ...noEdit, checks: [] }))));
+  // Each check is named once: a repeated one could hide a failing result behind a passing one.
+  assert.isTrue(Option.isNone(decode(admit({ ...noEdit, checks: ["test", "test"] }))));
   assert.isTrue(
     Option.isNone(decode(answer({ prepared: { ...prepared, bytes: "x".repeat(1_000_001) } }))),
   );

@@ -18172,6 +18172,76 @@ it.effect(
     ),
 );
 
+it.effect(
+  "Gates/Q2: a pending named question replaced by another on the same evidence is superseded, never left beside it",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* configureLifecycleFactory;
+          yield* seedIssue(7896);
+          const ask = (question: string) =>
+            usePolicy(() =>
+              Effect.succeed({
+                type: "reserve" as const,
+                reason: `The owner decides ${question}.`,
+                evidenceDigest: sha256("the same evidence"),
+                question,
+              }),
+            );
+          yield* ask("retention-period");
+          yield* advance("tracker_event", 2);
+          const [first] = yield* decisionsOf(7896);
+          yield* ask("archive-location");
+          for (const trigger of ["clock", "restart"] as const) yield* advance(trigger, 2);
+          const decisions = yield* decisionsOf(7896);
+          assert.deepStrictEqual(
+            decisions.map((decision) => [
+              decision.decisionId === first!.decisionId,
+              decision.state,
+            ]),
+            [
+              [true, "superseded"],
+              [false, "pending"],
+            ],
+          );
+          assert.isUndefined(decisions[0]!.resolution);
+          assert.include(decisions[0]!.superseded?.reason ?? "", "another question");
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Gates/Q3: a gate asked on its evidence before questions had names stays the one decision once its question is named",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* configureLifecycleFactory;
+          yield* seedIssue(7897);
+          const ask = (question?: string) =>
+            usePolicy(() =>
+              Effect.succeed({
+                type: "reserve" as const,
+                reason: "Which retention period applies?",
+                evidenceDigest: sha256("retention evidence"),
+                ...(question === undefined ? {} : { question }),
+              }),
+            );
+          yield* ask();
+          yield* advance("tracker_event", 2);
+          const [unnamed] = yield* decisionsOf(7897);
+          assert.strictEqual(unnamed?.state, "pending");
+          yield* ask("retention-period");
+          for (const trigger of ["clock", "restart"] as const) yield* advance(trigger, 2);
+          assert.deepStrictEqual(yield* decisionsOf(7897), [unnamed]);
+          assert.strictEqual((yield* commentsWith(7897, "t3-factory-decision")).length, 1);
+        }),
+      ),
+    ),
+);
+
 const legacyJob = "alpha_supervised";
 const legacyTask = ScheduledTaskId.make(
   "scheduled-task:command:mcp:45f4b96b:schedule-task:alpha-native-supervised-probe",
@@ -22513,6 +22583,117 @@ it.effect(
           const retry = admittedBy(yield* advance("clock", 3));
           assert.deepStrictEqual(stageOf(retry), [itemKeyFor(7961), "triage"]);
           assert.deepStrictEqual(admittedOnly(yield* advance("restart", 3)), []);
+        }),
+      ),
+    ),
+);
+
+/**
+ * Rewrites an admitted reservation's decision key to the one an earlier build derived: the exact
+ * policy revision, configuration pin included. This is what stored records from that build carry.
+ */
+const asEarlierBuildKey = (admission: FactoryLifecycle.FactoryAdmissionResult) =>
+  Effect.gen(function* () {
+    if (admission.type === "refused" || admission.reservation.origin !== "admitted") {
+      return assert.fail("expected an admission");
+    }
+    const reservation = admission.reservation;
+    const store = yield* FactoryStore.FactoryStore;
+    const observation = Option.getOrThrow(
+      yield* store.getObservation({ factoryId, observationId: reservation.observationId! }),
+    );
+    const earlier = FactoryLifecycle.decisionKeyOf(
+      {
+        factoryId,
+        itemKey: reservation.itemKey,
+        taskKind: reservation.taskKind,
+        policyRevision: reservation.policyRevision,
+        stage: { type: "triage", basis: reservation.stageBasis! },
+      },
+      observation,
+      { exactPolicy: true },
+    );
+    assert.notStrictEqual(earlier, reservation.decisionKey);
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`
+      UPDATE factory_reservations
+      SET decision_key = ${earlier}, record_json = json_set(record_json, '$.decisionKey', ${earlier})
+      WHERE reservation_id = ${reservation.reservationId}
+    `;
+  });
+
+it.effect(
+  "Prepare/U1: preparations recorded by an earlier build keep counting after a configuration-only change",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const revision = (pin: string) => `test-policy:${"a".repeat(16)}:${pin.repeat(16)}`;
+          yield* configureLifecycleFactory;
+          yield* configureFactory(
+            lifecycleConfiguration({ pools: pool(2), policyRevision: revision("1") }),
+          );
+          // The routine item, and a prepared one whose build adopts its proposal by id.
+          yield* usePolicy((input) => {
+            if (input.observation.itemKey !== itemKeyFor(7972)) {
+              return routinePreparationPolicy(input);
+            }
+            const proposal = input.outcomes.findLast(
+              (outcome) =>
+                outcome.state === "verified" && outcome.report.outcome === "unit_proposed",
+            );
+            return proposal === undefined || input.stage.type !== "implement"
+              ? input.outcomes.length === 0
+                ? triageRequest(input)
+                : Effect.succeed({ type: "none" as const, reason: "waiting" })
+              : Effect.map(stageRequest(input), (decision) =>
+                  decision !== undefined && "taskKind" in decision
+                    ? {
+                        ...decision,
+                        prepared: proposal.outcomeId,
+                        workspaceStrategy: { type: "worktree" as const, baseRef: lifecycleBase },
+                      }
+                    : decision,
+                );
+          });
+          yield* seedIssue(7971, {
+            body: "Make exports resumable.",
+            labels: ["ready", "needs-main"],
+          });
+          yield* seedIssue(7972, { body: "Make imports resumable." });
+          const first = admittedOnly(yield* advance("tracker_event", 1));
+          const triageOf = (issue: number) =>
+            first.find((admission) => stageOf(admission)?.[0] === itemKeyFor(issue))!;
+          // Both preparations were recorded by the earlier build.
+          yield* asEarlierBuildKey(triageOf(7971));
+          yield* asEarlierBuildKey(triageOf(7972));
+          yield* workStage(triageOf(7971), {
+            outcome: "not_actionable",
+            summary: "No owned files.",
+            failure: "main: the issue declares no owned files",
+          });
+          yield* workStage(triageOf(7972), {
+            outcome: "unit_proposed",
+            summary: "One unit.",
+            proposal: {
+              basis: admittedVersion(triageOf(7972)),
+              unit: "## Owned files\n- src/importer.ts",
+              ownedFiles: ["src/importer.ts"],
+            },
+            subject: { repository: claimRepository, baseCommit: lifecycleBase },
+          });
+          // Root repairs requirements only: the configuration pin changes, the script does not.
+          yield* configureFactory(
+            lifecycleConfiguration({ pools: pool(2), policyRevision: revision("2") }),
+          );
+          const next = admittedOnly(yield* advance("outcome", 3));
+          assert.deepStrictEqual(next.map(stageOf).toSorted(), [
+            [itemKeyFor(7971), "triage"],
+            [itemKeyFor(7972), "implement"],
+          ]);
+          for (const trigger of ["restart", "clock"] as const) {
+            assert.deepStrictEqual(admittedOnly(yield* advance(trigger, 2)), []);
+          }
         }),
       ),
     ),
