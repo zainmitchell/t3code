@@ -9,11 +9,18 @@ import * as SqlClient from "effect/sql/SqlClient";
 const Digest = Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/));
 const Text = Schema.String.check(Schema.isMinLength(1));
 
+export const CreationIdentity = Schema.Struct({
+  device: Schema.String.check(Schema.isPattern(/^(0|[1-9][0-9]*)$/)),
+  inode: Schema.String.check(Schema.isPattern(/^[1-9][0-9]*$/)),
+});
+export type CreationIdentity = typeof CreationIdentity.Type;
+
 export const Reservation = Schema.Struct({
   factoryId: FactoryId,
   itemKey: FactoryItemKey,
   issue: Schema.Int,
   root: Text,
+  rootIdentity: Schema.optional(CreationIdentity),
   path: Text,
   digest: Digest,
   basis: Schema.Struct({
@@ -27,12 +34,6 @@ export const Reservation = Schema.Struct({
   anchorPath: Text,
 });
 export type Reservation = typeof Reservation.Type;
-
-export const CreationIdentity = Schema.Struct({
-  device: Schema.String.check(Schema.isPattern(/^(0|[1-9][0-9]*)$/)),
-  inode: Schema.String.check(Schema.isPattern(/^[1-9][0-9]*$/)),
-});
-export type CreationIdentity = typeof CreationIdentity.Type;
 
 export const PreparedCriteria = Schema.Union([
   Schema.Struct({ reservation: Reservation, state: Schema.Literal("reserved") }),

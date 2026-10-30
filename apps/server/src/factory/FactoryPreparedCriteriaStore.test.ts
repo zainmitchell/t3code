@@ -16,6 +16,7 @@ const reservation = {
   itemKey: FactoryItemKey.make("github:example/repo#1"),
   issue: 1,
   root: "/criteria",
+  rootIdentity: { device: "1", inode: "9" },
   path: "/criteria/parent-1.json",
   digest: "a".repeat(64),
   basis: {
@@ -45,6 +46,7 @@ it.effect("reserves the exact preparation once and refuses every changed binding
       { itemKey: FactoryItemKey.make("github:example/repo#2") },
       { issue: 2 },
       { root: "/other" },
+      { rootIdentity: { device: "1", inode: "10" } },
       { digest: "c".repeat(64) },
       { creationId: "creation-2" },
       { anchorPath: "/criteria/.other.anchor" },

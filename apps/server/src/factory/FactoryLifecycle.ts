@@ -98,6 +98,7 @@ import { decisionGuidance } from "./factoryDecisionGuidance.ts";
 import * as FactoryEffects from "./FactoryEffects.ts";
 import * as FactoryIntegrator from "./FactoryIntegrator.ts";
 import * as FactoryOperationStore from "./FactoryOperationStore.ts";
+import * as FactoryPreparedCriteriaStore from "./FactoryPreparedCriteriaStore.ts";
 import {
   bindingBasis,
   criteriaProposalProblems,
@@ -1185,6 +1186,186 @@ export const makeInsideRoot = (fs: FileSystem.FileSystem, path: Path.Path) => {
   return insideArtifactRoot;
 };
 
+export const makePreparedCriteriaPublication = (deps: {
+  readonly fs: FileSystem.FileSystem;
+  readonly path: Path.Path;
+  readonly store: FactoryPreparedCriteriaStore.FactoryPreparedCriteriaStore["Service"];
+}) => {
+  const { fs, path, store } = deps;
+  const normalized = (value: string) =>
+    path.sep === "\\" ? path.normalize(value).toLowerCase() : path.normalize(value);
+  const identityOf = (info: FileSystem.File.Info, type: "File" | "Directory") =>
+    info.type === type && Option.isSome(info.ino) && info.ino.value > 0n
+      ? { device: String(info.dev), inode: String(info.ino.value) }
+      : undefined;
+  const sameIdentity = (
+    left: FactoryPreparedCriteriaStore.CreationIdentity | undefined,
+    right: FactoryPreparedCriteriaStore.CreationIdentity,
+  ) => left?.device === right.device && left.inode === right.inode;
+  const rootOf = Effect.fnUntraced(function* (root: string) {
+    const real = normalized(yield* fs.realPath(root));
+    const identity = identityOf(yield* fs.stat(real), "Directory");
+    return identity === undefined ? undefined : { root: real, identity };
+  });
+  const verify = Effect.fnUntraced(
+    function* (
+      file: string,
+      identity: FactoryPreparedCriteriaStore.CreationIdentity,
+      reservation: FactoryPreparedCriteriaStore.Reservation,
+    ) {
+      const rootIdentity = reservation.rootIdentity;
+      if (rootIdentity === undefined || path.dirname(file) !== reservation.root) return false;
+      return yield* Effect.scoped(
+        Effect.gen(function* () {
+          if (
+            normalized(yield* fs.realPath(reservation.root)) !== reservation.root ||
+            !sameIdentity(
+              identityOf(yield* fs.stat(reservation.root), "Directory"),
+              rootIdentity,
+            ) ||
+            normalized(yield* fs.realPath(file)) !== file
+          )
+            return false;
+          const handle = yield* fs.open(file, { flag: "r" });
+          if (!sameIdentity(identityOf(yield* handle.stat, "File"), identity)) return false;
+          const hash = NodeCrypto.createHash("sha256");
+          let chunk = yield* handle.readAlloc(64 * 1024);
+          while (Option.isSome(chunk)) {
+            hash.update(chunk.value);
+            chunk = yield* handle.readAlloc(64 * 1024);
+          }
+          return (
+            hash.digest("hex") === reservation.digest &&
+            sameIdentity(identityOf(yield* handle.stat, "File"), identity) &&
+            sameIdentity(identityOf(yield* fs.stat(file), "File"), identity) &&
+            normalized(yield* fs.realPath(file)) === file &&
+            sameIdentity(identityOf(yield* fs.stat(reservation.root), "Directory"), rootIdentity)
+          );
+        }),
+      );
+    },
+    Effect.orElseSucceed(() => false),
+  );
+
+  const isKept = Effect.fn("FactoryLifecycle.isKeptPreparedCriteria")(
+    function* (input: {
+      readonly factoryId: FactoryId;
+      readonly itemKey: FactoryItemKey;
+      readonly issue: number;
+      readonly root: string;
+      readonly target: string;
+    }) {
+      const root = yield* rootOf(input.root);
+      const target = normalized(input.target);
+      const found = yield* store.get(target);
+      if (root === undefined || Option.isNone(found) || found.value.state === "reserved")
+        return false;
+      const { reservation, identity } = found.value;
+      if (
+        reservation.factoryId !== input.factoryId ||
+        reservation.itemKey !== input.itemKey ||
+        reservation.issue !== input.issue ||
+        reservation.root !== root.root ||
+        reservation.path !== target ||
+        !sameIdentity(reservation.rootIdentity, root.identity)
+      )
+        return false;
+      if (
+        !(yield* verify(reservation.anchorPath, identity, reservation)) ||
+        !(yield* verify(target, identity, reservation))
+      )
+        return false;
+      return Option.isSome(yield* store.publish({ reservation, identity }));
+    },
+    Effect.orElseSucceed(() => false),
+  );
+
+  const keep = Effect.fn("FactoryLifecycle.keepPreparedCriteria")(function* (input: {
+    readonly factoryId: FactoryId;
+    readonly itemKey: FactoryItemKey;
+    readonly issue: number;
+    readonly root: string;
+    readonly digest: string;
+    readonly bytes: string;
+    readonly basis: FactoryPreparedCriteriaStore.Reservation["basis"];
+  }) {
+    const result = yield* Effect.scoped(
+      Effect.gen(function* () {
+        if (sha256(input.bytes) !== input.digest)
+          return "the prepared digest does not match its bytes";
+        const root = yield* rootOf(input.root);
+        if (root === undefined) return "the platform cannot identify the criteria root";
+        const target = path.join(root.root, `parent-${input.issue}-${input.digest}.json`);
+        let found = yield* store.get(target);
+        if (Option.isNone(found)) {
+          if (yield* fs.exists(target)) return "an unrecognized target already exists";
+          const creationId = NodeCrypto.randomUUID();
+          found = yield* store.reserve({
+            factoryId: input.factoryId,
+            itemKey: input.itemKey,
+            issue: input.issue,
+            root: root.root,
+            rootIdentity: root.identity,
+            path: target,
+            digest: input.digest,
+            basis: input.basis,
+            creationId,
+            anchorPath: `${target}.${creationId}.anchor`,
+          });
+        }
+        if (Option.isNone(found)) return "another creation reserved this target";
+        const reservation = found.value.reservation;
+        if (
+          reservation.factoryId !== input.factoryId ||
+          reservation.itemKey !== input.itemKey ||
+          reservation.issue !== input.issue ||
+          reservation.root !== root.root ||
+          reservation.digest !== input.digest ||
+          canonical(reservation.basis) !== canonical(input.basis) ||
+          !sameIdentity(reservation.rootIdentity, root.identity)
+        )
+          return "the target belongs to another preparation basis or criteria root";
+        let record = found.value;
+        if (record.state === "reserved") {
+          const opened = yield* fs.open(reservation.anchorPath, { flag: "wx" }).pipe(Effect.result);
+          if (opened._tag === "Failure")
+            return (yield* fs.exists(reservation.anchorPath))
+              ? "an unidentified anchor exists; its origin cannot be recovered"
+              : opened.failure.message;
+          const handle = opened.success;
+          yield* handle.writeAll(new TextEncoder().encode(input.bytes));
+          yield* handle.sync;
+          const identity = identityOf(yield* handle.stat, "File");
+          if (identity === undefined) return "the platform cannot identify the created anchor";
+          if (!(yield* verify(reservation.anchorPath, identity, reservation)))
+            return "the created anchor could not be verified";
+          const identified = yield* store.identify({ reservation, identity });
+          if (Option.isNone(identified) || identified.value.state === "reserved")
+            return "the anchor identity was not recorded";
+          record = identified.value;
+        }
+        const identity = record.identity;
+        if (!(yield* verify(reservation.anchorPath, identity, reservation)))
+          return "the recorded anchor is missing or replaced";
+        if (!(yield* fs.exists(target))) {
+          const linked = yield* fs.link(reservation.anchorPath, target).pipe(Effect.result);
+          if (linked._tag === "Failure" && !(yield* verify(target, identity, reservation)))
+            return linked.failure.message;
+        }
+        if (!(yield* verify(target, identity, reservation)))
+          return "the target is not the recorded anchor object";
+        if (!(yield* verify(reservation.anchorPath, identity, reservation)))
+          return "the recorded anchor was replaced during publication";
+        return Option.isSome(yield* store.publish({ reservation, identity }))
+          ? undefined
+          : "publication was not recorded";
+      }),
+    ).pipe(Effect.result);
+    return result._tag === "Success" ? result.success : result.failure.message;
+  });
+  return { keep, isKept };
+};
+
 export interface VerificationBindingDeps {
   readonly fs: FileSystem.FileSystem;
   readonly path: Path.Path;
@@ -1655,6 +1836,12 @@ const make = Effect.gen(function* () {
   const generations = yield* FactoryExecutionGenerations.FactoryExecutionGenerations;
   const projections = yield* ProjectionStore.ProjectionStoreV2;
   const operationStore = yield* FactoryOperationStore.FactoryOperationStore;
+  const preparedCriteriaStore = yield* FactoryPreparedCriteriaStore.FactoryPreparedCriteriaStore;
+  const preparedPublication = makePreparedCriteriaPublication({
+    fs,
+    path,
+    store: preparedCriteriaStore,
+  });
   const integrator = yield* FactoryIntegrator.FactoryIntegrator;
   const projectService = yield* ProjectService.ProjectService;
   const transfers = yield* FactoryTransferStore.FactoryTransferStore;
@@ -3700,34 +3887,15 @@ const make = Effect.gen(function* () {
   });
 
   /**
-   * Prepared criteria kept under the criteria root by their own sha256, so a closure names bytes
-   * anyone can reread. Already there with those bytes, they are not written again.
-   */
-  const keepPrepared = Effect.fnUntraced(function* (
-    root: string,
-    issue: number,
-    digest: string,
-    bytes: string,
-  ) {
-    const target = path.join(root, `parent-${issue}-${digest}.json`);
-    if (!(yield* insideArtifactRoot(root, target))) return "the target is outside the root";
-    const existing = yield* fs.readFile(target).pipe(Effect.option);
-    if (Option.isSome(existing)) {
-      return sha256(existing.value) === digest ? undefined : `${target} holds other bytes`;
-    }
-    const partial = `${target}.${NodeCrypto.randomUUID()}.partial`;
-    const written = yield* fs
-      .writeFileString(partial, bytes)
-      .pipe(Effect.andThen(fs.rename(partial, target)), Effect.result);
-    if (written._tag === "Success") return undefined;
-    yield* fs.remove(partial).pipe(Effect.ignore);
-    return written.failure.message;
-  });
-
-  /**
    * Every criteria document for `issue` under the criteria root, by real path.
    */
-  const adoptedCriteriaOf = Effect.fnUntraced(function* (root: string, issue: number) {
+  const adoptedCriteriaOf = Effect.fnUntraced(function* (input: {
+    readonly root: string;
+    readonly issue: number;
+    readonly factoryId: FactoryId;
+    readonly itemKey: FactoryItemKey;
+  }) {
+    const { root, issue } = input;
     const listed = yield* fs.readDirectory(root, { recursive: true }).pipe(Effect.result);
     if (listed._tag === "Failure") return { unread: listed.failure.message };
     const found: Array<string> = [];
@@ -3739,6 +3907,7 @@ const make = Effect.gen(function* () {
       );
       if (read._tag === "Failure") return { unread: `${entry}: ${read.failure.message}` };
       const { target, bytes } = read.success;
+      if (yield* preparedPublication.isKept({ ...input, target })) continue;
       const document = parseJson(new TextDecoder().decode(bytes));
       if (
         typeof document === "object" &&
@@ -3822,6 +3991,7 @@ const make = Effect.gen(function* () {
     let criteria: Option.Option<Criteria>;
     let criteriaSha256: string;
     let prepared: string | undefined;
+    let preparedBasis: FactoryPreparedCriteriaStore.Reservation["basis"] | undefined;
     if ((closure.criteria === undefined) === (closure.prepared === undefined)) {
       return wait(
         "the parent closure names neither or both of adopted and prepared criteria",
@@ -3868,7 +4038,12 @@ const make = Effect.gen(function* () {
       }
       // Root's adoption for this parent is T3's own lookup: a closure that leaves it out, or pins
       // another document, would drop the holds it carries.
-      const adoptions = yield* adoptedCriteriaOf(authority.criteriaRoot, issue);
+      const adoptions = yield* adoptedCriteriaOf({
+        root: authority.criteriaRoot,
+        issue,
+        factoryId: configuration.factoryId,
+        itemKey: candidate.itemKey,
+      });
       if ("unread" in adoptions) {
         return wait(
           `T3 could not read Root's adopted criteria for #${issue} under ${authority.criteriaRoot}: ${adoptions.unread}`,
@@ -3904,7 +4079,7 @@ const make = Effect.gen(function* () {
         );
       }
       // The latest verified proposal on the current text, under the current policy, is its basis.
-      const proposal = parentOutcomes.findLast(
+      const proposalOutcome = parentOutcomes.findLast(
         (outcome) =>
           outcome.stage === "triage" &&
           outcome.state === "verified" &&
@@ -3912,8 +4087,9 @@ const make = Effect.gen(function* () {
           outcome.report.criteria?.basis.itemVersion === candidate.observation.itemVersion &&
           outcome.report.criteria.basis.bodySha256 === bodySha256 &&
           outcome.policyRevision === configuration.policyRevision,
-      )?.report.criteria;
-      if (proposal === undefined) {
+      );
+      const proposal = proposalOutcome?.report.criteria;
+      if (proposal === undefined || proposalOutcome === undefined) {
         return wait(
           `#${issue} has no verified criteria proposal for its current text (item version ${candidate.observation.itemVersion}) under the current policy`,
           "T3 (preparation)",
@@ -3950,6 +4126,13 @@ const make = Effect.gen(function* () {
         );
       }
       prepared = given.bytes;
+      preparedBasis = {
+        configurationRevision: configuration.revision,
+        policyRevision: configuration.policyRevision,
+        itemVersion: candidate.observation.itemVersion,
+        bodySha256,
+        proposalOutcomeId: proposalOutcome.outcomeId,
+      };
     }
     if (authority.close === "owner") {
       const decided = (yield* outcomeStore.reservedDecisions(configuration.factoryId)).find(
@@ -4015,8 +4198,16 @@ const make = Effect.gen(function* () {
         "every required clause is proved",
       );
     }
-    if (prepared !== undefined) {
-      const kept = yield* keepPrepared(authority.criteriaRoot, issue, criteriaSha256, prepared);
+    if (prepared !== undefined && preparedBasis !== undefined) {
+      const kept = yield* preparedPublication.keep({
+        factoryId: configuration.factoryId,
+        itemKey: candidate.itemKey,
+        issue,
+        root: authority.criteriaRoot,
+        digest: criteriaSha256,
+        bytes: prepared,
+        basis: preparedBasis,
+      });
       if (kept !== undefined) {
         return wait(
           `T3 could not keep the prepared criteria under ${authority.criteriaRoot}: ${kept}`,
@@ -5845,7 +6036,9 @@ const make = Effect.gen(function* () {
 });
 
 /** The lifecycle on the stores its caller provides. */
-export const layerUsingStores = Layer.effect(FactoryLifecycle, make);
+export const layerUsingStores = Layer.effect(FactoryLifecycle, make).pipe(
+  Layer.provide(FactoryPreparedCriteriaStore.layer),
+);
 
 export const layer = layerUsingStores.pipe(
   Layer.provide(FactoryOutcomeStore.layer),

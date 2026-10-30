@@ -147,6 +147,7 @@ import {
 } from "./factoryCoordination.ts";
 import * as FactoryTracker from "./FactoryTracker.ts";
 import * as FactoryTransferStore from "./FactoryTransferStore.ts";
+import * as FactoryPreparedCriteriaStore from "./FactoryPreparedCriteriaStore.ts";
 import type { FactoryTransferInput } from "./factoryTransfers.ts";
 import * as CommandJobFence from "../commandJobs/CommandJobFence.ts";
 import * as CommandJobs from "../commandJobs/CommandJobs.ts";
@@ -13030,6 +13031,382 @@ const parentWaitsOn = (issue: number, detail: string) =>
     );
   });
 
+const publicationFixture = Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const directory = yield* fs.realPath(yield* fs.makeTempDirectoryScoped());
+  const root =
+    path.sep === "\\"
+      ? path.join(directory, "criteria").toLowerCase()
+      : path.join(directory, "criteria");
+  yield* fs.makeDirectory(root);
+  const bytes = JSON.stringify({ schema: "factory-parent-criteria/1", issue: 1, clauses: [] });
+  const input = {
+    factoryId,
+    itemKey: FactoryItemKey.make("github:example/repo#1"),
+    issue: 1,
+    root,
+    bytes,
+    digest: sha256(bytes),
+    basis: {
+      configurationRevision: 1,
+      policyRevision: "policy-1",
+      itemVersion: "v1",
+      bodySha256: sha256("body"),
+      proposalOutcomeId: "proposal-1",
+    },
+  };
+  const target = path.join(root, `parent-1-${input.digest}.json`);
+  const connect = FactoryPreparedCriteriaStore.layer.pipe(
+    Layer.provideMerge(SqlitePersistence.layerFromPath(path.join(directory, "state.sqlite"))),
+  );
+  const run = <A, E>(
+    f: (
+      store: FactoryPreparedCriteriaStore.FactoryPreparedCriteriaStore["Service"],
+    ) => Effect.Effect<A, E>,
+  ) =>
+    Effect.scoped(
+      Effect.flatMap(FactoryPreparedCriteriaStore.FactoryPreparedCriteriaStore, f).pipe(
+        Effect.provide(Layer.fresh(connect)),
+      ),
+    );
+  return { fs, path, input, target, root, run };
+});
+
+it.effect.each(["before-create", "before-identity", "before-link", "before-published"] as const)(
+  "Parent/publication: SQLite and anchor survive interruption %s without inventing origin",
+  (milestone) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* publicationFixture;
+        const interrupted = yield* Effect.exit(
+          f.run((store) => {
+            const fs = {
+              ...f.fs,
+              open: (file: string, options?: Parameters<typeof f.fs.open>[1]) =>
+                milestone === "before-create" && options?.flag === "wx"
+                  ? Effect.interrupt
+                  : f.fs.open(file, options),
+              link: (from: string, to: string) =>
+                milestone === "before-link" ? Effect.interrupt : f.fs.link(from, to),
+            };
+            const faulted = {
+              ...store,
+              identify: (input: Parameters<typeof store.identify>[0]) =>
+                milestone === "before-identity" ? Effect.interrupt : store.identify(input),
+              publish: (input: Parameters<typeof store.publish>[0]) =>
+                milestone === "before-published" ? Effect.interrupt : store.publish(input),
+            };
+            return FactoryLifecycle.makePreparedCriteriaPublication({
+              fs,
+              path: f.path,
+              store: faulted,
+            }).keep(f.input);
+          }),
+        );
+        assert.isTrue(Exit.isFailure(interrupted));
+        const before = Option.getOrThrow(yield* f.run((store) => store.get(f.target)));
+        if (milestone === "before-identity") {
+          assert.strictEqual(before.state, "reserved");
+          assert.strictEqual(
+            yield* f.fs.readFileString(before.reservation.anchorPath),
+            f.input.bytes,
+          );
+          const retried = yield* f.run((store) =>
+            FactoryLifecycle.makePreparedCriteriaPublication({
+              fs: f.fs,
+              path: f.path,
+              store,
+            }).keep(f.input),
+          );
+          assert.include(retried ?? "", "unidentified anchor");
+          assert.isFalse(yield* f.fs.exists(f.target));
+          assert.strictEqual(
+            yield* f.fs.readFileString(before.reservation.anchorPath),
+            f.input.bytes,
+          );
+        } else {
+          if (milestone === "before-published") {
+            assert.strictEqual(before.state, "identified");
+            assert.isTrue(
+              yield* f.run((store) =>
+                FactoryLifecycle.makePreparedCriteriaPublication({
+                  fs: f.fs,
+                  path: f.path,
+                  store,
+                }).isKept({ ...f.input, target: f.target }),
+              ),
+            );
+          }
+          assert.strictEqual(
+            yield* f.run((store) =>
+              FactoryLifecycle.makePreparedCriteriaPublication({
+                fs: f.fs,
+                path: f.path,
+                store,
+              }).keep(f.input),
+            ),
+            undefined,
+          );
+          const published = Option.getOrThrow(yield* f.run((store) => store.get(f.target)));
+          assert.strictEqual(published.state, "published");
+          assert.strictEqual(
+            yield* f.fs.readFileString(published.reservation.anchorPath),
+            f.input.bytes,
+          );
+          assert.strictEqual(yield* f.fs.readFileString(f.target), f.input.bytes);
+          assert.isTrue(
+            yield* f.run((store) =>
+              FactoryLifecycle.makePreparedCriteriaPublication({
+                fs: f.fs,
+                path: f.path,
+                store,
+              }).isKept({ ...f.input, target: f.target }),
+            ),
+          );
+        }
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "Parent/publication: competing services keep one anchor and refuse a colliding Root file",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* publicationFixture;
+        yield* f.run((store) => store.get(f.target));
+        const results = yield* Effect.forEach(
+          [0, 1],
+          () =>
+            f.run((store) =>
+              FactoryLifecycle.makePreparedCriteriaPublication({
+                fs: f.fs,
+                path: f.path,
+                store,
+              }).keep(f.input),
+            ),
+          { concurrency: "unbounded" },
+        );
+        assert.include(results, undefined);
+        assert.strictEqual(
+          (yield* f.fs.readDirectory(f.root)).filter((name) => name.endsWith(".anchor")).length,
+          1,
+        );
+        assert.strictEqual(
+          yield* f.run((store) =>
+            FactoryLifecycle.makePreparedCriteriaPublication({
+              fs: f.fs,
+              path: f.path,
+              store,
+            }).keep(f.input),
+          ),
+          undefined,
+        );
+        const other = {
+          ...f.input,
+          issue: 2,
+          itemKey: FactoryItemKey.make("github:example/repo#2"),
+        };
+        const target = f.path.join(f.root, `parent-2-${other.digest}.json`);
+        const colliding = {
+          ...f.fs,
+          link: (from: string, to: string) =>
+            Effect.andThen(
+              f.fs.writeFileString(to, other.bytes, { flag: "wx" }),
+              f.fs.link(from, to),
+            ),
+        };
+        assert.isString(
+          yield* f.run((store) =>
+            FactoryLifecycle.makePreparedCriteriaPublication({
+              fs: colliding,
+              path: f.path,
+              store,
+            }).keep(other),
+          ),
+        );
+        assert.strictEqual(yield* f.fs.readFileString(target), other.bytes);
+        assert.isFalse(
+          yield* f.run((store) =>
+            FactoryLifecycle.makePreparedCriteriaPublication({
+              fs: f.fs,
+              path: f.path,
+              store,
+            }).isKept({ ...other, target }),
+          ),
+        );
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect.each(["anchor", "digest", "root"] as const)(
+  "Parent/publication: changed %s invalidates provenance",
+  (changed) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* publicationFixture;
+        assert.strictEqual(
+          yield* f.run((store) =>
+            FactoryLifecycle.makePreparedCriteriaPublication({
+              fs: f.fs,
+              path: f.path,
+              store,
+            }).keep(f.input),
+          ),
+          undefined,
+        );
+        const found = Option.getOrThrow(yield* f.run((store) => store.get(f.target)));
+        if (changed === "anchor") {
+          yield* f.fs.remove(found.reservation.anchorPath);
+          yield* f.fs.writeFileString(found.reservation.anchorPath, f.input.bytes, { flag: "wx" });
+        } else if (changed === "digest") {
+          yield* f.fs.writeFileString(f.target, `${f.input.bytes} `);
+        } else {
+          const old = `${f.root}-original`;
+          yield* f.fs.rename(f.root, old);
+          yield* f.fs.makeDirectory(f.root);
+          const anchor = f.path.join(old, f.path.basename(found.reservation.anchorPath));
+          yield* f.fs.link(anchor, found.reservation.anchorPath);
+          yield* f.fs.link(anchor, f.target);
+        }
+        assert.isFalse(
+          yield* f.run((store) =>
+            FactoryLifecycle.makePreparedCriteriaPublication({
+              fs: f.fs,
+              path: f.path,
+              store,
+            }).isKept({ ...f.input, target: f.target }),
+          ),
+        );
+        assert.isString(
+          yield* f.run((store) =>
+            FactoryLifecycle.makePreparedCriteriaPublication({
+              fs: f.fs,
+              path: f.path,
+              store,
+            }).keep(f.input),
+          ),
+        );
+        assert.isTrue(yield* f.fs.exists(f.target));
+        assert.isTrue(yield* f.fs.exists(found.reservation.anchorPath));
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "Parent/publication: an unsupported creation identity fails closed and retains the unknown anchor",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* publicationFixture;
+        const unsupported = {
+          ...f.fs,
+          open: (file: string, options?: Parameters<typeof f.fs.open>[1]) =>
+            Effect.map(f.fs.open(file, options), (handle) =>
+              options?.flag === "wx"
+                ? new Proxy(handle, {
+                    get: (target, key) =>
+                      key === "stat"
+                        ? Effect.map(target.stat, (info) => ({ ...info, ino: Option.none() }))
+                        : Reflect.get(target, key, target),
+                  })
+                : handle,
+            ),
+        };
+        assert.include(
+          (yield* f.run((store) =>
+            FactoryLifecycle.makePreparedCriteriaPublication({
+              fs: unsupported,
+              path: f.path,
+              store,
+            }).keep(f.input),
+          )) ?? "",
+          "cannot identify the created anchor",
+        );
+        const found = Option.getOrThrow(yield* f.run((store) => store.get(f.target)));
+        assert.strictEqual(found.state, "reserved");
+        assert.strictEqual(yield* f.fs.readFileString(found.reservation.anchorPath), f.input.bytes);
+        assert.isFalse(yield* f.fs.exists(f.target));
+        assert.include(
+          (yield* f.run((store) =>
+            FactoryLifecycle.makePreparedCriteriaPublication({
+              fs: f.fs,
+              path: f.path,
+              store,
+            }).keep(f.input),
+          )) ?? "",
+          "unidentified anchor",
+        );
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "Parent/publication: same-byte Root files and replaced objects never become kept copies",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* publicationFixture;
+        yield* f.fs.writeFileString(f.target, f.input.bytes, { flag: "wx" });
+        assert.isFalse(
+          yield* f.run((store) =>
+            FactoryLifecycle.makePreparedCriteriaPublication({
+              fs: f.fs,
+              path: f.path,
+              store,
+            }).isKept({ ...f.input, target: f.target }),
+          ),
+        );
+        assert.include(
+          (yield* f.run((store) =>
+            FactoryLifecycle.makePreparedCriteriaPublication({
+              fs: f.fs,
+              path: f.path,
+              store,
+            }).keep(f.input),
+          )) ?? "",
+          "unrecognized target",
+        );
+        assert.strictEqual(yield* f.fs.readFileString(f.target), f.input.bytes);
+        yield* f.fs.remove(f.target);
+        assert.strictEqual(
+          yield* f.run((store) =>
+            FactoryLifecycle.makePreparedCriteriaPublication({
+              fs: f.fs,
+              path: f.path,
+              store,
+            }).keep(f.input),
+          ),
+          undefined,
+        );
+        const owned = Option.getOrThrow(yield* f.run((store) => store.get(f.target)));
+        yield* f.fs.remove(f.target);
+        yield* f.fs.writeFileString(f.target, f.input.bytes, { flag: "wx" });
+        assert.isFalse(
+          yield* f.run((store) =>
+            FactoryLifecycle.makePreparedCriteriaPublication({
+              fs: f.fs,
+              path: f.path,
+              store,
+            }).isKept({ ...f.input, target: f.target }),
+          ),
+        );
+        assert.isString(
+          yield* f.run((store) =>
+            FactoryLifecycle.makePreparedCriteriaPublication({
+              fs: f.fs,
+              path: f.path,
+              store,
+            }).keep(f.input),
+          ),
+        );
+        assert.strictEqual(yield* f.fs.readFileString(owned.reservation.anchorPath), f.input.bytes);
+        assert.strictEqual(yield* f.fs.readFileString(f.target), f.input.bytes);
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+);
+
 it.effect(
   "Parent/P2: a parent with no Root route is prepared once, its untrusted criteria revalidated by T3, and closed once on its own landings",
   () =>
@@ -13157,30 +13534,46 @@ it.effect(
           );
           yield* fs.remove(ambiguous);
           // E2's carrier lands: T3 keeps the exact bytes under the criteria root and closes once.
-          state.ready = new Set([7701, 7703]);
+          state.ready = new Set([7703]);
           yield* landThroughT3(7703, "c0007703");
-          yield* advance("clock");
-          const github = yield* GitHubFake;
-          const closed = github.issues.get(issueKey(claimRepository, 7701))!;
-          assert.strictEqual(closed.state, "closed");
+          state.ready = new Set([7701]);
+          const lookups = yield* AdmissionLookups;
+          lookups.beforeIntent = (intent) =>
+            intent.kind === "tracker_close" ? Effect.interrupt : Effect.void;
+          const interrupted = yield* Effect.exit(reconcileFactory("clock"));
+          assert.isTrue(Exit.isFailure(interrupted));
           const kept = path.join(criteriaRoot, `parent-7701-${current.sha256}.json`);
           assert.strictEqual(yield* fs.readFileString(kept), current.bytes);
-          const closing = closed.comments.filter((comment) =>
-            comment.body.includes(`adopted criteria (sha256 ${current.sha256})`),
-          );
-          assert.strictEqual(closing.length, 1);
-          assert.include(closing[0]!.body, `Clause E1 (${e1}): ${k2} landed`);
-          assert.include(closing[0]!.body, `Clause E2 (${e2}): ${k3} landed`);
-          const requests = yield* closeRequests;
-          for (const trigger of ["restart", "clock", "owner_decision"] as const) {
-            yield* advance(trigger);
-          }
-          assert.strictEqual(yield* closeRequests, requests);
-          assert.strictEqual(yield* dispositionOf(7701), "done");
-          assert.deepStrictEqual(
-            (yield* itemHistory(7701)).filter((entry) => entry === "triage"),
-            ["triage", "triage"],
-          );
+          lookups.beforeIntent = undefined;
+          const rebuilt = yield* freshLifecycle(yield* Scope.Scope);
+          yield* Effect.gen(function* () {
+            yield* advance("restart");
+            yield* advance("clock");
+            const github = yield* GitHubFake;
+            const closed = github.issues.get(issueKey(claimRepository, 7701))!;
+            assert.strictEqual(closed.state, "closed");
+            assert.strictEqual(yield* fs.readFileString(kept), current.bytes);
+            const closing = closed.comments.filter((comment) =>
+              comment.body.includes(`adopted criteria (sha256 ${current.sha256})`),
+            );
+            assert.strictEqual(closing.length, 1);
+            assert.include(closing[0]!.body, `Clause E1 (${e1}): ${k2} landed`);
+            assert.include(closing[0]!.body, `Clause E2 (${e2}): ${k3} landed`);
+            const requests = yield* closeRequests;
+            for (const trigger of ["restart", "clock", "owner_decision"] as const) {
+              yield* advance(trigger);
+            }
+            assert.strictEqual(yield* closeRequests, requests);
+            assert.strictEqual(
+              yield* dispositionOf(7701),
+              "done",
+              JSON.stringify(yield* recordOf(7701)),
+            );
+            assert.deepStrictEqual(
+              (yield* itemHistory(7701)).filter((entry) => entry === "triage"),
+              ["triage", "triage"],
+            );
+          }).pipe(Effect.provideService(FactoryLifecycle.FactoryLifecycle, rebuilt));
         }),
       ),
     ),
@@ -13297,6 +13690,23 @@ it.effect(
             7711,
             "clause H2 is reserved (H1=satisfied, H2=reserved, whole-parent=reserved)",
           );
+          const otherText = adoptedText.replace('"issue":7711', '"issue":9999');
+          yield* fs.writeFileString(path.join(criteriaRoot, "other.json"), otherText);
+          state.prepared = {
+            ...exact,
+            adopted: { root: criteriaRoot, path: "other.json", sha256: sha256(otherText) },
+          };
+          yield* advance("clock");
+          yield* parentWaitsOn(
+            7711,
+            "the prepared closure does not carry #7711's adopted criteria",
+          );
+          yield* fs.remove(path.join(criteriaRoot, "other.json"));
+          state.prepared = { ...exact, adopted };
+          yield* fs.makeDirectory(path.join(criteriaRoot, "unread.json"));
+          yield* advance("clock");
+          yield* parentWaitsOn(7711, "T3 could not read Root's adopted criteria");
+          yield* fs.remove(path.join(criteriaRoot, "unread.json"), { recursive: true });
           // Two adoptions for one parent are Root's to settle, never the policy's choice.
           yield* fs.writeFileString(
             path.join(criteriaRoot, "second.json"),
