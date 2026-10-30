@@ -200,8 +200,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
     // Per-instance capabilities cache: keyed on binary + resolved HOME so
     // account-specific probes never share auth metadata across instances.
     // A transient miss may reuse the last account once, but its usage windows keep their age.
-    // An explicit invalidation starts a new generation: a probe begun before it, still in flight,
-    // never becomes the fallback after it.
+    // A probe in flight across an explicit invalidation never becomes that fallback.
     const probeGeneration = yield* Ref.make(0);
     const lastGoodCapabilities = yield* Ref.make<ClaudeCapabilitiesProbe | undefined>(undefined);
     const capabilitiesProbeCache = yield* Cache.makeWith(
