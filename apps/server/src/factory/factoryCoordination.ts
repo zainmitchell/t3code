@@ -425,6 +425,8 @@ const ITEM = /^ {0,3}(?:[-*+]|\p{Nd}{1,3}[.)])[ \t]+(?:\[([ xX])\][ \t]+)?/u;
 const BOLD_LABEL = /^\*\*([^*\n]{1,80}?)\*\*/u;
 const PLAIN_LABEL = /^([A-Za-z0-9][\p{L}\p{N}_/-]*(?: [\p{L}\p{N}_/-]+){0,3}):[ \t]/u;
 const CITATION = /\/issues\/([0-9]+)#issuecomment-([0-9]+)(?![\p{L}\p{N}_])/gu;
+const DETAILS_TAG = /<details(?:\s+[^<>]*)?>|<\/details\s*>/gi;
+const DETAILS_FRAGMENT = /<\/?details/i;
 
 export interface AcceptanceItem {
   readonly start: number;
@@ -478,11 +480,27 @@ export const parentAcceptance = (body: string) => {
       fence = opened[1]!;
       continue;
     }
-    const lowered = line.toLowerCase();
-    depth += lowered.split("<details").length - lowered.split("</details>").length;
-    if (depth > 0 || lowered.includes("</details>")) {
-      depth = Math.max(depth, 0);
-      if (current !== undefined) closeItem();
+    const tags = [...line.matchAll(DETAILS_TAG)];
+    if (tags.length > 0 || depth > 0 || DETAILS_FRAGMENT.test(line)) {
+      const before = depth;
+      const outside: Array<string> = [];
+      let position = 0;
+      let malformed = DETAILS_FRAGMENT.test(line.replace(DETAILS_TAG, ""));
+      for (const tag of tags) {
+        if (depth === 0) outside.push(line.slice(position, tag.index));
+        if (tag[0].startsWith("</")) {
+          if (depth === 0) malformed = true;
+          else depth--;
+        } else depth++;
+        position = tag.index + tag[0].length;
+      }
+      if (depth === 0) outside.push(line.slice(position));
+      if (current !== undefined) {
+        if (before === 0 && tags.length > 0) closeItem();
+        if (malformed || outside.some((part) => strip(part) !== ""))
+          current.unlisted.push(strip(line));
+      }
+      blank = true;
       continue;
     }
     const heading = HEADING.exec(line);
@@ -525,7 +543,10 @@ export const parentAcceptance = (body: string) => {
     }
     blank = false;
   }
-  if (current !== undefined) closeItem();
+  if (current !== undefined) {
+    closeItem();
+    if (depth > 0) current.unlisted.push("unclosed details block");
+  }
   const characters = codePoints(body);
   return {
     items: sections.flatMap((section) =>

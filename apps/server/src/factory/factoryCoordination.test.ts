@@ -7,6 +7,7 @@ import * as Option from "effect/Option";
 
 import {
   criterionToken,
+  criteriaProposalProblems,
   decodeCriteria,
   decodeVerificationDocument,
   defectChild,
@@ -296,6 +297,76 @@ describe("acceptance with historical details", () => {
     assert.deepStrictEqual(
       parentAcceptance(body).items.map((item) => item.excerpt),
       ["A: ship safely", "B: preserve required payment hold"],
+    );
+  });
+  it.each([
+    [
+      "lookalike",
+      "## Acceptance\n- A: ship safely\n<details-history>\n- B: preserve required payment hold\n</details>\n",
+    ],
+    [
+      "mixed malformed closer",
+      "## Acceptance\n- A: ship safely\n<details>\n- old\n</details broken> </details>\n- B: preserve required payment hold\n",
+    ],
+    [
+      "unclosed",
+      "## Acceptance\n- A: ship safely\n<details>\n- B: preserve required payment hold\n",
+    ],
+    [
+      "inline current text",
+      "## Acceptance\n- A: ship safely\n<details>old</details> - B: preserve required payment hold\n",
+    ],
+  ])("refuses a full-body-hash truncated proposal across %s", (_name, body) => {
+    const hash = (text: string) => NodeCrypto.createHash("sha256").update(text).digest("hex");
+    const accepted = parentAcceptance(body);
+    assert.isAbove(accepted.unlisted.length, 0);
+    const source = {
+      start: 16,
+      end: 30,
+      excerpt: "A: ship safely",
+      sha256: hash("A: ship safely"),
+    };
+    const proposal = {
+      schema: "factory-parent-criteria-proposal/1" as const,
+      issue: 1,
+      basis: { itemVersion: "v1", bodySha256: hash(body) },
+      clauses: [{ id: "A", source }],
+    };
+    const document = {
+      schema: "factory-parent-criteria/1",
+      issue: 1,
+      version: "1",
+      bodySha256: hash(body),
+      clauses: [
+        {
+          id: "A",
+          required: true,
+          state: "open",
+          source: {
+            kind: "issue_acceptance",
+            ref: `https://github.com/${repository}/issues/1#acceptance`,
+            ...source,
+          },
+          evidence: [],
+        },
+      ],
+    };
+    assert.include(
+      criteriaProposalProblems({ proposal, issue: 1, body }).join(),
+      "text outside its list items",
+    );
+    assert.include(
+      preparedCriteriaProblems({
+        proposal,
+        document,
+        issue: 1,
+        repository,
+        body,
+        comments: [],
+        children: [],
+        adopted: undefined,
+      }).join(),
+      "text outside its list items",
     );
   });
 });
