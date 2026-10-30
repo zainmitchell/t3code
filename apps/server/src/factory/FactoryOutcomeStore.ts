@@ -108,6 +108,8 @@ const Receipt = Schema.Struct({
   noEdit: Schema.optional(
     Schema.Struct({
       requirementDigest: Schema.String,
+      /** The admitted requirement as T3 decoded it; absent on receipts recorded before it was kept. */
+      requirement: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
       candidate: Schema.String,
       results: Schema.Array(
         Schema.Struct({

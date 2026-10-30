@@ -22341,13 +22341,13 @@ it.effect(
             instructionRevision: "e04d4b92",
             clauseBinding: "parent 5 clause C05",
           };
-          const at = { baseRef: "main" };
+          const at = { baseRef: "main", requirement };
           yield* usePolicy((input) =>
             Effect.map(stageRequest(input), (decision) =>
               decision !== undefined && "taskKind" in decision
                 ? {
                     ...decision,
-                    noEdit: requirement,
+                    noEdit: at.requirement,
                     workspaceStrategy: { type: "worktree" as const, baseRef: at.baseRef },
                   }
                 : decision,
@@ -22363,11 +22363,19 @@ it.effect(
             `the no-edit unit would not start exactly at its candidate ${candidate}`,
           );
           at.baseRef = candidate;
+          // A requirement bound to another item never starts on this one.
+          at.requirement = { ...requirement, itemKey: itemKeyFor(7907) };
+          assert.deepStrictEqual(admittedOnly(yield* advance("clock", 1)), []);
+          assert.include(
+            (yield* recordOf(7906))?.detail ?? "",
+            "the no-edit unit is bound to another item or item version",
+          );
+          at.requirement = { ...requirement, itemKey: itemKeyFor(7906) };
           const admission = admittedBy(yield* advance("clock", 1));
           if (admission.reservation.origin !== "admitted") {
             return assert.fail("expected an admitted no-edit unit");
           }
-          assert.isTrue(admission.reservation.stageBasis?.endsWith(noEditBasis(requirement)));
+          assert.isTrue(admission.reservation.stageBasis?.endsWith(noEditBasis(at.requirement)));
         }),
       ),
     ),

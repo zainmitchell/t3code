@@ -5015,7 +5015,11 @@ const make = Effect.gen(function* () {
                 requirement.execution !== null &&
                 requirement.execution !== decision.execution
               ? `the no-edit unit names execution ${requirement.execution}, not the one admitted`
-              : undefined;
+              : (requirement.itemKey !== undefined && requirement.itemKey !== itemKey) ||
+                  (requirement.itemVersion !== undefined &&
+                    requirement.itemVersion !== candidate.observation.itemVersion)
+                ? "the no-edit unit is bound to another item or item version"
+                : undefined;
       if (refused !== undefined) {
         return {
           disposition: "nothing_proposed",

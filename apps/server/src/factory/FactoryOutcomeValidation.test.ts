@@ -913,6 +913,7 @@ it.effect("verifies a no-edit unit only by its exact receipt and the logs T3 rea
         if (outcome.state === "verified") {
           assert.deepStrictEqual(outcome.receipt.noEdit, {
             requirementDigest: noEditBasis(requirement).slice("|ne:".length),
+            requirement,
             candidate: head,
             results: requirement.checks.map((check) => ({
               check,
@@ -1059,4 +1060,67 @@ it.effect("binds each admitted no-edit check to exactly one result, whatever its
       }).pipe(Effect.provide(layerTest));
     }
   }),
+);
+
+it.effect(
+  "records the policy's whole no-edit binding in T3's own receipt, and refuses another one",
+  () =>
+    Effect.gen(function* () {
+      const requirement: NoEditRequirement = {
+        schema: "factory-noedit/1",
+        candidate: head,
+        base: head,
+        ownedFiles: [],
+        checks: ["vp run typecheck"],
+        execution: "verifier",
+        instructionRevision: "e04d4b92",
+        clauseBinding: "#5/C05",
+        itemKey: admitted.itemKey,
+        itemVersion: admitted.itemVersion,
+        unit: "d".repeat(64),
+        criteria: "e".repeat(64),
+      };
+      const receiptPath = "/artifacts/receipt.json";
+      const log = { path: "/artifacts/typecheck.log", sha256: "a".repeat(64) };
+      const run = (copied: NoEditRequirement) =>
+        Effect.gen(function* () {
+          const receipt = JSON.stringify({
+            schema: "factory-noedit-receipt/1",
+            requirement: copied,
+            itemKey: admitted.itemKey,
+            itemVersion: admitted.itemVersion,
+            results: [{ check: "vp run typecheck", exitCode: 0, log }],
+          });
+          const fixture = yield* makeFixture(btc131(), {
+            reservation: { ...admitted, stageBasis: `implement:none${noEditBasis(requirement)}` },
+            readArtifact: (_root, path) =>
+              Effect.succeed(
+                path === receiptPath
+                  ? { text: receipt, sha256: "b".repeat(64) }
+                  : { text: "log", sha256: log.sha256 },
+              ),
+          });
+          const { outcomeId } = yield* fixture.ops.report({
+            threadId,
+            report: {
+              outcome: "implemented",
+              summary: "Verified as it is.",
+              subject: { repository: "example/connector", baseCommit: head, headCommit: head },
+              artifacts: [{ path: receiptPath, sha256: "b".repeat(64) }, log],
+            },
+          });
+          yield* fixture.ops.reconcile(factoryId);
+          return Option.getOrThrow(yield* fixture.outcomes.get(outcomeId));
+        }).pipe(Effect.provide(layerTest));
+      const accepted = yield* run(requirement);
+      assert.strictEqual(accepted.state, "verified");
+      if (accepted.state !== "verified") return;
+      assert.deepStrictEqual(accepted.receipt.noEdit?.requirement, requirement);
+      // A receipt copying the requirement for another unit is not the one admitted.
+      const other = yield* run({ ...requirement, unit: "f".repeat(64) });
+      assert.include(
+        other.state === "rejected" ? other.rejection : other.state,
+        "noedit_requirement_mismatch: ",
+      );
+    }),
 );

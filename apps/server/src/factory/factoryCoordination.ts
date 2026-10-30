@@ -936,6 +936,12 @@ export const NoEditRequirement = Schema.Struct({
   execution: Schema.optional(Schema.NullOr(NoEditText)),
   instructionRevision: NoEditText,
   clauseBinding: NoEditText,
+  // What the policy binds the unit to, when it names it: T3 checks the item and its version at
+  // admission, and the digest binds all four, so a receipt for another unit or criteria refuses.
+  itemKey: Schema.optional(NoEditText),
+  itemVersion: Schema.optional(NoEditText),
+  unit: Schema.optional(Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/))),
+  criteria: Schema.optional(Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/))),
 }).check(
   Schema.makeFilter((requirement) => requirement.candidate === requirement.base, {
     expected: "a candidate that is its own base",
@@ -976,6 +982,8 @@ export type NoEditRefusal =
 /** What T3 itself read back for an accepted no-edit report, recorded on its verified outcome. */
 export interface NoEditNativeReceipt {
   readonly requirementDigest: string;
+  /** The admitted requirement exactly as T3 decoded it, every field it binds. */
+  readonly requirement: NoEditRequirement;
   readonly candidate: string;
   readonly results: ReadonlyArray<{
     readonly check: string;
@@ -1074,6 +1082,7 @@ export const noEditReceiptProblem = (input: {
   return {
     receipt: {
       requirementDigest: input.basis.slice("|ne:".length),
+      requirement,
       candidate: requirement.candidate,
       results,
     },

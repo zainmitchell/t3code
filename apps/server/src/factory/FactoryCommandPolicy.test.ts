@@ -708,8 +708,8 @@ it("Policy answer: a parent closure names adopted or prepared criteria as its po
   });
   assert.isTrue(Option.isSome(decode(reserve("retention-period"))));
   assert.isTrue(Option.isNone(decode(reserve("q".repeat(201)))));
-  // A no-edit admit as the policy emits it: no execution named is null, and its own extra keys
-  // (item, version, unit, criteria) are not the requirement.
+  // A no-edit admit as the policy emits it: no execution named is null, and its item, version,
+  // unit and criteria digests are part of the requirement.
   const noEdit = {
     schema: "factory-noedit/1",
     candidate: "c".repeat(40),
@@ -743,6 +743,7 @@ it("Policy answer: a parent closure names adopted or prepared criteria as its po
   assert.isTrue(Option.isNone(decode(admit({ ...noEdit, base: "b".repeat(40) }))));
   assert.isTrue(Option.isNone(decode(admit({ ...noEdit, ownedFiles: ["src/a.ts"] }))));
   assert.isTrue(Option.isNone(decode(admit({ ...noEdit, checks: [] }))));
+  assert.isTrue(Option.isNone(decode(admit({ ...noEdit, unit: "not a digest" }))));
   // Each check is named once: a repeated one could hide a failing result behind a passing one.
   assert.isTrue(Option.isNone(decode(admit({ ...noEdit, checks: ["test", "test"] }))));
   assert.isTrue(
