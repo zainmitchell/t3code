@@ -224,8 +224,10 @@ const overtakenBy = (
   if (isReservationRequest(decision) && decision.question !== undefined) {
     // The gate still asks when it is this question, or the same evidence asked before questions
     // were named; any other pending gate is another question.
-    return pending.decisionId === gateDecisionId({ ...pending, question: decision.question }) ||
-      (pending.decisionId === evidenceGateId(pending) &&
+    return pending.question === decision.question ||
+      pending.decisionId === gateDecisionId({ ...pending, question: decision.question }) ||
+      (pending.question === undefined &&
+        pending.decisionId === evidenceGateId(pending) &&
         pending.evidenceDigest === decision.evidenceDigest)
       ? undefined
       : "the policy now asks another question";
@@ -484,6 +486,16 @@ const choiceBasis = (decision: {
   ((decision.resources ?? []).length === 0 && decision.noEdit === undefined)
     ? ""
     : `|exe:${encodeURIComponent(decision.execution)}`;
+
+/** An execution as it runs: its model selection with options, runtime and interaction mode. */
+const executionIdentity = (execution: {
+  readonly modelSelection: unknown;
+  readonly runtimeMode: string;
+  readonly interactionMode: string;
+}) =>
+  sha256(
+    canonical([execution.modelSelection, execution.runtimeMode, execution.interactionMode]),
+  ).slice(0, 32);
 
 /** The stage-basis suffix naming the single-capacity resources a decision holds. */
 const resourceBasis = (resources: ReadonlyArray<string> | undefined) =>
@@ -1989,9 +2001,11 @@ const triageDecisionOf = (
         (outcome.report.outcome === "not_actionable" && isRoutineGap(outcome.report.failure))) &&
       outcome.failureDigest !== undefined,
   );
-  if (failed?.failureDigest === undefined) return { basis: first, key: firstKey, keys: firstKeys };
+  if (failed?.failureDigest === undefined) {
+    return { basis: first, key: firstKey, keys: firstKeys, keysFor: keysOf };
+  }
   const basis = triageBasis(observation.itemVersion, failed.failureDigest, readback);
-  return { basis, key: keyOf(basis), keys: keysOf(basis), failed };
+  return { basis, key: keyOf(basis), keys: keysOf(basis), keysFor: keysOf, failed };
 };
 
 const make = Effect.gen(function* () {
@@ -3940,27 +3954,6 @@ const make = Effect.gen(function* () {
       },
     });
     const line = integrationLineOf(configuration);
-    // A preparation that failed in its environment is retried only on another execution: the
-    // same one would fail the same way, and its work was never judged.
-    let environment: string | undefined;
-    if (failed.report.failureClass === "environment" && reservationId !== undefined) {
-      const ran = yield* store.getReservation(reservationId);
-      const now = FactoryStore.executionFor(configuration, "triage");
-      const before =
-        Option.isSome(ran) && ran.value.origin === "admitted"
-          ? canonical(ran.value.modelSelection)
-          : undefined;
-      environment = sha256(
-        canonical([now.modelSelection, now.runtimeMode, now.interactionMode]),
-      ).slice(0, 32);
-      if (before === canonical(now.modelSelection)) {
-        return unread(
-          "it ended in its environment and the triage execution is unchanged",
-          "the operator of the triage execution (its provider credential, model or runtime)",
-          "repair or change the factory's triage execution; T3 then prepares the item once on it",
-        );
-      }
-    }
     if (reservationId === undefined) {
       return unread(
         "names no execution whose proposal T3 can read back",
@@ -4070,7 +4063,6 @@ const make = Effect.gen(function* () {
           blocker.outcomes.map((outcome) => [outcome.outcomeId, outcome.state]),
         ]),
         ...(retried.size === 0 ? [] : [[...retried].toSorted(([a], [b]) => a.localeCompare(b))]),
-        ...(environment === undefined ? [] : [["environment", environment]]),
       ]),
     ).slice(0, 32);
     return triageDecisionOf(input, candidate.observation, outcomes, readback);
@@ -4117,7 +4109,25 @@ const make = Effect.gen(function* () {
     const current = yield* triageDecisionFor(configuration, candidate, outcomes);
     if (current === undefined) return prepare(`${outcomeId}'s preparation cannot be read back now`);
     if ("unread" in current) return current.unread;
-    if (outcome.decisionKey === undefined || !current.keys.has(outcome.decisionKey)) {
+    // A preparation run again on another execution after an environment failure is that basis too.
+    const preparedOn =
+      outcome.origin.reservationId === undefined
+        ? Option.none<FactoryStore.FactoryReservation>()
+        : yield* store.getReservation(outcome.origin.reservationId);
+    const retriedBasis =
+      Option.isSome(preparedOn) && preparedOn.value.origin === "admitted"
+        ? preparedOn.value.stageBasis
+        : undefined;
+    const onAnotherExecution =
+      retriedBasis !== undefined &&
+      retriedBasis.startsWith(`${current.basis}:env:`) &&
+      /^[0-9a-f]{32}$/.test(retriedBasis.slice(current.basis.length + ":env:".length)) &&
+      outcome.decisionKey !== undefined &&
+      current.keysFor(retriedBasis).has(outcome.decisionKey);
+    if (
+      !onAnotherExecution &&
+      (outcome.decisionKey === undefined || !current.keys.has(outcome.decisionKey))
+    ) {
       return prepare(
         `${outcomeId} was prepared on other inputs than the item's current text, evidence and policy`,
       );
@@ -4272,6 +4282,22 @@ const make = Effect.gen(function* () {
    * T3 rereads the criteria and judges every clause from its own records and the parent's whole
    * membership; the policy's word that they are met counts for nothing. Its plan, or one wait.
    */
+  /**
+   * The identity of the execution a failed preparation actually ran on: its thread's model
+   * selection (options included), runtime and interaction mode. Undefined when it cannot be read.
+   */
+  const executionRanBy = Effect.fnUntraced(function* (failed: FactoryPolicyOutcome) {
+    const reservationId = failed.origin.reservationId;
+    if (reservationId === undefined) return undefined;
+    const reservation = yield* store.getReservation(reservationId).pipe(Effect.option);
+    const ran = Option.flatten(reservation);
+    if (Option.isNone(ran) || ran.value.origin !== "admitted") return undefined;
+    const projection = yield* projections
+      .getThreadProjection(ran.value.execution.threadId)
+      .pipe(Effect.option);
+    return Option.isNone(projection) ? undefined : executionIdentity(projection.value.thread);
+  });
+
   const closeParent = Effect.fnUntraced(function* (
     configuration: FactoryStore.FactoryConfiguration,
     candidate: Candidate,
@@ -4681,13 +4707,40 @@ const make = Effect.gen(function* () {
                 grant.evidenceDigest === evidenceDigest,
             ).length
           : 0;
-      // A pending gate asked on the same evidence before its question had a name is that question.
+      // A question already asked is that decision in any state: pending, answered or withdrawn.
+      // A gate asked on the same evidence before questions had names is named once, in place.
       if (question !== undefined && kind === "gate") {
-        const unnamed = evidenceGateId({ factoryId, itemKey, stage: stage.type, evidenceDigest });
-        const asked = (yield* outcomeStore.reservedDecisions(factoryId)).some(
-          (decision) => decision.decisionId === unnamed && decision.state === "pending",
+        const gates = (yield* outcomeStore.reservedDecisions(factoryId)).filter(
+          (decision) =>
+            decision.itemKey === itemKey &&
+            decision.stage === stage.type &&
+            (decision.kind ?? "gate") === "gate",
         );
-        if (asked) return;
+        const named = gates.find(
+          (decision) =>
+            decision.question === question ||
+            decision.decisionId ===
+              gateDecisionId({ factoryId, itemKey, stage: stage.type, question }),
+        );
+        const unnamed =
+          named === undefined
+            ? gates.find(
+                (decision) =>
+                  decision.question === undefined &&
+                  decision.decisionId ===
+                    evidenceGateId({ factoryId, itemKey, stage: stage.type, evidenceDigest }),
+              )
+            : undefined;
+        if (unnamed !== undefined) {
+          yield* outcomeStore.nameDecision({ decisionId: unnamed.decisionId, question });
+        }
+        const existing = named ?? unnamed;
+        if (existing !== undefined) {
+          if (existing.state === "pending" && configuration.claim !== undefined) {
+            yield* recordDecisionOnTracker(configuration, subject, existing);
+          }
+          return;
+        }
       }
       const reservedDecision = yield* outcomeStore.reserveDecision({
         // Its exact evidence identifies it, or the question the policy names: the same question
@@ -4704,6 +4757,7 @@ const make = Effect.gen(function* () {
         reason,
         evidenceDigest,
         kind,
+        ...(question !== undefined && kind === "gate" ? { question } : {}),
       });
       if (reservedDecision.state === "pending" && configuration.claim !== undefined) {
         yield* recordDecisionOnTracker(configuration, subject, reservedDecision);
@@ -4846,10 +4900,43 @@ const make = Effect.gen(function* () {
           };
         }
       }
+      // A preparation that failed in its environment runs again only on an execution other than the
+      // one it failed on, once per execution: the same one would fail the same way.
+      let basis = triage.basis;
+      if (triage.failed?.report.failureClass === "environment") {
+        const chosen =
+          decision.execution === undefined
+            ? FactoryStore.executionFor(configuration, "triage")
+            : configuration.executionChoices?.[decision.execution];
+        if (chosen !== undefined) {
+          const ran = yield* executionRanBy(triage.failed);
+          const now = executionIdentity(chosen);
+          if (ran === undefined || ran === now) {
+            return {
+              disposition: "nothing_proposed",
+              detail: waitText({
+                issue: subject.issueNumber,
+                what:
+                  ran === undefined
+                    ? "its last preparation failed in its environment, and T3 cannot read back the execution it ran on"
+                    : "its last preparation failed in its environment, and the execution it would prepare on is the one it failed on",
+                actor: "the operator of that execution (its provider credential, model or runtime)",
+                action:
+                  "repair that execution and change its configuration (model, options, runtime or interaction mode); a credential repair alone is not visible to T3",
+                consequence: "no preparation starts on the environment it failed in",
+                resume:
+                  "the execution the preparation is decided on differs from the one it failed on",
+              }),
+              reasonClass: "waiting",
+            };
+          }
+          basis = `${triage.basis}:env:${now}`;
+        }
+      }
       const admission = yield* admit(
         {
           ...decision,
-          stage: { type: "triage", basis: triage.basis },
+          stage: { type: "triage", basis },
           ...(candidate.owner === undefined ? {} : { continues: candidate.owner.reservationId }),
         },
         collected,

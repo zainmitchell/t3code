@@ -18235,8 +18235,82 @@ it.effect(
           assert.strictEqual(unnamed?.state, "pending");
           yield* ask("retention-period");
           for (const trigger of ["clock", "restart"] as const) yield* advance(trigger, 2);
-          assert.deepStrictEqual(yield* decisionsOf(7897), [unnamed]);
+          // The same record, still pending, now carries the name it is asked by.
+          assert.deepStrictEqual(yield* decisionsOf(7897), [
+            { ...unnamed!, question: "retention-period" },
+          ]);
           assert.strictEqual((yield* commentsWith(7897, "t3-factory-decision")).length, 1);
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Gates/Q4: naming a question asked before questions had names keeps its answer or withdrawal, never asks it again",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* configureLifecycleFactory;
+          yield* configureFactory(lifecycleConfiguration({ pools: pool(2) }));
+          yield* seedIssue(7898);
+          yield* seedIssue(7899);
+          const ask = (evidence: string, question?: string) =>
+            usePolicy(() =>
+              Effect.succeed({
+                type: "reserve" as const,
+                reason: "Which currency are totals exported in?",
+                evidenceDigest: sha256(evidence),
+                ...(question === undefined ? {} : { question }),
+              }),
+            );
+          yield* ask("currency evidence");
+          yield* advance("tracker_event", 2);
+          const outcomes = yield* FactoryOutcomeStore.FactoryOutcomeStore;
+          const [answered] = yield* decisionsOf(7898);
+          const [withdrawn] = yield* decisionsOf(7899);
+          assert.isTrue(
+            yield* outcomes.resolveDecision({
+              decisionId: answered!.decisionId,
+              answer: "EUR",
+              by: "session:owner:card",
+            }),
+          );
+          assert.isTrue(
+            yield* outcomes.supersedeDecision({
+              decisionId: withdrawn!.decisionId,
+              reason: "the policy withdrew it: the owner deferred it",
+            }),
+          );
+          const cards = (issue: number) =>
+            Effect.map(commentsWith(issue, "t3-factory-decision"), (all) => all.length);
+          const stateOf = (issue: number) =>
+            Effect.map(decisionsOf(issue), (all) =>
+              all.map((decision) => [
+                decision.decisionId,
+                decision.state,
+                decision.resolution?.answer,
+                decision.superseded?.reason,
+              ]),
+            );
+          const before = [yield* stateOf(7898), yield* stateOf(7899)];
+          // The upgraded policy names the same question, then rewords its evidence under that name.
+          for (const evidence of ["currency evidence", "currency evidence, reworded"]) {
+            yield* ask(evidence, "export-currency");
+            for (const trigger of ["clock", "restart"] as const) yield* advance(trigger, 2);
+            assert.deepStrictEqual([yield* stateOf(7898), yield* stateOf(7899)], before, evidence);
+            assert.deepStrictEqual([yield* cards(7898), yield* cards(7899)], [1, 1], evidence);
+          }
+          // A genuinely different question is one new decision on each item.
+          yield* ask("archive evidence", "archive-location");
+          yield* advance("clock", 2);
+          for (const issue of [7898, 7899]) {
+            const all = yield* decisionsOf(issue);
+            assert.strictEqual(all.length, 2, `#${issue}`);
+            assert.strictEqual(all[1]!.state, "pending", `#${issue}`);
+            assert.strictEqual(yield* cards(issue), 2, `#${issue}`);
+          }
+          assert.strictEqual((yield* decisionsOf(7898))[0]!.resolution?.answer, "EUR");
         }),
       ),
     ),
@@ -22562,7 +22636,7 @@ it.effect(
           assert.deepStrictEqual(admittedOnly(yield* advance("clock", 3)), []);
           assert.include(
             (yield* recordOf(7961))?.detail ?? "",
-            "it ended in its environment and the triage execution is unchanged",
+            "the execution it would prepare on is the one it failed on",
           );
           // An unrelated configuration change retries nothing.
           yield* configureFactory(lifecycleConfiguration({ pools: pool(2) }));
@@ -22694,6 +22768,112 @@ it.effect(
           for (const trigger of ["restart", "clock"] as const) {
             assert.deepStrictEqual(admittedOnly(yield* advance(trigger, 2)), []);
           }
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Prepare/E2: a preparation failed in its environment retries once only when the execution it chose changes",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const preparer = (runtimeMode: "approval-required" | "full-access") => ({
+            modelSelection: rosterSelection,
+            runtimeMode,
+            interactionMode: "default" as const,
+          });
+          yield* configureLifecycleFactory;
+          yield* configureFactory(
+            lifecycleConfiguration({
+              executionChoices: { preparer: preparer("approval-required") },
+            }),
+          );
+          // The policy prepares under its named preparer on every key T3 offers that has not run,
+          // and builds the unit a verified preparation proposes, adopting it by id.
+          yield* usePolicy((input) => {
+            const proposal = input.outcomes.findLast(
+              (outcome) =>
+                outcome.state === "verified" && outcome.report.outcome === "unit_proposed",
+            );
+            if (proposal !== undefined) {
+              return Effect.map(stageRequest(input), (decision) =>
+                decision !== undefined && "taskKind" in decision
+                  ? {
+                      ...decision,
+                      prepared: proposal.outcomeId,
+                      workspaceStrategy: { type: "worktree" as const, baseRef: lifecycleBase },
+                    }
+                  : decision,
+              );
+            }
+            return input.stage.type === "implement" &&
+              input.triageDecisionKey !== undefined &&
+              !input.outcomes.some((outcome) => outcome.decisionKey === input.triageDecisionKey)
+              ? Effect.map(triageRequest(input), (decision) =>
+                  decision !== undefined && "taskKind" in decision
+                    ? { ...decision, execution: "preparer" }
+                    : decision,
+                )
+              : Effect.succeed({ type: "none" as const, reason: "prepared" });
+          });
+          yield* seedIssue(7981, { body: "Reconcile the ledger." });
+          const triage = admittedBy(yield* advance("tracker_event", 1));
+          const execution = yield* startStage(triage);
+          yield* completeLatestRun(execution.threadId, "failed");
+          yield* advance("outcome", 3);
+          assert.deepStrictEqual(yield* itemHistory(7981), ["triage", "failed"]);
+          // The chosen preparer is unchanged: no retry.
+          assert.deepStrictEqual(admittedOnly(yield* advance("clock", 3)), []);
+          // Changing only the default execution, which this policy does not choose, changes nothing.
+          yield* configureFactory(
+            lifecycleConfiguration({
+              execution: {
+                modelSelection: betaSelection,
+                runtimeMode: "full-access",
+                interactionMode: "default",
+              },
+              executionChoices: { preparer: preparer("approval-required") },
+            }),
+          );
+          assert.deepStrictEqual(admittedOnly(yield* advance("clock", 3)), []);
+          // The wait says what would change it, including that a credential repair is not seen.
+          const waiting = (yield* recordOf(7981))?.detail ?? "";
+          assert.include(waiting, "the execution it would prepare on is the one it failed on");
+          assert.include(waiting, "a credential repair alone is not visible to T3");
+          // Repairing the chosen preparer's runtime is the environment change: one retry on it.
+          yield* configureFactory(
+            lifecycleConfiguration({
+              execution: {
+                modelSelection: betaSelection,
+                runtimeMode: "full-access",
+                interactionMode: "default",
+              },
+              executionChoices: { preparer: preparer("full-access") },
+            }),
+          );
+          const retry = admittedBy(yield* advance("clock", 3));
+          assert.deepStrictEqual(stageOf(retry), [itemKeyFor(7981), "triage"]);
+          for (const trigger of ["restart", "clock"] as const) {
+            assert.deepStrictEqual(admittedOnly(yield* advance(trigger, 3)), []);
+          }
+          // Its proposal is the current preparation: the build adopting it starts, once.
+          yield* workStage(retry, {
+            outcome: "unit_proposed",
+            summary: "One unit.",
+            proposal: {
+              basis: admittedVersion(retry),
+              unit: "## Owned files\n- src/ledger.ts",
+              ownedFiles: ["src/ledger.ts"],
+            },
+            subject: { repository: claimRepository, baseCommit: lifecycleBase },
+          });
+          assert.deepStrictEqual(stageOf(admittedBy(yield* advance("outcome", 3))), [
+            itemKeyFor(7981),
+            "implement",
+          ]);
+          assert.deepStrictEqual(admittedOnly(yield* advance("restart", 3)), []);
         }),
       ),
     ),

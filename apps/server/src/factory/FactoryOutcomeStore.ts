@@ -154,6 +154,8 @@ export const ReservedDecision = Schema.Struct({
   evidenceDigest: Schema.String,
   /** `grant`: the owner may answer with finite authority for this exact subject. */
   kind: Schema.optional(Schema.Literals(["gate", "grant"])),
+  /** The question a policy named this gate by; set once, also on a gate asked before names. */
+  question: Schema.optional(Schema.String),
   state: Schema.Literals(["pending", "resolved", "superseded"]),
   createdAt: Schema.String,
   resolution: Schema.optional(
@@ -289,6 +291,14 @@ export class FactoryOutcomeStore extends Context.Service<
     readonly supersedeDecision: (input: {
       readonly decisionId: string;
       readonly reason: string;
+    }) => Effect.Effect<boolean, FactoryOutcomeStoreError>;
+    /**
+     * Names the question a gate asked before questions had names, in place, keeping its state,
+     * answer and history. A gate already named keeps its name.
+     */
+    readonly nameDecision: (input: {
+      readonly decisionId: string;
+      readonly question: string;
     }) => Effect.Effect<boolean, FactoryOutcomeStoreError>;
   }
 >()("t3/factory/FactoryOutcomeStore") {}
@@ -841,6 +851,25 @@ const make = Effect.gen(function* () {
         return updated.length === 1;
       },
       Effect.mapError(fail("supersede-decision")),
+    ),
+    nameDecision: Effect.fn("FactoryOutcomeStore.nameDecision")(
+      function* (input: { readonly decisionId: string; readonly question: string }) {
+        const rows = yield* sql<{ readonly record_json: string }>`
+          SELECT record_json FROM factory_reserved_decisions WHERE decision_id = ${input.decisionId}
+        `;
+        if (rows[0] === undefined) return false;
+        const decision = yield* decodeDecision(rows[0].record_json);
+        if (decision.question !== undefined) return decision.question === input.question;
+        const named: ReservedDecision = { ...decision, question: input.question };
+        const updated = yield* sql`
+          UPDATE factory_reserved_decisions SET record_json = ${yield* encodeDecision(named)}
+          WHERE decision_id = ${input.decisionId}
+            AND json_extract(record_json, '$.question') IS NULL
+          RETURNING decision_id
+        `;
+        return updated.length === 1;
+      },
+      Effect.mapError(fail("name-decision")),
     ),
   });
 });
