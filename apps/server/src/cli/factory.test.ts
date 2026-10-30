@@ -13,6 +13,7 @@ import {
 } from "@t3tools/contracts";
 import * as NetService from "@t3tools/shared/Net";
 import * as Cause from "effect/Cause";
+import * as Console from "effect/Console";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -29,6 +30,7 @@ import {
   FactoryCliError,
   hostAdminDestination,
   pendingDecisions,
+  refusedHistoricalTermination,
   remoteDestination,
   retirementPlan,
   runAudited,
@@ -709,4 +711,83 @@ it.effect(
         "no running T3 server",
       );
     }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NetService.layer))),
+);
+
+it.effect(
+  "Historical termination: a response naming refusals exits failed and is audited as failed; a clean read or record succeeds",
+  () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const stateDir = yield* fs.makeTempDirectoryScoped({ prefix: "factory-cli-" });
+      const runtimeStatePath = path.join(stateDir, "server-runtime.json");
+      yield* fs.writeFileString(
+        runtimeStatePath,
+        JSON.stringify({
+          version: 1,
+          pid: 1,
+          port: 3773,
+          origin: "http://127.0.0.1:3773",
+          startedAt: "2026-10-30T00:00:00.000Z",
+        }),
+      );
+      const auth = recordingAuth();
+      const printed: Array<string> = [];
+      const testConsole = {
+        ...globalThis.console,
+        log: (...args: ReadonlyArray<unknown>) => {
+          printed.push(args.map(String).join(" "));
+        },
+      } satisfies Console.Console;
+      // Each, as the lifecycle returns it over the RPC.
+      const call = (result: {
+        readonly applied: boolean;
+        readonly refusals: ReadonlyArray<string>;
+        readonly evidenceDigest?: string;
+      }) =>
+        Effect.exit(
+          runAudited(
+            {
+              stateDir,
+              call: { operation: "historical-termination-capture-read", request: {} },
+              destination: hostAdminDestination("historical-termination", runtimeStatePath),
+              connect: () => Effect.void,
+            },
+            () => refusedHistoricalTermination(result),
+          ).pipe(Effect.provide(auth.layer), Effect.provideService(Console.Console, testConsole)),
+        );
+
+      const refused = yield* call({ applied: false, refusals: ["unknown_reservation"] });
+      assert.isTrue(Exit.isFailure(refused));
+      const error = Exit.isFailure(refused) ? Cause.squash(refused.cause) : undefined;
+      assert.instanceOf(error, FactoryCliError);
+      assert.strictEqual((error as FactoryCliError).reason, "refused: unknown_reservation");
+      // Its structured result is still printed, once, for the operator to read.
+      assert.deepStrictEqual(printed, ['{"applied":false,"refusals":["unknown_reservation"]}']);
+
+      const read = yield* call({ applied: false, refusals: [], evidenceDigest: "d".repeat(64) });
+      const recorded = yield* call({ applied: true, refusals: [], evidenceDigest: "d".repeat(64) });
+      assert.isTrue(Exit.isSuccess(read) && Exit.isSuccess(recorded));
+      // Success prints nothing here: the command prints the returned result itself.
+      assert.strictEqual(printed.length, 1);
+
+      assert.deepStrictEqual(
+        (yield* auditLines(stateDir)).map((line) => [line.outcome, line.error ?? line.result]),
+        [
+          [
+            "failed",
+            "FactoryCliError: factory historical-termination: refused: unknown_reservation",
+          ],
+          ["succeeded", { applied: false, refusals: [], evidenceDigest: "d".repeat(64) }],
+          ["succeeded", { applied: true, refusals: [], evidenceDigest: "d".repeat(64) }],
+        ],
+      );
+      // Every call's session is revoked, refused or not, and no token is written.
+      assert.deepStrictEqual(auth.revoked, [
+        "session:host-admin",
+        "session:host-admin",
+        "session:host-admin",
+      ]);
+      assert.notInclude(yield* auditText(stateDir), SESSION_TOKEN);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );

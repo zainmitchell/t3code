@@ -841,6 +841,29 @@ const disposeCommand = Command.make("dispose", {
   ),
 );
 
+/**
+ * A response that names any refusal is the command's failure: its structured result is printed
+ * once, then the call fails, so the exit status and the audit say refused. A clean read, applied
+ * or not, is a success.
+ */
+export const refusedHistoricalTermination = <
+  A extends { readonly refusals: ReadonlyArray<string> },
+>(
+  result: A,
+) =>
+  result.refusals.length === 0
+    ? Effect.succeed(result)
+    : printJson(result).pipe(
+        Effect.andThen(
+          Effect.fail(
+            new FactoryCliError({
+              operation: "historical-termination",
+              reason: `refused: ${result.refusals.join(", ")}`,
+            }),
+          ),
+        ),
+      );
+
 const historicalTerminationCommand = Command.make("historical-termination", {
   ...factoryLocationFlags,
   request: fileArgument(
@@ -878,7 +901,10 @@ const historicalTerminationCommand = Command.make("historical-termination", {
           request: input,
           documentSha256: request.sha256,
         },
-        (client) => client[WS_METHODS.factoryHistoricalTermination](input),
+        (client) =>
+          client[WS_METHODS.factoryHistoricalTermination](input).pipe(
+            Effect.flatMap(refusedHistoricalTermination),
+          ),
       );
     }).pipe(Effect.flatMap(printJson)),
   ),
