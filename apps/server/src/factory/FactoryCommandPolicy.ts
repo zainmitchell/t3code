@@ -120,11 +120,27 @@ const PolicyDecision = Schema.Union([
      * `held`, `excluded` or `other`. T3 itself records `prepared_stale`.
      */
     class: Schema.optional(Bounded(64)),
+    /**
+     * Withdraws one pending gate this policy raised that no longer stands, as `GateWithdrawal`
+     * names it. Read exactly: any other shape fails this item's decision, withdrawing nothing.
+     */
+    withdraws: Schema.optional(Schema.Unknown),
   }),
   /** A product gate on integration found the work at fault; it goes back to correction. */
   Schema.Struct({ decision: Schema.Literal("fail"), failure: Bounded(20_000) }),
 ]);
 type PolicyDecision = typeof PolicyDecision.Type;
+
+/** A pending gate, named as the policy input gave it, and the version and revision deciding now. */
+const GateWithdrawal = Schema.Struct({
+  decisionId: Bounded(200),
+  evidenceDigest: Bounded(200),
+  stage: Bounded(64),
+  itemVersion: Bounded(2_000),
+  policyRevision: Bounded(2_000),
+  reason: Bounded(2_000),
+});
+const decodeWithdrawal = Schema.decodeUnknownOption(GateWithdrawal, { onExcessProperty: "error" });
 
 /** The policy's answer for a pass: decisions in the order it wants them carried out. */
 export const PolicyAnswer = Schema.Struct({
@@ -426,10 +442,16 @@ export const layer = Layer.effect(
     ): Effect.fn.Return<FactoryLifecycle.FactoryPolicyDecision> {
       switch (decision.decision) {
         case "none": {
+          const withdraws =
+            decision.withdraws === undefined ? undefined : decodeWithdrawal(decision.withdraws);
+          if (withdraws !== undefined && Option.isNone(withdraws)) {
+            return policyFailure("policy withdrawal is not a gate withdrawal");
+          }
           const nothing: FactoryLifecycle.FactoryNothingProposed = {
             type: "none",
             reason: decision.reason,
             ...(decision.class === undefined ? {} : { class: decision.class }),
+            ...(withdraws === undefined ? {} : { withdraws: withdraws.value }),
           };
           return nothing;
         }

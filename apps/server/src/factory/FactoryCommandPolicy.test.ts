@@ -221,6 +221,76 @@ it.live("Policy: nothing to do, a broken answer and a changed pin start nothing"
   }).pipe(Effect.provide(layer)),
 );
 
+/** A pinned one-shot policy that answers `decision` for the item, whatever it is given. */
+const answering = (decision: unknown) =>
+  Effect.acquireRelease(
+    Effect.sync(() => {
+      const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-factory-policy-"));
+      const script = NodePath.join(root, "policy.mjs");
+      const answer = JSON.stringify({ decisions: [{ itemKey, decision }] });
+      NodeFS.writeFileSync(
+        script,
+        `process.stdin.resume();\nprocess.stdin.on("end", () => process.stdout.write(${JSON.stringify(answer)}));\n`,
+      );
+      return { root, script, sha256: sha256(NodeFS.readFileSync(script)) };
+    }),
+    ({ root }) => Effect.sync(() => NodeFS.rmSync(root, { recursive: true, force: true })),
+  );
+
+const gateWithdrawal = {
+  decisionId: "479bf8dc0c9d2c736ef620e93351c01c12cb7fe2",
+  evidenceDigest: sha256("evidence of #9"),
+  stage: "implement",
+  itemVersion: "v1",
+  policyRevision: "policy-r1",
+  reason: "the owner deferred this optional question",
+};
+
+it.live.each([
+  [
+    "an exact withdrawal is carried as given",
+    { withdraws: gateWithdrawal },
+    { type: "none", reason: "held", class: "held", withdraws: gateWithdrawal },
+  ],
+  [
+    "a withdrawal with a field T3 does not read fails the item",
+    { withdraws: { ...gateWithdrawal, answer: "no" } },
+    { type: "policy_failed", reason: "policy withdrawal is not a gate withdrawal" },
+  ],
+  [
+    "a withdrawal missing its evidence fails the item",
+    { withdraws: { ...gateWithdrawal, evidenceDigest: undefined } },
+    { type: "policy_failed", reason: "policy withdrawal is not a gate withdrawal" },
+  ],
+  [
+    "a withdrawal that is not a record fails the item",
+    { withdraws: "479bf8dc0c9d2c736ef620e93351c01c12cb7fe2" },
+    { type: "policy_failed", reason: "policy withdrawal is not a gate withdrawal" },
+  ],
+  [
+    "a misspelled withdrawal withdraws nothing",
+    { withdraw: gateWithdrawal },
+    { type: "none", reason: "held", class: "held" },
+  ],
+] as const)("Policy/G1: %s", ([, fields, expected]) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const pinned = yield* answering({
+        decision: "none",
+        reason: "held",
+        class: "held",
+        ...fields,
+      });
+      const config = configuration({
+        executable: process.execPath,
+        script: pinned.script,
+        sha256: pinned.sha256,
+      });
+      assert.deepStrictEqual(only(yield* decide([{ labels: [] }], config)), expected);
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
 it("Policy input: each item's relations and the work under way reach the policy as read", () => {
   const issue = {
     state: "open" as const,

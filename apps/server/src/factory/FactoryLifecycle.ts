@@ -203,6 +203,45 @@ const overtakenBy = (
     : "the evidence it was asked on changed";
 };
 
+/**
+ * The pending gate a policy's explicit withdrawal supersedes, or why it supersedes none: only an
+ * unanswered owner gate of this item, stage and evidence, withdrawn on the item version and policy
+ * revision of this pass. A grant request, or T3's own ticket question, is never withdrawn.
+ */
+const withdrawalOf = (
+  reserved: ReadonlyArray<FactoryOutcomeStore.ReservedDecision>,
+  candidate: {
+    readonly itemKey: FactoryItemKey;
+    readonly stage: FactoryStage;
+    readonly observation: { readonly itemVersion: string };
+  },
+  withdrawal: FactoryGateWithdrawal,
+  policyRevision: string,
+): { readonly decisionId: string; readonly reason: string } | { readonly refused: string } => {
+  const named = `decision ${withdrawal.decisionId}`;
+  const pending = reserved.find((decision) => decision.decisionId === withdrawal.decisionId);
+  if (pending === undefined || pending.itemKey !== candidate.itemKey) {
+    return { refused: `${named} is not this item's` };
+  }
+  if (pending.state !== "pending") return { refused: `${named} is already ${pending.state}` };
+  if ((pending.kind ?? "gate") !== "gate" || pending.stage === TICKET_DECISION_STAGE) {
+    return { refused: `${named} is not a policy gate` };
+  }
+  if (withdrawal.stage !== pending.stage || pending.stage !== candidate.stage.type) {
+    return { refused: `${named} was asked at its ${pending.stage} stage, not ${withdrawal.stage}` };
+  }
+  if (withdrawal.evidenceDigest !== pending.evidenceDigest) {
+    return { refused: `${named} was asked on other evidence` };
+  }
+  if (withdrawal.itemVersion !== candidate.observation.itemVersion) {
+    return { refused: `the withdrawal of ${named} names another item version` };
+  }
+  if (withdrawal.policyRevision !== policyRevision) {
+    return { refused: `the withdrawal of ${named} names another policy revision` };
+  }
+  return { decisionId: pending.decisionId, reason: `the policy withdrew it: ${withdrawal.reason}` };
+};
+
 /** An answer to a factory card the factory refused, with the reason its owner sees. */
 export class FactoryCardRefused extends Schema.TaggedError<FactoryCardRefused>()(
   "FactoryCardRefused",
@@ -523,6 +562,21 @@ export interface FactoryNothingProposed {
   readonly reason: string;
   /** A class the owner can count across passes, such as `needs_routing`. */
   readonly class?: string;
+  /** One pending owner gate the policy raised that no longer stands; never an answer to it. */
+  readonly withdraws?: FactoryGateWithdrawal;
+}
+
+/**
+ * A policy's explicit withdrawal of one pending gate, naming it as the policy was given it: its
+ * decision, evidence and stage, the item version and the policy revision it decides on now.
+ */
+export interface FactoryGateWithdrawal {
+  readonly decisionId: string;
+  readonly evidenceDigest: string;
+  readonly stage: string;
+  readonly itemVersion: string;
+  readonly policyRevision: string;
+  readonly reason: string;
 }
 
 /**
@@ -2567,6 +2621,68 @@ const make = Effect.gen(function* () {
     readonly events: ReadonlyArray<FactoryOutcomeStore.StoredItemEvent>;
   }
 
+  /**
+   * Supersedes the one gate a policy's explicit withdrawal names, only while everything it was
+   * decided on still stands. One write transaction rereads the configuration, the item's later
+   * reads, its lifecycle and the gate; the pass's own snapshot of them is never enough.
+   */
+  const withdrawGate = Effect.fnUntraced(function* (
+    configuration: FactoryStore.FactoryConfiguration,
+    candidate: Candidate,
+    withdrawal: FactoryGateWithdrawal,
+  ) {
+    const { factoryId } = configuration;
+    const stale = (why: string) => ({
+      refused: `the withdrawal of decision ${withdrawal.decisionId} ${why}`,
+    });
+    return yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const current = yield* store.getConfiguration(factoryId);
+          if (
+            Option.isNone(current) ||
+            current.value.revision !== configuration.revision ||
+            current.value.policyRevision !== withdrawal.policyRevision
+          ) {
+            return stale("was decided on a factory configuration since replaced");
+          }
+          const later = yield* store.observationsAfter({
+            factoryId,
+            observationId: candidate.observation.observationId,
+          });
+          if (later.some((read) => !read.complete || read.itemVersion !== withdrawal.itemVersion)) {
+            return stale("was decided on an item read over since");
+          }
+          const events = yield* outcomeStore.itemEvents({ factoryId, itemKey: candidate.itemKey });
+          if (
+            events.map((event) => event.seq).join() !==
+            candidate.events.map((event) => event.seq).join()
+          ) {
+            return stale("was decided before the item's lifecycle moved");
+          }
+          const checked = withdrawalOf(
+            yield* outcomeStore.reservedDecisions(factoryId),
+            { itemKey: candidate.itemKey, stage: nextStage(events), observation: candidate.observation },
+            withdrawal,
+            current.value.policyRevision,
+          );
+          if ("refused" in checked) return checked;
+          // Pending only: an answer or supersession that committed first stands.
+          return (yield* outcomeStore.supersedeDecision(checked))
+            ? { withdrew: checked.decisionId }
+            : stale("lost to an answer or supersession committed first");
+        }),
+      )
+      .pipe(
+        Effect.catchTags({
+          SqlError: (cause) =>
+            Effect.fail(
+              new FactoryOutcomeStore.FactoryOutcomeStoreError({ operation: "withdraw-gate", cause }),
+            ),
+        }),
+      );
+  });
+
   const collectPass = Effect.fnUntraced(function* (
     factoryId: FactoryId,
     configuration: FactoryStore.FactoryConfiguration,
@@ -3255,6 +3371,12 @@ const make = Effect.gen(function* () {
             moved = true;
             retry = true;
           }
+          const withdrawal =
+            decision !== undefined &&
+            isNothingProposed(decision) &&
+            decision.withdraws !== undefined
+              ? yield* withdrawGate(configuration, candidate, decision.withdraws)
+              : undefined;
           for (const pending of reserved) {
             if (pending.itemKey !== itemKey || pending.state !== "pending") continue;
             // T3's own question about a ticket create is settled by that create, not the policy.
@@ -3264,31 +3386,29 @@ const make = Effect.gen(function* () {
               yield* outcomeStore.supersedeDecision({ decisionId: pending.decisionId, reason });
             }
           }
+          const detail =
+            withdrawal !== undefined && "refused" in withdrawal
+              ? `${result.detail}; T3 withdrew nothing: ${withdrawal.refused}`
+              : result.detail;
           // A precise reason to start nothing is a wait, kept once per basis; anything else ends it.
           yield* outcomeStore.recordWait({
             factoryId,
             itemKey,
             wait:
-              result.disposition === "nothing_proposed" && result.detail !== undefined
+              result.disposition === "nothing_proposed" && detail !== undefined
                 ? {
                     basis: sha256(
-                      canonical([candidate.stage.type, result.reasonClass ?? null, result.detail]),
+                      canonical([candidate.stage.type, result.reasonClass ?? null, detail]),
                     ).slice(0, 32),
                     stage: candidate.stage.type,
                     reasonClass: result.reasonClass,
-                    detail: result.detail,
+                    detail,
                   }
                 : { ended: result.disposition },
           });
           if (result.admission !== undefined) admissions.push(result.admission);
           if (result.issue !== undefined) issues.push(result.issue);
-          note(
-            itemKey,
-            candidate.stage.type,
-            result.disposition,
-            result.detail,
-            result.reasonClass,
-          );
+          note(itemKey, candidate.stage.type, result.disposition, detail, result.reasonClass);
         }
         for (const candidate of candidates) {
           if (!decided.has(candidate.itemKey)) {

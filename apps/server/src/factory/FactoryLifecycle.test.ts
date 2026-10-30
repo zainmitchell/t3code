@@ -17129,6 +17129,337 @@ it.effect(
     ),
 );
 
+/** The retained btc-tracker #9 question its policy asked against the owner's own deferral. */
+const deferredQuestion =
+  "#9 preparation needs the owner: decision: Can one Tracker 03 file hold rows from more than one account? The owner deferred this optional question and directed that it not be asked again.";
+const btcPolicyRevision = "btc-policy:7297a6c7e467ed5f:b097f9d087474859";
+const heldReason = "held: deferred by the owner";
+
+/** A pending gate an item's own policy input carries, as the policy would name it to withdraw. */
+const withdrawalFor = (
+  input: Parameters<ProposeFn>[0],
+  decision: FactoryOutcomeStore.ReservedDecision,
+  overrides: Partial<FactoryLifecycle.FactoryGateWithdrawal> = {},
+): FactoryLifecycle.FactoryGateWithdrawal => ({
+  decisionId: decision.decisionId,
+  evidenceDigest: decision.evidenceDigest,
+  stage: decision.stage,
+  itemVersion: input.observation.itemVersion,
+  policyRevision: input.configuration.policyRevision,
+  reason: "the owner deferred this optional question and directed that it not be asked again",
+  ...overrides,
+});
+
+const heldWithdrawing = (
+  withdraws?: FactoryLifecycle.FactoryGateWithdrawal,
+): FactoryLifecycle.FactoryPolicyDecision => ({
+  type: "none",
+  reason: heldReason,
+  class: "held",
+  ...(withdraws === undefined ? {} : { withdraws }),
+});
+
+const decisionsOf = (issueNumber: number) =>
+  Effect.map(
+    Effect.flatMap(FactoryOutcomeStore.FactoryOutcomeStore, (outcomes) =>
+      outcomes.reservedDecisions(factoryId),
+    ),
+    (decisions) => decisions.filter((decision) => decision.itemKey === itemKeyFor(issueNumber)),
+  );
+
+const waitDetailOf = (issueNumber: number) =>
+  Effect.flatMap(FactoryLifecycle.FactoryLifecycle, (factory) =>
+    Effect.map(
+      factory.readState({ factoryId }),
+      (state) => state.waits.find((wait) => wait.itemKey === itemKeyFor(issueNumber))?.detail,
+    ),
+  );
+
+const issueNumberOf = (itemKey: string) => Number(/#(\d+)$/.exec(itemKey)![1]);
+
+it.effect(
+  "Gates/G1: a policy's exact withdrawal supersedes only its own pending gate, once; nothing else is withdrawn",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* configureLifecycleFactory;
+          yield* configureFactory(lifecycleConfiguration({ policyRevision: btcPolicyRevision }));
+          // Each item asks its owner on its own evidence; one is a supervised start's grant request.
+          yield* usePolicy((input) =>
+            issueNumberOf(input.observation.itemKey) === 7803
+              ? proposeSupervised(input)
+              : Effect.succeed({
+                  type: "reserve",
+                  reason:
+                    issueNumberOf(input.observation.itemKey) === 7801
+                      ? deferredQuestion
+                      : `A genuine owner decision for ${input.observation.itemKey}.`,
+                  evidenceDigest: sha256(`evidence of ${input.observation.itemKey}`),
+                }),
+          );
+          const items = [7801, 7802, 7803, 7804, 7805, 7806, 7807, 7808, 7809];
+          for (const issueNumber of items) yield* seedIssue(issueNumber);
+          assert.deepStrictEqual(admissionsOnly(yield* advance("tracker_event", 2)), []);
+          const [asked] = yield* decisionsOf(7801);
+          const [genuine] = yield* decisionsOf(7802);
+          const [grantRequest] = yield* decisionsOf(7803);
+          assert.deepStrictEqual(
+            [asked?.state, asked?.stage, asked?.reason, genuine?.state, grantRequest?.kind],
+            ["pending", "implement", deferredQuestion, "pending", "grant"],
+          );
+          assert.strictEqual((yield* commentsWith(7801, "t3-factory-decision")).length, 1);
+          const store = yield* FactoryStore.FactoryStore;
+          yield* store.issueGrant({
+            factoryId,
+            itemKey: grantRequest!.itemKey,
+            stage: grantRequest!.stage,
+            evidenceDigest: grantRequest!.evidenceDigest,
+            units: 1,
+            decisionId: grantRequest!.decisionId,
+            by: "session:owner:card",
+          });
+
+          // The corrected policy holds every item; only the deferred question's gate is named exactly.
+          const named = new Map<number, Partial<FactoryLifecycle.FactoryGateWithdrawal>>([
+            [7801, {}],
+            [7803, {}],
+            [7804, { evidenceDigest: sha256("other evidence") }],
+            [7805, { itemVersion: "an earlier version" }],
+            [7806, { policyRevision: "btc-policy:0000000000000000:0000000000000000" }],
+            [7807, { stage: "review" }],
+            [7808, { decisionId: genuine!.decisionId }],
+          ]);
+          yield* usePolicy((input) => {
+            const issueNumber = issueNumberOf(input.observation.itemKey);
+            if (issueNumber === 7809) {
+              return Effect.succeed({ type: "policy_failed", reason: "policy could not decide" });
+            }
+            const pending = input.reserved.find((decision) => decision.state === "pending");
+            const overrides = named.get(issueNumber);
+            return Effect.succeed(
+              heldWithdrawing(
+                pending === undefined || overrides === undefined
+                  ? undefined
+                  : withdrawalFor(input, pending, overrides),
+              ),
+            );
+          });
+          // Two collections at once, then later passes and a restart: one change, made once.
+          const factory = yield* FactoryLifecycle.FactoryLifecycle;
+          yield* Effect.all(
+            [
+              factory.reconcile({ factoryId, trigger: "clock" }),
+              factory.reconcile({ factoryId, trigger: "clock" }),
+            ],
+            { concurrency: "unbounded" },
+          );
+          assert.deepStrictEqual(admissionsOnly(yield* advance("clock", 2)), []);
+          const [withdrawn] = yield* decisionsOf(7801);
+          assert.strictEqual(withdrawn?.state, "superseded");
+          // The question it asked stays as asked, unanswered; the reason names who withdrew it.
+          assert.strictEqual(withdrawn?.reason, deferredQuestion);
+          assert.isUndefined(withdrawn?.resolution);
+          assert.strictEqual(
+            withdrawn?.superseded?.reason,
+            "the policy withdrew it: the owner deferred this optional question and directed that it not be asked again",
+          );
+          for (const trigger of ["restart", "clock", "owner_decision"] as const) {
+            assert.deepStrictEqual(admissionsOnly(yield* advance(trigger, 2)), []);
+          }
+          assert.deepStrictEqual(yield* decisionsOf(7801), [withdrawn]);
+          assert.strictEqual((yield* commentsWith(7801, "t3-factory-decision")).length, 1);
+          // Every other gate, and the grant request with its unspent grant, still waits for its owner.
+          for (const issueNumber of items.slice(1)) {
+            assert.deepStrictEqual(
+              (yield* decisionsOf(issueNumber)).map((decision) => decision.state),
+              ["pending"],
+              `#${issueNumber}`,
+            );
+          }
+          assert.deepStrictEqual(
+            (yield* grantsOf(7803)).map((grant) => [grant.state, grant.remaining]),
+            [["active", 1]],
+          );
+          // A withdrawal T3 refused says why, where the item's wait is shown.
+          const refused = new Map([
+            [7803, `decision ${grantRequest!.decisionId} is not a policy gate`],
+            [7804, "was asked on other evidence"],
+            [7805, "names another item version"],
+            [7806, "names another policy revision"],
+            [7807, "was asked at its implement stage, not review"],
+            [7808, `decision ${genuine!.decisionId} is not this item's`],
+          ]);
+          for (const [issueNumber, why] of refused) {
+            const detail = yield* waitDetailOf(issueNumber);
+            assert.include(detail, `${heldReason}; T3 withdrew nothing: `, `#${issueNumber}`);
+            assert.include(detail, why, `#${issueNumber}`);
+          }
+          assert.strictEqual(yield* waitDetailOf(7802), heldReason);
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Gates/G2: an owner's answer and a policy's withdrawal never overwrite each other, in either order",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* configureLifecycleFactory;
+          yield* usePolicy((input) =>
+            Effect.succeed({
+              type: "reserve",
+              reason: deferredQuestion,
+              evidenceDigest: sha256(`evidence of ${input.observation.itemKey}`),
+            }),
+          );
+          yield* seedIssue(7821);
+          yield* seedIssue(7822);
+          yield* advance("tracker_event", 2);
+          const outcomes = yield* FactoryOutcomeStore.FactoryOutcomeStore;
+          const [answered] = yield* decisionsOf(7821);
+          // The owner answers one gate before any withdrawal: the answer stands, and is never withdrawn.
+          assert.isTrue(
+            yield* outcomes.resolveDecision({
+              decisionId: answered!.decisionId,
+              answer: "no",
+              by: "session:owner:card",
+            }),
+          );
+          // The policy names each item's own gate, answered or not, exactly.
+          yield* usePolicy((input) => {
+            const gate = input.reserved[0];
+            return Effect.succeed(
+              heldWithdrawing(gate === undefined ? undefined : withdrawalFor(input, gate)),
+            );
+          });
+          yield* advance("clock", 2);
+          const [stillAnswered] = yield* decisionsOf(7821);
+          assert.deepStrictEqual(
+            [stillAnswered?.state, stillAnswered?.resolution?.answer, stillAnswered?.superseded],
+            ["resolved", "no", undefined],
+          );
+          assert.include(
+            yield* waitDetailOf(7821),
+            `decision ${answered!.decisionId} is already resolved`,
+          );
+          // The other was withdrawn first: an answer arriving after it changes nothing.
+          const [withdrawn] = yield* decisionsOf(7822);
+          assert.strictEqual(withdrawn?.state, "superseded");
+          assert.isFalse(
+            yield* outcomes.resolveDecision({
+              decisionId: withdrawn!.decisionId,
+              answer: "yes",
+              by: "session:owner:card",
+            }),
+          );
+          assert.deepStrictEqual(yield* decisionsOf(7822), [withdrawn]);
+        }),
+      ),
+    ),
+);
+
+/**
+ * A pending gate on `issueNumber`, then a policy whose next decision withdraws it exactly as its
+ * input names it, after `meanwhile` changed what that input was read from.
+ */
+const withdrawAfter = (
+  issueNumber: number,
+  meanwhile: (
+    input: Parameters<ProposeFn>[0],
+    gate: FactoryOutcomeStore.ReservedDecision,
+  ) => Effect.Effect<unknown, unknown, FactoryStore.FactoryStore | FactoryOutcomeStore.FactoryOutcomeStore>,
+) =>
+  Effect.gen(function* () {
+    yield* configureLifecycleFactory;
+    yield* seedIssue(issueNumber);
+    yield* usePolicy(() =>
+      Effect.succeed({
+        type: "reserve",
+        reason: "A genuine owner question.",
+        evidenceDigest: sha256("original"),
+      }),
+    );
+    yield* advance("tracker_event", 2);
+    const store = yield* FactoryStore.FactoryStore;
+    const outcomes = yield* FactoryOutcomeStore.FactoryOutcomeStore;
+    yield* usePolicy((input) =>
+      Effect.gen(function* () {
+        const gate = input.reserved[0]!;
+        const withdrawal = withdrawalFor(input, gate);
+        yield* meanwhile(input, gate).pipe(
+          Effect.provideService(FactoryStore.FactoryStore, store),
+          Effect.provideService(FactoryOutcomeStore.FactoryOutcomeStore, outcomes),
+          Effect.orDie,
+        );
+        // Later passes hold without withdrawing: only the stale decision names the gate.
+        yield* usePolicy(() => Effect.succeed(heldWithdrawing()));
+        return heldWithdrawing(withdrawal);
+      }),
+    );
+    yield* advance("clock", 2);
+    return { gate: (yield* decisionsOf(issueNumber))[0]!, detail: yield* waitDetailOf(issueNumber) };
+  });
+
+it.effect(
+  "Gates/W1: a withdrawal decided under a policy revision adopted over withdraws nothing",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const { gate } = yield* withdrawAfter(7891, () =>
+            configureFactory(lifecycleConfiguration({ policyRevision: "policy-r2" })),
+          );
+          assert.deepStrictEqual([gate.state, gate.superseded], ["pending", undefined]);
+          const current = yield* (yield* FactoryStore.FactoryStore).getConfiguration(factoryId);
+          assert.strictEqual(Option.getOrThrow(current).policyRevision, "policy-r2");
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Gates/W2: a withdrawal decided on an item version read over withdraws nothing",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const { gate } = yield* withdrawAfter(7892, (input) =>
+            observe(input.observation.itemKey, { itemVersion: "newer-durable-version" }),
+          );
+          assert.deepStrictEqual([gate.state, gate.superseded], ["pending", undefined]);
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Gates/W3: an owner's answer committed while the policy decides stands; the withdrawal changes nothing",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const { gate, detail } = yield* withdrawAfter(7893, (_input, pending) =>
+            Effect.flatMap(FactoryOutcomeStore.FactoryOutcomeStore, (outcomes) =>
+              outcomes.resolveDecision({
+                decisionId: pending.decisionId,
+                answer: "no",
+                by: "session:owner:card",
+              }),
+            ),
+          );
+          assert.deepStrictEqual(
+            [gate.state, gate.resolution?.answer, gate.superseded],
+            ["resolved", "no", undefined],
+          );
+          assert.include(detail, `decision ${gate.decisionId} is already resolved`);
+        }),
+      ),
+    ),
+);
+
 const legacyJob = "alpha_supervised";
 const legacyTask = ScheduledTaskId.make(
   "scheduled-task:command:mcp:45f4b96b:schedule-task:alpha-native-supervised-probe",
