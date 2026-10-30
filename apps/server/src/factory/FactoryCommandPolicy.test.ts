@@ -477,6 +477,17 @@ it("Policy input: closed blockers carry their outcomes as facts; other items are
     [[refused, 2]],
   );
   assert.isFalse("criteriaEvidence" in parent.items[0]!);
+  // The preparation the factory owes an item reaches the policy as recorded.
+  const owed = FactoryCommandPolicy.policyInput({
+    configuration: configuration(),
+    items: [{ ...item, preparation: { due: true, reason: "routine_gap", gap: "main: no files" } }],
+    active: [],
+  });
+  assert.deepStrictEqual(owed.items[0]!.preparation, {
+    due: true,
+    reason: "routine_gap",
+    gap: "main: no files",
+  });
   // An item without blockers serializes exactly as it did before they existed.
   assert.deepStrictEqual(Object.keys(input.items[1]!), [
     "decisionKey",
@@ -587,8 +598,10 @@ it.live(
       assert.include(triage.packet.text, "Item version: v1.");
       assert.include(triage.packet.text, "unit_proposed");
       assert.notInclude(triage.packet.text, "criteria_proposed");
-      // A routine record gap is named as Main's to make, not left as a person's hold.
-      assert.include(triage.packet.text, "`main:` for a routine record only Main may make");
+      // Routine coordination is the preparation's own to settle, never parked for a coordinator.
+      assert.include(triage.packet.text, "Routine coordination is yours to settle in the proposal");
+      assert.notInclude(triage.packet.text, "`main:`");
+      assert.notInclude(triage.packet.text, "`ownership:`");
       assert.strictEqual(triage.packet.sha256, sha256(triage.packet.text));
       // A parent is prepared as criteria on its exact text, never as a unit.
       const parent = only(yield* decide([{ labels: ["policy:triage"], subIssueCount: 2 }]));

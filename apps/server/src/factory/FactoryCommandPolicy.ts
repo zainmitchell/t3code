@@ -185,19 +185,31 @@ const REPORT_REQUIREMENTS: Record<string, string> = {
   criteria_proposed:
     "criteria_proposed with criteria.basis = the body sha256 and item version named above, and one clause per acceptance list item, quoted exactly with its offsets and sha256, each in body order",
   not_actionable:
-    "not_actionable only for what a person must settle, with failure led by its kind: `decision:` (the one question, its consequence and the exact action that answers it), `permission:`, `private_data:`, `ownership:` or `hold:`, or `main:` for a routine record only Main may make (the exact record: an owned-files declaration, a dependency edge, a child), then what is missing",
+    "not_actionable only for what a person must settle, with failure led by its kind: `decision:` (the one question, its consequence and the exact action that answers it), `permission:`, `private_data:`, or `hold:`, then what is missing. Routine coordination is never not_actionable",
 };
 
 /** The last preparation's failure, so a retry on it can correct what it names. */
 const previousPreparation = (item: FactoryLifecycle.FactoryPolicyItem) => {
   const last = item.outcomes.findLast((outcome) => outcome.stage === "triage");
-  return last?.state === "verified" && last.report.outcome === "failed"
+  if (last?.state !== "verified") return [];
+  if (last.report.outcome === "failed") {
+    return [
+      "The last preparation of this item ended without a usable result; correct what it names:",
+      last.report.failure ?? last.report.summary,
+    ];
+  }
+  return last.report.outcome === "not_actionable" &&
+    FactoryLifecycle.isRoutineGap(last.report.failure)
     ? [
-        "The last preparation of this item ended without a usable result; correct what it names:",
+        "The last preparation stopped on routine coordination, which is this preparation's to settle in its proposal:",
         last.report.failure ?? last.report.summary,
       ]
     : [];
 };
+
+/** Coordination a preparation settles itself, never hands to a person or an outside coordinator. */
+const ROUTINE_COORDINATION =
+  "Routine coordination is yours to settle in the proposal, never a reason for not_actionable: the unit's owned files, its dependencies, a split into bounded children, the candidate commit and the checks that verify it. A label or note asking for a coordinator (needs-main) is input to this preparation, not a hold.";
 
 /**
  * Where verification output has to be for T3 to count it: a head already reviewed is reviewed
@@ -220,6 +232,7 @@ const evidenceInstructions = (
     return [
       `Item version: ${item.observation.itemVersion}. Report it as proposal.basis; a proposal for any other version is rejected.`,
       "Prepare from what you can verify: the issue, its blockers and parent, its verified outcomes, the project's rules and the repository at its integration base. Change no file and no tracker record. Settle routine gaps yourself from that evidence; a missing permission, product decision or owner hold is never yours to settle.",
+      ROUTINE_COORDINATION,
       "Name subject.baseCommit: the build starts exactly there. T3 reads it back now and again when the build is admitted: it must exist and lie on the branch T3 integrates onto, as T3 reads that branch, so a proposal without a base, or with one T3 cannot read there, is rejected. The proposal is evidence for the policy, not a start or a grant.",
       ...previousPreparation(item),
     ];
@@ -367,6 +380,7 @@ export const policyInput = (
           })),
         }),
     ...(item.childrenUnread === undefined ? {} : { childrenUnread: item.childrenUnread }),
+    ...(item.preparation === undefined ? {} : { preparation: item.preparation }),
     ...(item.criteriaEvidence === undefined
       ? {}
       : { criteriaEvidence: item.criteriaEvidence.map(itemFacts) }),

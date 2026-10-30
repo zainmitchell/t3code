@@ -22277,6 +22277,106 @@ it.effect(
     ),
 );
 
+/**
+ * A project policy that follows the factory's own preparation input, as the unified policy does,
+ * while it still parks the legacy needs-main label as the old policy did.
+ */
+const routinePreparationPolicy: ProposeFn = (input) => {
+  if (input.stage.type !== "implement") return stageRequest(input);
+  if (input.preparation?.due === true) return triageRequest(input);
+  const proposed = input.outcomes.some(
+    (outcome) =>
+      outcome.state === "verified" &&
+      outcome.report.outcome === "unit_proposed" &&
+      outcome.report.proposal?.basis === input.observation.itemVersion,
+  );
+  if (proposed) return stageRequest(input);
+  const stopped = input.outcomes.some(
+    (outcome) => outcome.stage === "triage" && outcome.state === "verified",
+  );
+  return stopped || input.issue.labels.includes("needs-main")
+    ? Effect.succeed({ type: "none" as const, reason: "held for a person", class: "held" })
+    : triageRequest(input);
+};
+
+it.effect(
+  "Prepare/M1: a routine needs-main item is prepared and admitted by the factory itself; a person's hold gets no work and no answer",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* configureLifecycleFactory;
+          yield* configureFactory(lifecycleConfiguration({ pools: pool(2) }));
+          yield* usePolicy(routinePreparationPolicy);
+          // A legacy item parked for an outside coordinator, and an ordinary item.
+          yield* seedIssue(7951, {
+            body: "Make the importer resumable.",
+            labels: ["ready", "needs-main"],
+          });
+          yield* seedIssue(7952, { body: "Rotate the importer key." });
+          const first = admittedOnly(yield* advance("tracker_event", 1));
+          const triageOf = (issue: number) =>
+            first.find((admission) => stageOf(admission)?.[0] === itemKeyFor(issue))!;
+          assert.deepStrictEqual(first.map(stageOf).toSorted(), [
+            [itemKeyFor(7951), "triage"],
+            [itemKeyFor(7952), "triage"],
+          ]);
+          assert.deepStrictEqual(admittedOnly(yield* advance("restart", 2)), []);
+          // One preparation stops on routine coordination, the other on a genuine permission.
+          yield* workStage(triageOf(7951), {
+            outcome: "not_actionable",
+            summary: "No owned files.",
+            failure: "main: the issue declares no owned files",
+          });
+          yield* workStage(triageOf(7952), {
+            outcome: "not_actionable",
+            summary: "Needs the key.",
+            failure: "permission: rotating the key needs the owner's production credential",
+          });
+          // The routine gap is prepared again by the factory, exactly once; the hold is not.
+          const retry = admittedBy(yield* advance("outcome", 3));
+          assert.deepStrictEqual(stageOf(retry), [itemKeyFor(7951), "triage"]);
+          for (const trigger of ["restart", "clock"] as const) {
+            assert.deepStrictEqual(admittedOnly(yield* advance(trigger, 2)), []);
+          }
+          yield* workStage(retry, {
+            outcome: "unit_proposed",
+            summary: "One unit: the importer.",
+            proposal: {
+              basis: admittedVersion(retry),
+              unit: "## Owned files\n- src/importer.ts",
+              ownedFiles: ["src/importer.ts"],
+            },
+            subject: { repository: claimRepository, baseCommit: lifecycleBase },
+          });
+          // The prepared unit reaches its next native stage once, across passes and a restart.
+          const build = admittedBy(yield* advance("outcome", 3));
+          assert.deepStrictEqual(stageOf(build), [itemKeyFor(7951), "implement"]);
+          for (const trigger of ["restart", "clock", "tracker_event"] as const) {
+            assert.deepStrictEqual(admittedOnly(yield* advance(trigger, 2)), []);
+          }
+          assert.deepStrictEqual(yield* itemHistory(7951), [
+            "triage",
+            "not_actionable",
+            "triage",
+            "unit_proposed",
+            "implement",
+          ]);
+          // The permission stays a person's: no further work, no question answered for them.
+          assert.deepStrictEqual(yield* itemHistory(7952), ["triage", "not_actionable"]);
+          assert.isFalse(
+            (yield* decisionsOf(7952)).some((decision) => decision.resolution !== undefined),
+          );
+          // The legacy label stays on the tracker: T3 removed nothing.
+          assert.include(
+            (yield* GitHubFake).issues.get(issueKey(claimRepository, 7951))!.labels,
+            "needs-main",
+          );
+        }),
+      ),
+    ),
+);
+
 it.effect("Decompose/D3: a proposal for other text is rejected and builds nothing", () =>
   runIsolated(
     Effect.scoped(

@@ -545,6 +545,16 @@ export interface FactoryPolicyItem {
   };
   /** The decision a request for this stage would be, so its packet can name its work key. */
   readonly decisionKey: FactoryDecisionKey;
+  /**
+   * The preparation the factory owes the item now, from its own records: a routine coordination
+   * gap its last preparation stopped on, or a legacy needs-main label. A policy that sees it
+   * triages on `triageDecisionKey`; a person's hold never makes one due.
+   */
+  readonly preparation?: {
+    readonly due: true;
+    readonly reason: "routine_gap" | "legacy_needs_main";
+    readonly gap?: string;
+  };
   /** The decision a triage of this item version would be; only before its first build. */
   readonly triageDecisionKey?: FactoryDecisionKey;
   /**
@@ -1858,6 +1868,47 @@ export const decisionKeyOf = (
  * failure now (`readback`: its candidate base and the item's blockers). The retry runs once on that
  * readback; a failed retry is decided again only when the readback changes or new inputs arrive.
  */
+/**
+ * A preparation gap that is routine coordination, the factory's own to settle by preparing again:
+ * missing scope, evidence, candidate or check bindings. A person's decision, permission, private
+ * data or hold is never routine.
+ */
+export const isRoutineGap = (failure: string | undefined) =>
+  failure !== undefined && /^\s*(?:main|needs-main|ownership)\s*:/i.test(failure);
+
+/** The legacy tracker label that parked an item for an external coordinator. */
+export const LEGACY_NEEDS_MAIN_LABEL = "needs-main";
+
+/**
+ * Whether the factory owes the item a preparation now, from its own records: its last preparation
+ * on this text stopped on routine coordination and the retry it opens has not run, or it still
+ * carries the legacy needs-main label with no preparation on this text. Never for a person's hold.
+ */
+export const preparationDueOf = (input: {
+  readonly labels: ReadonlyArray<string>;
+  readonly itemVersion: string;
+  readonly outcomes: ReadonlyArray<FactoryPolicyOutcome>;
+  readonly triage: { readonly key: FactoryDecisionKey; readonly failed?: FactoryPolicyOutcome };
+}): FactoryPolicyItem["preparation"] => {
+  const tried = input.outcomes.some(
+    (outcome) => outcome.stage === "triage" && outcome.decisionKey === input.triage.key,
+  );
+  if (tried) return undefined;
+  const failed = input.triage.failed;
+  if (failed?.report.outcome === "not_actionable") {
+    return { due: true, reason: "routine_gap", gap: (failed.report.failure ?? "").slice(0, 2_000) };
+  }
+  const prepared = input.outcomes.some(
+    (outcome) =>
+      outcome.stage === "triage" &&
+      outcome.itemVersion === input.itemVersion &&
+      outcome.state === "verified",
+  );
+  return input.labels.includes(LEGACY_NEEDS_MAIN_LABEL) && !prepared && failed === undefined
+    ? { due: true, reason: "legacy_needs_main" }
+    : undefined;
+};
+
 const triageDecisionOf = (
   input: Pick<FactoryAdmissionRequest, "factoryId" | "itemKey" | "policyRevision">,
   observation: FactoryStore.ItemObservation,
@@ -1872,13 +1923,16 @@ const triageDecisionOf = (
   const firstKey = keyOf(first);
   // Preparations recorded while keys still named the configuration pin count as this one.
   const firstKeys = new Set([firstKey, keyOf(first, true)]);
+  // A preparation that stopped on routine coordination ended without a usable result too: the
+  // factory prepares it again, once per gap and readback, instead of parking it for a person.
   const failed = outcomes.findLast(
     (outcome) =>
       outcome.stage === "triage" &&
       outcome.decisionKey !== undefined &&
       firstKeys.has(outcome.decisionKey) &&
       outcome.state === "verified" &&
-      outcome.report.outcome === "failed" &&
+      (outcome.report.outcome === "failed" ||
+        (outcome.report.outcome === "not_actionable" && isRoutineGap(outcome.report.failure))) &&
       outcome.failureDigest !== undefined,
   );
   if (failed?.failureDigest === undefined) {
@@ -3604,6 +3658,18 @@ const make = Effect.gen(function* () {
           ),
           // No triage is offered while a failed preparation's readback cannot be made.
           ...(triage === undefined || "unread" in triage ? {} : { triageDecisionKey: triage.key }),
+          ...(() => {
+            const preparation =
+              triage === undefined || "unread" in triage
+                ? undefined
+                : preparationDueOf({
+                    labels: candidate.issue.labels,
+                    itemVersion: candidate.observation.itemVersion,
+                    outcomes,
+                    triage,
+                  });
+            return preparation === undefined ? {} : { preparation };
+          })(),
         });
       }
       const answer = yield* proposer.value.decide({ configuration, items, active });
