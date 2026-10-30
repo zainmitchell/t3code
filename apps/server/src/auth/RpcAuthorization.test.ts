@@ -109,6 +109,7 @@ describe("factory owner authorization", () => {
     for (const method of [
       WS_METHODS.factoryConfigure,
       WS_METHODS.factorySwitchProvider,
+      WS_METHODS.factoryAgentCeiling,
       WS_METHODS.factoryDisposeNeverStarted,
     ]) {
       expect(requiredScopeForRpcMethod(method)).toBe(AuthSettingsWriteScope);

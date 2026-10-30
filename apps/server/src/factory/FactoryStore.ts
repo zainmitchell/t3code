@@ -602,6 +602,28 @@ export interface ReserveExecutionInput {
       };
 }
 
+/**
+ * Every agent execution in the environment as its shared ceiling counts them, each once: held
+ * factory custody in any factory or pool (a descendant only while its own run is unfinished, an
+ * observed carrier once and not beside the native or transferred custody it mirrors), and the
+ * unfinished run of any thread no held reservation covers. Units for factory custody, one per run.
+ */
+export interface AgentOccupancy {
+  /** The environment's ceiling; null when none is set and each factory's pools limit it. */
+  readonly ceiling: number | null;
+  readonly revision: number;
+  readonly occupied: number;
+  readonly counted: {
+    readonly admitted: number;
+    readonly descendants: number;
+    readonly observed: number;
+    readonly transferred: number;
+    readonly otherRuns: number;
+  };
+  /** Threads counted under `otherRuns`, for an owner to find what holds the ceiling. */
+  readonly otherRunThreads: ReadonlyArray<string>;
+}
+
 export type ReserveExecutionResult =
   | { readonly type: "reserved"; readonly reservation: NativeReservation }
   /** A continuation of the thread's own execution, or work with no factory origin. */
@@ -783,6 +805,21 @@ export class FactoryStore extends Context.Service<
       readonly factoryId: FactoryId;
       readonly observationId: FactoryObservationId;
     }) => Effect.Effect<Option.Option<ItemObservation>, FactoryStoreError>;
+    /** The environment's agent ceiling and every execution it counts now. */
+    readonly agentOccupancy: () => Effect.Effect<AgentOccupancy, FactoryStoreError>;
+    /**
+     * Sets the environment's agent ceiling, or clears it with null, only while `expectRevision`
+     * is still its revision. While one is set it alone limits every factory's starts; no pool
+     * subdivides it.
+     */
+    readonly setAgentCeiling: (input: {
+      readonly agents: number | null;
+      readonly expectRevision: number;
+      readonly by: string;
+    }) => Effect.Effect<
+      { readonly applied: boolean; readonly occupancy: AgentOccupancy },
+      FactoryStoreError
+    >;
     /** Decides and records a reservation. The caller must hold the write transaction. */
     readonly reserveExecution: (
       input: ReserveExecutionInput,
@@ -1136,6 +1173,122 @@ const make = Effect.gen(function* () {
         AND json_extract(record_json, '$.quarantine') IS NULL
     `.pipe(Effect.map((rows) => rows[0]?.units ?? 0));
 
+  const environmentCeiling = () =>
+    sql<{ readonly agent_ceiling: number | null; readonly revision: number }>`
+      SELECT agent_ceiling, revision FROM factory_environment WHERE singleton = 1
+    `.pipe(
+      Effect.map((rows) => ({
+        ceiling: rows[0]?.agent_ceiling ?? null,
+        revision: rows[0]?.revision ?? 0,
+      })),
+    );
+
+  // The same statuses the recovery index orders by; any other status is a finished run.
+  const unfinishedRunThreads = () =>
+    sql<{ readonly thread_id: string }>`
+      SELECT DISTINCT thread_id FROM orchestration_v2_projection_runs
+      WHERE status IN ('preparing', 'queued', 'starting', 'running', 'waiting')
+    `.pipe(Effect.map((rows) => new Set(rows.map((row) => row.thread_id))));
+
+  const hasUnfinishedRun = (threadId: ThreadId) =>
+    sql`
+      SELECT 1 FROM orchestration_v2_projection_runs
+      WHERE thread_id = ${threadId}
+        AND status IN ('preparing', 'queued', 'starting', 'running', 'waiting')
+      LIMIT 1
+    `.pipe(Effect.map((rows) => rows.length > 0));
+
+  /** See `AgentOccupancy`. Run inside the commit that admits against it. */
+  const agentOccupancy = Effect.fnUntraced(function* () {
+    const { ceiling, revision } = yield* environmentCeiling();
+    const held = yield* sql<{
+      readonly origin: FactoryReservation["origin"];
+      readonly item_key: string;
+      readonly units: number;
+      readonly carrier_key: string | null;
+      readonly execution_thread_id: string | null;
+      readonly quarantined: number;
+    }>`
+      SELECT origin, item_key, units, carrier_key, execution_thread_id,
+        json_extract(record_json, '$.quarantine') IS NOT NULL AS quarantined
+      FROM factory_reservations WHERE state = 'held'
+    `;
+    const unfinished = yield* unfinishedRunThreads();
+    // A thread bound to held custody, native or transferred, is counted through it.
+    const covered = new Set(
+      (yield* sql<{ readonly thread_id: string }>`
+        SELECT binding.thread_id FROM factory_thread_bindings AS binding
+        JOIN factory_reservations AS reservation
+          ON reservation.reservation_id = binding.reservation_id
+        WHERE reservation.state = 'held'
+      `).map((row) => row.thread_id),
+    );
+    // A carrier T3's own claim produced, in any factory, is that native execution's mirror.
+    const mirrored = new Set(
+      (yield* sql<{ readonly carrier_key: string }>`
+        SELECT operation.carrier_key FROM factory_claim_operations AS operation
+        JOIN factory_reservations AS reservation
+          ON reservation.reservation_id = operation.reservation_id
+        WHERE reservation.state = 'held'
+          OR json_extract(reservation.record_json, '$.releasedReason') = 'outcome_verified'
+      `).map((row) => row.carrier_key),
+    );
+    const transferredItems = new Set(
+      held.flatMap((row) => (row.origin === "transferred" ? [row.item_key] : [])),
+    );
+    const counted = { admitted: 0, descendants: 0, observed: 0, transferred: 0, otherRuns: 0 };
+    const carriers = new Map<string, number>();
+    for (const row of held) {
+      // The owner's quarantine: still owns its item, no longer charged.
+      if (row.quarantined === 1) continue;
+      if (row.origin === "admitted") counted.admitted += row.units;
+      else if (row.origin === "transferred") counted.transferred += row.units;
+      else if (row.origin === "inherited") {
+        if (row.execution_thread_id !== null && unfinished.has(row.execution_thread_id)) {
+          counted.descendants += row.units;
+        }
+      } else if (
+        row.carrier_key !== null &&
+        !mirrored.has(row.carrier_key) &&
+        !transferredItems.has(row.item_key)
+      ) {
+        // Each factory that read one claim charged it; it is one execution.
+        carriers.set(row.carrier_key, Math.max(carriers.get(row.carrier_key) ?? 0, row.units));
+      }
+    }
+    for (const units of carriers.values()) counted.observed += units;
+    const otherRunThreads = [...unfinished].filter((threadId) => !covered.has(threadId)).toSorted();
+    counted.otherRuns = otherRunThreads.length;
+    return {
+      ceiling,
+      revision,
+      occupied:
+        counted.admitted +
+        counted.descendants +
+        counted.observed +
+        counted.transferred +
+        counted.otherRuns,
+      counted,
+      otherRunThreads,
+    } satisfies AgentOccupancy;
+  });
+
+  /**
+   * Whether `units` more fit: under the environment's ceiling when one is set, else the pool's.
+   * Already at or over the ceiling, nothing new starts; nothing running is stopped.
+   */
+  const capacityFits = Effect.fnUntraced(function* (
+    factoryId: FactoryId,
+    pool: typeof FactoryPool.Type,
+    units: number,
+  ) {
+    const { ceiling } = yield* environmentCeiling();
+    if (ceiling === null) {
+      return (yield* occupiedUnits(factoryId, pool.poolId)) + units <= pool.capacityUnits;
+    }
+    return (yield* agentOccupancy()).occupied + units <= ceiling;
+  });
+
   /** The admitted decision a native reservation belongs to. */
   const admittedRootOf = Effect.fnUntraced(function* (reservation: NativeReservation) {
     let current: FactoryReservation = reservation;
@@ -1422,8 +1575,7 @@ const make = Effect.gen(function* () {
     ) {
       return { type: "refused", refusal: "custody_changed" } as const;
     }
-    const occupied = yield* occupiedUnits(admission.factoryId, admission.poolId);
-    if (occupied + admission.units > pool.capacityUnits) {
+    if (!(yield* capacityFits(admission.factoryId, pool, admission.units))) {
       return { type: "refused", refusal: "capacity_exhausted" } as const;
     }
     // Each named resource is held by one reservation at a time, decided in this commit.
@@ -1516,9 +1668,21 @@ const make = Effect.gen(function* () {
       if (!samePinnedSelection(bound.value.modelSelection, input.modelSelection)) {
         return { type: "refused", refusal: "selection_pinned" } as const;
       }
-      return (yield* claimReady(bound.value))
-        ? ({ type: "none" } as const)
-        : ({ type: "refused", refusal: "claim_not_ready" } as const);
+      if (!(yield* claimReady(bound.value))) {
+        return { type: "refused", refusal: "claim_not_ready" } as const;
+      }
+      // A descendant counts against the environment's ceiling only while its own run is
+      // unfinished, so running a finished one again is a new start under it.
+      if (
+        bound.value.origin === "inherited" &&
+        !(yield* hasUnfinishedRun(input.executionThreadId))
+      ) {
+        const { ceiling } = yield* environmentCeiling();
+        if (ceiling !== null && (yield* agentOccupancy()).occupied + bound.value.units > ceiling) {
+          return { type: "refused", refusal: "capacity_exhausted" } as const;
+        }
+      }
+      return { type: "none" } as const;
     }
     // The trusted initiator comes first; context lineage, a sender and a schedule may agree with
     // it but never override it. Owners from different decisions are refused, not chosen between.
@@ -1574,8 +1738,7 @@ const make = Effect.gen(function* () {
     ) {
       return { type: "refused", refusal: "selection_not_configured" } as const;
     }
-    const occupied = yield* occupiedUnits(parent.factoryId, parent.poolId);
-    if (occupied + parent.units > pool.capacityUnits) {
+    if (!(yield* capacityFits(parent.factoryId, pool, parent.units))) {
       return { type: "refused", refusal: "capacity_exhausted" } as const;
     }
     const reservation: NativeReservation = {
@@ -1888,6 +2051,38 @@ const make = Effect.gen(function* () {
     beginCollection,
     recordItemObservation,
     getObservation,
+    // A view: admission counts again inside its own commit, so this takes no writer lock.
+    agentOccupancy: Effect.fn("FactoryStore.agentOccupancy")(function () {
+      return agentOccupancy().pipe(Effect.mapError(fail("agent-occupancy")));
+    }),
+    setAgentCeiling: Effect.fn("FactoryStore.setAgentCeiling")(
+      function* (input: {
+        readonly agents: number | null;
+        readonly expectRevision: number;
+        readonly by: string;
+      }) {
+        return yield* sql.withTransaction(
+          Effect.gen(function* () {
+            const { revision } = yield* environmentCeiling();
+            if (revision !== input.expectRevision) {
+              return { applied: false, occupancy: yield* agentOccupancy() };
+            }
+            yield* sql`
+              INSERT INTO factory_environment (singleton, agent_ceiling, revision, set_by, set_at)
+              VALUES (
+                1, ${input.agents}, ${revision + 1}, ${input.by},
+                ${DateTime.formatIso(yield* DateTime.now)}
+              )
+              ON CONFLICT(singleton) DO UPDATE SET
+                agent_ceiling = excluded.agent_ceiling, revision = excluded.revision,
+                set_by = excluded.set_by, set_at = excluded.set_at
+            `;
+            return { applied: true, occupancy: yield* agentOccupancy() };
+          }),
+        );
+      },
+      Effect.mapError(fail("set-agent-ceiling")),
+    ),
     reserveExecution,
     recordClaimOperation,
     listReservations,

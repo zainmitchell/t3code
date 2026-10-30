@@ -2306,6 +2306,27 @@ export const layerWsRpc = (
             })),
             factoryOwnerFailure(WS_METHODS.factoryConfigure),
           ),
+        [WS_METHODS.factoryAgentCeiling]: (input) =>
+          factoryLifecycle
+            .agentCeiling({
+              ...(input.set === undefined ? {} : { set: input.set }),
+              by: factoryActor,
+            })
+            .pipe(
+              Effect.tap((result) =>
+                input.set === undefined
+                  ? Effect.void
+                  : Effect.logInfo("Factory owner agent ceiling", {
+                      agents: input.set.agents,
+                      expectRevision: input.set.expectRevision,
+                      by: factoryActor,
+                      applied: result.applied,
+                      revision: result.occupancy.revision,
+                      occupied: result.occupancy.occupied,
+                    }),
+              ),
+              factoryOwnerFailure(WS_METHODS.factoryAgentCeiling),
+            ),
         [WS_METHODS.factorySwitchProvider]: (input) =>
           providerRegistry.getProviders.pipe(
             Effect.flatMap((providers) => factoryLifecycle.switchProvider(input, providers)),

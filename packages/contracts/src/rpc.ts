@@ -371,6 +371,8 @@ import {
 } from "./scheduledTask.ts";
 import { SecretRequestAnswerInput, SecretRequestError } from "./secretRequest.ts";
 import {
+  FactoryAgentCeilingInput,
+  FactoryAgentCeilingResult,
   FactoryConfigureInput,
   FactoryConfigureResult,
   FactoryDecideInput,
@@ -575,6 +577,7 @@ export const WS_METHODS = {
   factoryHistoricalTermination: "factory.historicalTermination",
   factoryConfigure: "factory.configure",
   factorySwitchProvider: "factory.switchProvider",
+  factoryAgentCeiling: "factory.agentCeiling",
   factoryObserveClaims: "factory.observeClaims",
   factoryTransfer: "factory.transfer",
   factoryRollbackTransfer: "factory.rollbackTransfer",
@@ -1993,6 +1996,12 @@ const WsFactoryConfigureRpc = Rpc.make(WS_METHODS.factoryConfigure, {
   error: Schema.Union([FactoryOwnerError, EnvironmentAuthorizationError]),
 });
 
+const WsFactoryAgentCeilingRpc = Rpc.make(WS_METHODS.factoryAgentCeiling, {
+  payload: FactoryAgentCeilingInput,
+  success: FactoryAgentCeilingResult,
+  error: Schema.Union([FactoryOwnerError, EnvironmentAuthorizationError]),
+});
+
 const WsFactorySwitchProviderRpc = Rpc.make(WS_METHODS.factorySwitchProvider, {
   payload: FactorySwitchProviderInput,
   success: FactorySwitchProviderResult,
@@ -2133,6 +2142,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsFactoryHistoricalTerminationRpc,
   WsFactoryConfigureRpc,
   WsFactorySwitchProviderRpc,
+  WsFactoryAgentCeilingRpc,
   WsFactoryObserveClaimsRpc,
   WsFactoryTransferRpc,
   WsFactoryRollbackTransferRpc,

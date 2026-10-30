@@ -213,16 +213,21 @@ describe("runMigrations", () => {
         [75, "PeerLinkFence"],
         [76, "WaitingLinkRequestIndex"],
         [77, "FactoryPreparedCriteria"],
+        [78, "FactoryAgentCeiling"],
       ]);
       assert.deepStrictEqual(yield* history, migrationManifest);
       assert.deepStrictEqual(yield* factoryRows, rowsBefore);
       assert.deepStrictEqual(
         (yield* schema).filter(
-          (row) => isFactoryObject(row) && row.tbl_name !== "factory_prepared_criteria",
+          (row) =>
+            isFactoryObject(row) &&
+            row.tbl_name !== "factory_prepared_criteria" &&
+            row.tbl_name !== "factory_environment",
         ),
         factorySchemaBefore,
       );
       assert.deepStrictEqual(yield* sql`SELECT * FROM factory_prepared_criteria`, []);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM factory_environment`, []);
       assert.deepStrictEqual(
         yield* sql`SELECT environment_id, fenced FROM peer_environment_links`,
         [{ environment_id: "peer", fenced: 0 }],

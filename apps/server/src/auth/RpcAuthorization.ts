@@ -125,6 +125,7 @@ export const RPC_REQUIRED_SCOPES = {
   // A configuration names a command the host runs as the factory's policy.
   [WS_METHODS.factoryConfigure]: AuthSettingsWriteScope,
   [WS_METHODS.factorySwitchProvider]: AuthSettingsWriteScope,
+  [WS_METHODS.factoryAgentCeiling]: AuthSettingsWriteScope,
   // It releases custody nothing proves, on the owner's word alone.
   [WS_METHODS.factoryDisposeNeverStarted]: AuthSettingsWriteScope,
   // Delivery logs hold request bodies, so they need the same scope as the URL.

@@ -197,8 +197,28 @@ export type FactoryEnterResult = typeof FactoryEnterResult.Type;
 /** What a factory holds and why it is idle or blocked, as its owner and agents read it. */
 export const FactoryStateInput = Schema.Struct({ factoryId: FactoryId });
 
+/**
+ * The environment's agent ceiling and every execution it counts now, the same for every factory.
+ * While a ceiling is set it alone limits starts; pool capacities do not subdivide it.
+ */
+export const FactoryAgentOccupancy = Schema.Struct({
+  ceiling: Schema.NullOr(Schema.Number),
+  revision: Schema.Number,
+  occupied: Schema.Number,
+  counted: Schema.Struct({
+    admitted: Schema.Number,
+    descendants: Schema.Number,
+    observed: Schema.Number,
+    transferred: Schema.Number,
+    otherRuns: Schema.Number,
+  }),
+  otherRunThreads: Schema.Array(Schema.String),
+});
+export type FactoryAgentOccupancy = typeof FactoryAgentOccupancy.Type;
+
 export const FactoryStateResult = Schema.Struct({
   configured: Schema.Boolean,
+  agents: Schema.optional(FactoryAgentOccupancy),
   enabled: Schema.optional(Schema.Boolean),
   configurationRevision: Schema.optional(Schema.Number),
   policyRevision: Schema.optional(Schema.String),
@@ -538,6 +558,20 @@ export const FactoryRejectOutcomeInput = Schema.Struct({
   reason: Bounded(2_000),
 });
 export const FactoryRejectOutcomeResult = Schema.Struct({ rejected: Schema.Boolean });
+
+/**
+ * The owner reads the environment's agent ceiling, or sets it (null clears it) while
+ * `expectRevision` is still its revision. One ceiling for every project and role.
+ */
+export const FactoryAgentCeilingInput = Schema.Struct({
+  set: Schema.optional(
+    Schema.Struct({ agents: Schema.NullOr(PositiveInt), expectRevision: NonNegativeInt }),
+  ),
+});
+export const FactoryAgentCeilingResult = Schema.Struct({
+  applied: Schema.Boolean,
+  occupancy: FactoryAgentOccupancy,
+});
 
 /** The owner revokes what remains of a finite grant. */
 export const FactoryRevokeGrantInput = Schema.Struct({

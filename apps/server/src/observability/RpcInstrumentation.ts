@@ -104,6 +104,7 @@ const RPC_AGGREGATES = {
   [WS_METHODS.factoryHistoricalTermination]: "factory",
   [WS_METHODS.factoryConfigure]: "factory",
   [WS_METHODS.factorySwitchProvider]: "factory",
+  [WS_METHODS.factoryAgentCeiling]: "factory",
   [WS_METHODS.factoryObserveClaims]: "factory",
   [WS_METHODS.factoryTransfer]: "factory",
   [WS_METHODS.factoryRollbackTransfer]: "factory",

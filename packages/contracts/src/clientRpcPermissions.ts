@@ -73,6 +73,8 @@ export const CLIENT_GUARDED_RPC_SCOPES = {
   // A configuration names a command the host runs as the factory's policy, like any settings write.
   [WS_METHODS.factoryConfigure]: AuthSettingsWriteScope,
   [WS_METHODS.factorySwitchProvider]: AuthSettingsWriteScope,
+  // It changes how many agents every project may run at once.
+  [WS_METHODS.factoryAgentCeiling]: AuthSettingsWriteScope,
   // It releases custody nothing proves, on the owner's word alone.
   [WS_METHODS.factoryDisposeNeverStarted]: AuthSettingsWriteScope,
   // It records the owner's decision on a historical stage's unprovable writers, or its proof.

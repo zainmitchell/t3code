@@ -8,6 +8,7 @@ type FactoryState = FactoryLifecycle.FactoryState;
 /** A factory's state as every owner surface reads it: MCP, web, desktop and mobile alike. */
 export const factoryStateView = (state: FactoryState): FactoryStateResult => ({
   configured: state.configuration !== null,
+  agents: state.agents,
   ...(state.configuration === null
     ? {}
     : {

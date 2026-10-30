@@ -396,6 +396,66 @@ const installCommand = Command.make("install", {
   ),
 );
 
+const ceilingCommand = Command.make("ceiling", {
+  ...factoryLocationFlags,
+  agents: Flag.Int("agents").pipe(
+    Flag.withSchema(PositiveInt),
+    Flag.withDescription(
+      "The most agents every project and role may run at once, together. Pools then no longer subdivide it.",
+    ),
+    Flag.optional,
+  ),
+  clear: Flag.Boolean("clear").pipe(
+    Flag.withDescription("Remove the ceiling, so each factory's pools limit it again."),
+    Flag.withDefault(false),
+  ),
+  expectRevision: Flag.Int("expect-revision").pipe(
+    Flag.withDescription(
+      "The ceiling revision being replaced (0 when none was ever set). A different current revision is refused.",
+    ),
+    Flag.optional,
+  ),
+}).pipe(
+  Command.withDescription(
+    "Print the environment's shared agent ceiling and every execution it counts, or set it with --agents or --clear. Over the ceiling nothing new starts; nothing running is stopped.",
+  ),
+  Command.withHandler((flags) =>
+    Effect.gen(function* () {
+      const agents = Option.getOrUndefined(flags.agents);
+      const expectRevision = Option.getOrUndefined(flags.expectRevision);
+      if (agents !== undefined && flags.clear) {
+        return yield* new FactoryCliError({
+          operation: "ceiling",
+          reason: "--agents and --clear are exclusive",
+        });
+      }
+      const changing = agents !== undefined || flags.clear;
+      if (changing !== (expectRevision !== undefined)) {
+        return yield* new FactoryCliError({
+          operation: "ceiling",
+          reason: changing
+            ? "--expect-revision is required to set or clear the ceiling"
+            : "--expect-revision only goes with --agents or --clear",
+        });
+      }
+      const set =
+        expectRevision === undefined ? undefined : { agents: agents ?? null, expectRevision };
+      const result = yield* withHostAdmin(
+        flags,
+        { operation: "ceiling", request: set === undefined ? {} : { set } },
+        (client) => client[WS_METHODS.factoryAgentCeiling](set === undefined ? {} : { set }),
+      );
+      if (set !== undefined && !result.applied) {
+        return yield* new FactoryCliError({
+          operation: "ceiling",
+          reason: `the ceiling is at revision ${result.occupancy.revision}, not ${set.expectRevision}: nothing changed`,
+        });
+      }
+      return result;
+    }).pipe(Effect.flatMap(printJson)),
+  ),
+);
+
 const instanceFlag = (name: string, description: string) =>
   Flag.String(name).pipe(Flag.withSchema(ProviderInstanceId), Flag.withDescription(description));
 
@@ -1153,11 +1213,12 @@ const decideCommand = Command.make("decide", {
 
 export const factoryCommand = Command.make("factory").pipe(
   Command.withDescription(
-    "Administer this environment's factories as its host administrator: install, switch providers, enter issues, observe, transfer, retire, recover, dispose, settle historical stages and answer decisions.",
+    "Administer this environment's factories as its host administrator: install, set the shared agent ceiling, switch providers, enter issues, observe, transfer, retire, recover, dispose, settle historical stages and answer decisions.",
   ),
   Command.withSubcommands([
     stateCommand,
     installCommand,
+    ceilingCommand,
     switchProviderCommand,
     enterCommand,
     observeCommand,

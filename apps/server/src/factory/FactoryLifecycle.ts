@@ -808,6 +808,8 @@ const excerpt = (text: string) =>
 export interface FactoryState {
   /** Null until the factory is configured. */
   readonly configuration: FactoryStore.FactoryConfiguration | null;
+  /** The environment's agent ceiling, shared by every factory, and what it counts now. */
+  readonly agents: FactoryStore.AgentOccupancy;
   /** Decisions only the owner can make, pending until that authority resolves them. */
   readonly reservedDecisions: ReadonlyArray<FactoryOutcomeStore.ReservedDecision>;
   /**
@@ -886,6 +888,17 @@ export class FactoryLifecycle extends Context.Service<
     readonly readState: (input: {
       readonly factoryId: FactoryId;
     }) => Effect.Effect<FactoryState, FactoryLifecycleError>;
+    /**
+     * The environment's agent ceiling and what it counts now. With `set`, the owner first sets
+     * it, or clears it with null, while `expectRevision` is still its revision.
+     */
+    readonly agentCeiling: (input: {
+      readonly set?: { readonly agents: number | null; readonly expectRevision: number };
+      readonly by: string;
+    }) => Effect.Effect<
+      { readonly applied: boolean; readonly occupancy: FactoryStore.AgentOccupancy },
+      FactoryLifecycleError
+    >;
     /** Every configured factory's state, as the owner surfaces read it. */
     readonly overview: () => Effect.Effect<
       ReadonlyArray<{ readonly factoryId: FactoryId; readonly state: FactoryState }>,
@@ -2731,6 +2744,35 @@ const make = Effect.gen(function* () {
     return results.flat();
   });
 
+  const agentCeiling = Effect.fn("FactoryLifecycle.agentCeiling")(
+    function* (input: {
+      readonly set?: { readonly agents: number | null; readonly expectRevision: number };
+      readonly by: string;
+    }) {
+      if (input.set === undefined) {
+        return { applied: false, occupancy: yield* store.agentOccupancy() };
+      }
+      const result = yield* store.setAgentCeiling({ ...input.set, by: input.by });
+      if (result.applied) {
+        // Every factory waits on the one ceiling, so each reads it again now.
+        for (const configuration of yield* store.listConfigurations()) {
+          yield* Queue.offer(wakes, {
+            factoryId: configuration.factoryId,
+            trigger: "owner_decision",
+          });
+        }
+      }
+      return result;
+    },
+    (effect) =>
+      effect.pipe(
+        Effect.mapError(
+          (cause) =>
+            new FactoryLifecycleError({ operation: "agent-ceiling", factoryId: "", cause }),
+        ),
+      ),
+  );
+
   const readState = Effect.fn("FactoryLifecycle.readState")(
     function* (input: { readonly factoryId: FactoryId }) {
       const configuration = Option.getOrNull(yield* store.getConfiguration(input.factoryId));
@@ -2763,6 +2805,7 @@ const make = Effect.gen(function* () {
       const results = yield* stageResultsOf(input.factoryId, lastCollection);
       return {
         configuration,
+        agents: yield* store.agentOccupancy(),
         reservedDecisions: yield* outcomeStore.reservedDecisions(input.factoryId),
         lastCollection,
         lastPassMetrics: (yield* Ref.get(lastMetrics)).get(input.factoryId) ?? null,
@@ -6235,6 +6278,7 @@ const make = Effect.gen(function* () {
     recordItemObservation,
     admit,
     readState,
+    agentCeiling,
     report: outcomeOps.report,
     transferLegacy: Effect.fn("FactoryLifecycle.transferLegacy")(function (input) {
       return transferOps.transferLegacy(input).pipe(
