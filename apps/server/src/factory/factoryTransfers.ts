@@ -62,7 +62,7 @@ const refused = (reason: string): FactoryTransferResult => ({ type: "refused", r
  * takes whole. Python ends lines only at `\n` and counts other whitespace than JS, so any but
  * space, tab, `\n` and `\r\n` is refused.
  */
-const listedOwnedFiles = (body: string) => {
+const listedOwnedFiles = (body: string, allowNone = false) => {
   for (let index = 0; index < body.length; index++) {
     const char = body.charAt(index);
     if (char === " " || char === "\t" || char === "\n") continue;
@@ -79,11 +79,15 @@ const listedOwnedFiles = (body: string) => {
   const end = lines.findIndex((line, index) => index > heading && line.startsWith("## "));
   const section = lines.slice(heading + 1, end === -1 ? undefined : end);
   const files: Array<string> = [];
+  let none = false;
   for (const line of section) {
     const file = /^[ \t]*- `([\w./-]+(?:\/[\w.-]+|\.\w+))`[ \t\r]*$/.exec(line)?.[1];
     if (file !== undefined) files.push(file);
+    // HSA writes `None` for a verification-only unit: it owns no file, and says so once.
+    else if (allowNone && !none && /^[ \t]*None[ \t\r]*$/.test(line)) none = true;
     else if (!/^[ \t\r]*$/.test(line)) return undefined;
   }
+  if (none) return files.length === 0 ? files : undefined;
   return files.length === 0 ? undefined : files;
 };
 
@@ -112,23 +116,52 @@ const btcPath = (path: string) => {
  * any marker BTC reads otherwise, or a second one, is refused rather than guessed at.
  */
 const btcWritesListed = (body: string, files: ReadonlyArray<string>) => {
-  const mentions = body.match(/btc-unit/gi)?.length ?? 0;
-  if (mentions === 0) return true;
+  if ((body.match(/btc-unit/gi)?.length ?? 0) === 0) return true;
+  const written = btcWrites(body);
+  const listed = files.map(btcPath);
+  return written !== undefined && !listed.includes(undefined) && sameScope(written, listed);
+};
+
+const sameScope = (
+  left: ReadonlyArray<string | undefined>,
+  right: ReadonlyArray<string | undefined>,
+) => {
+  const leftSet = new Set(left);
+  const rightSet = new Set(right);
+  return leftSet.size === rightSet.size && [...leftSet].every((path) => rightSet.has(path));
+};
+
+/** The paths BTC's only Builder marker writes, as BTC compares them; none if it reads otherwise. */
+const btcWrites = (body: string) => {
   const marker = BTC_UNIT.exec(body);
-  if (mentions > 1 || marker === null) return false;
+  if ((body.match(/btc-unit/gi)?.length ?? 0) !== 1 || marker === null) return undefined;
   const [, writes, resources] = marker;
-  if (writes === undefined || resources === undefined) return false;
+  if (writes === undefined || resources === undefined) return undefined;
   if (
     resources.split(";").some((name) => name !== "" && name !== "none" && !BTC_RESOURCES.has(name))
   ) {
-    return false;
+    return undefined;
   }
   const written = writes.split(";").flatMap((path) => (path === "" ? [] : [btcPath(path)]));
-  const listed = files.map(btcPath);
-  if (written.length === 0 || [...written, ...listed].includes(undefined)) return false;
-  const writtenSet = new Set(written);
-  const listedSet = new Set(listed);
-  return writtenSet.size === listedSet.size && [...writtenSet].every((path) => listedSet.has(path));
+  return written.length === 0 || written.includes(undefined) ? undefined : written;
+};
+
+/**
+ * Whether a bounded issue's own declaration owns exactly `owned`, as HSA and BTC read it: HSA's
+ * `## Owned files` section (`None` for none), which any BTC Builder marker must name exactly,
+ * else BTC's Builder marker alone. Undefined when the body declares nothing either reads, or
+ * declares it ambiguously; other notations are not read here.
+ */
+export const declaresOwnedFiles = (body: string, owned: ReadonlyArray<string>) => {
+  if (/^## Owned files[ \t\r]*$/m.test(body)) {
+    const files = listedOwnedFiles(body, true);
+    if (files === undefined || !btcWritesListed(body, files)) return undefined;
+    return sameScope(files, owned) && owned.length === new Set(owned).size;
+  }
+  const written = btcWrites(body);
+  if (written === undefined) return undefined;
+  const claimed = owned.map(btcPath);
+  return !claimed.includes(undefined) && sameScope(written, claimed);
 };
 
 /**

@@ -75,6 +75,14 @@ export const factoryStateView = (state: FactoryState): FactoryStateResult => ({
   })),
   results: state.results,
   lastCollection: state.lastCollection,
+  waits: state.waits.map(({ itemKey, basis, stage, reasonClass, detail, firstSeenAt }) => ({
+    itemKey,
+    basis,
+    stage,
+    ...(reasonClass === undefined ? {} : { reasonClass }),
+    detail,
+    firstSeenAt,
+  })),
   ...(state.lastPassMetrics === null ? {} : { lastPassMetrics: state.lastPassMetrics }),
 });
 

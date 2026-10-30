@@ -217,6 +217,27 @@ export class FactoryOutcomeStore extends Context.Service<
       readonly closureOutcomeId: string;
       readonly observationId: number;
     }) => Effect.Effect<boolean, FactoryOutcomeStoreError>;
+    /**
+     * What a pass decided about the item's waiting, in one transaction: a wait on the basis it
+     * already waits on writes nothing; another basis supersedes it from now; no wait ends it.
+     * The item's wait as stored afterwards, or none.
+     */
+    readonly recordWait: (input: {
+      readonly factoryId: FactoryId;
+      readonly itemKey: FactoryItemKey;
+      readonly wait:
+        | {
+            readonly basis: string;
+            readonly stage: string;
+            readonly reasonClass?: string | undefined;
+            readonly detail: string;
+          }
+        | { readonly ended: string };
+    }) => Effect.Effect<Option.Option<FactoryItemWait>, FactoryOutcomeStoreError>;
+    /** Every item of the factory that waits now, with when it was first seen waiting so. */
+    readonly currentWaits: (
+      factoryId: FactoryId,
+    ) => Effect.Effect<ReadonlyArray<FactoryItemWait>, FactoryOutcomeStoreError>;
     /** The item's lifecycle facts in native order. */
     readonly itemEvents: (input: {
       readonly factoryId: FactoryId;
@@ -250,6 +271,31 @@ export class FactoryOutcomeStore extends Context.Service<
     }) => Effect.Effect<boolean, FactoryOutcomeStoreError>;
   }
 >()("t3/factory/FactoryOutcomeStore") {}
+
+/** An item's current wait, as first recorded on its basis. */
+export interface FactoryItemWait {
+  readonly itemKey: FactoryItemKey;
+  readonly basis: string;
+  readonly stage: string;
+  readonly reasonClass?: string | undefined;
+  readonly detail: string;
+  readonly firstSeenAt: string;
+  readonly supersedes?: string | undefined;
+}
+
+/** The item's wait still standing at the end of its records, if any. */
+const openWait = (
+  records: ReadonlyArray<{ readonly record: FactoryItemEventRecord }>,
+  itemKey: FactoryItemKey,
+): FactoryItemWait | undefined => {
+  for (const { record } of records.toReversed()) {
+    if (record.type === "basis_changed") continue;
+    if (record.type !== "waiting") return undefined;
+    const { type: _type, ...stored } = record;
+    return { itemKey, ...stored };
+  }
+  return undefined;
+};
 
 const total = { onExcessProperty: "error" } as const;
 const makeItemKey = Schema.decodeSync(FactoryItemKey);
@@ -605,6 +651,8 @@ const make = Effect.gen(function* () {
               events.push({ type: "reopened", seq, closureOutcomeId: record.closureOutcomeId });
               break;
             case "basis_changed":
+            case "waiting":
+            case "wait_ended":
               break;
           }
         }
@@ -613,6 +661,78 @@ const make = Effect.gen(function* () {
       Effect.mapError(fail("item-events")),
     ),
     itemRecords,
+    recordWait: Effect.fn("FactoryOutcomeStore.recordWait")(
+      function* (input: {
+        readonly factoryId: FactoryId;
+        readonly itemKey: FactoryItemKey;
+        readonly wait:
+          | {
+              readonly basis: string;
+              readonly stage: string;
+              readonly reasonClass?: string | undefined;
+              readonly detail: string;
+            }
+          | { readonly ended: string };
+      }) {
+        return yield* sql.withTransaction(
+          Effect.gen(function* () {
+            const open = openWait(yield* itemRecords(input), input.itemKey);
+            const { wait } = input;
+            const at = DateTime.formatIso(yield* DateTime.now);
+            if ("ended" in wait) {
+              if (open !== undefined) {
+                yield* appendEvent(input.factoryId, input.itemKey, {
+                  type: "wait_ended",
+                  basis: open.basis,
+                  reason: wait.ended,
+                  endedAt: at,
+                });
+              }
+              return Option.none<FactoryItemWait>();
+            }
+            if (open?.basis === wait.basis) return Option.some(open);
+            const record = {
+              type: "waiting" as const,
+              basis: wait.basis,
+              stage: wait.stage,
+              ...(wait.reasonClass === undefined ? {} : { reasonClass: wait.reasonClass }),
+              detail: wait.detail,
+              firstSeenAt: at,
+              ...(open === undefined ? {} : { supersedes: open.basis }),
+            };
+            yield* appendEvent(input.factoryId, input.itemKey, record);
+            const { type: _type, ...stored } = record;
+            return Option.some<FactoryItemWait>({ itemKey: input.itemKey, ...stored });
+          }),
+        );
+      },
+      Effect.mapError(fail("record-wait")),
+    ),
+    currentWaits: Effect.fn("FactoryOutcomeStore.currentWaits")(
+      function* (factoryId: FactoryId) {
+        // A wait is current until any later record of its item: a newer wait, its end, or progress.
+        const rows = yield* sql<{ readonly item_key: string; readonly record_json: string }>`
+          SELECT w.item_key, w.record_json FROM factory_item_events w
+          WHERE w.factory_id = ${factoryId}
+            AND json_extract(w.record_json, '$.type') = 'waiting'
+            AND NOT EXISTS (
+              SELECT 1 FROM factory_item_events l
+              WHERE l.factory_id = w.factory_id AND l.item_key = w.item_key AND l.seq > w.seq
+                AND json_extract(l.record_json, '$.type') != 'basis_changed'
+            )
+          ORDER BY w.seq
+        `;
+        const waits: Array<FactoryItemWait> = [];
+        for (const row of rows) {
+          const record = yield* decodeItemEvent(row.record_json);
+          if (record.type !== "waiting") continue;
+          const { type: _type, ...stored } = record;
+          waits.push({ itemKey: makeItemKey(row.item_key), ...stored });
+        }
+        return waits;
+      },
+      Effect.mapError(fail("current-waits")),
+    ),
     reserveDecision: Effect.fn("FactoryOutcomeStore.reserveDecision")(
       function* (input: Omit<ReservedDecision, "state" | "createdAt" | "resolution">) {
         const decision: ReservedDecision = {

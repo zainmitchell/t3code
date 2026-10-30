@@ -15,6 +15,7 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
@@ -426,5 +427,62 @@ it.effect(
       // Another root is free.
       const other = yield* reserveVerification(174, `${shared}-other`, configuration.revision);
       assert.strictEqual(other.type, "reserved");
+    }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect(
+  "Coordination/waits: a wait is recorded once per basis from when it was first seen, and never read as an outcome",
+  () =>
+    Effect.gen(function* () {
+      const outcomes = yield* FactoryOutcomeStore.FactoryOutcomeStore;
+      const item = keyOf(180);
+      const wait = (detail: string) => ({
+        factoryId,
+        itemKey: item,
+        wait: { basis: `basis:${detail}`, stage: "rework", reasonClass: "waiting", detail },
+      });
+      const waitRecords = Effect.map(
+        outcomes.itemRecords({ factoryId, itemKey: item }),
+        (records) =>
+          records.filter(({ record }) => record.type === "waiting" || record.type === "wait_ended"),
+      );
+      // Concurrent passes and repeats on one basis write one record, first-seen unchanged.
+      const [first] = yield* Effect.all(
+        [
+          outcomes.recordWait(wait("#145 has not landed")),
+          outcomes.recordWait(wait("#145 has not landed")),
+        ],
+        { concurrency: 2 },
+      );
+      yield* outcomes.recordWait(wait("#145 has not landed"));
+      assert.strictEqual((yield* waitRecords).length, 1);
+      const [current] = yield* outcomes.currentWaits(factoryId);
+      assert.strictEqual(current?.firstSeenAt, first!.pipe(Option.getOrThrow).firstSeenAt);
+      // A changed basis supersedes it, keeping history; no wait ends it.
+      yield* outcomes.recordWait(wait("the consumer is undeclared"));
+      assert.deepStrictEqual(
+        (yield* outcomes.currentWaits(factoryId)).map((each) => [each.detail, each.supersedes]),
+        [["the consumer is undeclared", "basis:#145 has not landed"]],
+      );
+      yield* outcomes.recordWait({ factoryId, itemKey: item, wait: { ended: "admitted" } });
+      yield* outcomes.recordWait({ factoryId, itemKey: item, wait: { ended: "admitted" } });
+      assert.deepStrictEqual(yield* outcomes.currentWaits(factoryId), []);
+      assert.deepStrictEqual(
+        (yield* waitRecords).map(({ record }) => record.type),
+        ["waiting", "waiting", "wait_ended"],
+      );
+      // Waiting again, then progress: the wait no longer stands, and stage order never sees it.
+      yield* outcomes.recordWait(wait("#145 has not landed"));
+      assert.strictEqual((yield* outcomes.currentWaits(factoryId)).length, 1);
+      yield* verified("180-implement", item, "implement", {
+        outcome: "implemented",
+        subject: { repository, baseCommit: base, headCommit: head },
+        summary: "Built.",
+      });
+      assert.deepStrictEqual(yield* outcomes.currentWaits(factoryId), []);
+      assert.deepStrictEqual(
+        (yield* outcomes.itemEvents({ factoryId, itemKey: item })).map((event) => event.type),
+        ["outcome"],
+      );
     }).pipe(Effect.provide(layerTest)),
 );

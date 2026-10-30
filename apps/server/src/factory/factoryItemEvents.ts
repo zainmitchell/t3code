@@ -62,6 +62,27 @@ export const FactoryItemEventRecord = Schema.Union([
     closureOutcomeId: Schema.String,
     observationId: Schema.Number,
   }),
+  /**
+   * The item waits: what on, who acts, what they do and what resumes it, as decided. Recorded once
+   * per basis, from when it was first seen; a later wait on another basis supersedes it, and any
+   * lifecycle fact after it ends it. Never a stage outcome.
+   */
+  Schema.Struct({
+    type: Schema.Literal("waiting"),
+    basis: Schema.String,
+    stage: Schema.String,
+    reasonClass: Schema.optional(Schema.String),
+    detail: Schema.String,
+    firstSeenAt: Schema.String,
+    supersedes: Schema.optional(Schema.String),
+  }),
+  /** A pass decided the item no longer waits on that basis, and why, without other progress. */
+  Schema.Struct({
+    type: Schema.Literal("wait_ended"),
+    basis: Schema.String,
+    reason: Schema.String,
+    endedAt: Schema.String,
+  }),
 ]);
 export type FactoryItemEventRecord = typeof FactoryItemEventRecord.Type;
 

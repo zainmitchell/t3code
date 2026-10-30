@@ -116,6 +116,7 @@ import {
   type FactoryTransferResult,
   latestTransfers,
   makeTransfers,
+  declaresOwnedFiles,
   namesOwnedFiles,
 } from "./factoryTransfers.ts";
 import { forkParked } from "../serverActivation.ts";
@@ -633,6 +634,8 @@ export interface FactoryState {
   readonly lastCollection: ReadonlyArray<FactoryItemDispositionRecord>;
   /** The latest pass's counts; null until this process ran one. */
   readonly lastPassMetrics: FactoryPassMetrics | null;
+  /** Items that wait now, as recorded durably, from when each was first seen waiting so. */
+  readonly waits: ReadonlyArray<FactoryOutcomeStore.FactoryItemWait>;
   /** Problems that stop the factory as a whole, from its latest pass: one entry each. */
   readonly issues: ReadonlyArray<{ readonly kind: string; readonly detail: string }>;
   /** The verified result each item of the latest pass is now built on, for its owner to judge. */
@@ -1276,6 +1279,18 @@ export const deriveVerificationBinding = Effect.fnUntraced(function* (
     );
   }
   const identity = adopted.identity;
+  // The issue's own bounded declaration, read as HSA and BTC read it, is the scope it owns.
+  const declared = declaresOwnedFiles(candidate.issue.body, doc.ownership.owned);
+  if (declared !== true) {
+    return wait(
+      declared === undefined
+        ? `#${issue} declares no owned files in a notation T3 reads (an HSA "## Owned files" section or one BTC builder marker), or declares them ambiguously`
+        : `binding owns ${doc.ownership.owned.join(", ") || "nothing"}, which is not exactly what #${issue} declares`,
+      "Root coordinator",
+      "make the issue declare exactly the binding's owned files, or adopt a binding for its declaration",
+      "the declared and bound scopes agree",
+    );
+  }
   // The engine's own record of the unit's scope, where one was prepared, binds the template's.
   const proposed = outcomes.findLast(
     (outcome) =>
@@ -2149,6 +2164,7 @@ const make = Effect.gen(function* () {
         reservedDecisions: yield* outcomeStore.reservedDecisions(input.factoryId),
         lastCollection,
         lastPassMetrics: (yield* Ref.get(lastMetrics)).get(input.factoryId) ?? null,
+        waits: yield* outcomeStore.currentWaits(input.factoryId),
         results,
         issues: (yield* Ref.get(factoryIssues)).get(input.factoryId) ?? [],
         grants: yield* store.listGrants(input.factoryId),
@@ -3140,6 +3156,22 @@ const make = Effect.gen(function* () {
               yield* outcomeStore.supersedeDecision({ decisionId: pending.decisionId, reason });
             }
           }
+          // A precise reason to start nothing is a wait, kept once per basis; anything else ends it.
+          yield* outcomeStore.recordWait({
+            factoryId,
+            itemKey,
+            wait:
+              result.disposition === "nothing_proposed" && result.detail !== undefined
+                ? {
+                    basis: sha256(
+                      canonical([candidate.stage.type, result.reasonClass ?? null, result.detail]),
+                    ).slice(0, 32),
+                    stage: candidate.stage.type,
+                    reasonClass: result.reasonClass,
+                    detail: result.detail,
+                  }
+                : { ended: result.disposition },
+          });
           if (result.admission !== undefined) admissions.push(result.admission);
           if (result.issue !== undefined) issues.push(result.issue);
           note(

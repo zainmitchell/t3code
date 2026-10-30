@@ -11948,7 +11948,11 @@ const setUpBoundProof = (issue: number, prerequisite: number, commit: string) =>
     yield* seedIssue(prerequisite);
     const landed = yield* landThroughT3(prerequisite, commit);
     yield* seedIssue(prerequisite + 1, { state: "closed" });
-    yield* seedIssue(issue, { blockerNumbers: [prerequisite, prerequisite + 1] });
+    // A verification-only unit declares that it owns no file, as HSA writes it.
+    yield* seedIssue(issue, {
+      blockerNumbers: [prerequisite, prerequisite + 1],
+      body: `Rerun the settlement proof.\n\n## Owned files\n\nNone\n`,
+    });
     yield* workStage(admittedBy(yield* advance("tracker_event", 1)), {
       outcome: "failed",
       failure: "settlement check failed",
@@ -12082,6 +12086,15 @@ it.effect(
           proposal.baseRef = lifecycleBase;
           yield* refusedWith(`would not start at landed commit ${landed.mergeCommit}`);
           proposal.baseRef = landed.mergeCommit;
+          // The scope is the issue's own declaration: one that owns more, or one T3 cannot read,
+          // waits; the binding never widens it.
+          const proofIssue = (yield* GitHubFake).issues.get(issueKey(claimRepository, 7501))!;
+          const declared = proofIssue.body;
+          proofIssue.body = "Rerun the proof.\n\n## Owned files\n\n- `src/app.py`\n";
+          yield* refusedWith("which is not exactly what #7501 declares");
+          proofIssue.body = "<!-- connector-unit writes=src/ effort=high -->\nRerun the proof.";
+          yield* refusedWith("declares no owned files in a notation T3 reads");
+          proofIssue.body = declared;
           // Earlier output in the derived directory is never written over.
           const outputRoot = path.join(
             outputs,
@@ -12308,6 +12321,56 @@ it.effect(
             (yield* itemHistory(7550)).filter((entry) => entry === "rework").length,
             1,
           );
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Waits/W1: a wait persists once across passes and restart, is superseded on change, and ends on progress",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const proof = yield* setUpBoundProof(7560, 7561, "c0007560");
+          const launch = yield* LaunchFake;
+          launch.head = { commit: proof.landed.mergeCommit, tree: proof.landed.tree };
+          const factory = yield* FactoryLifecycle.FactoryLifecycle;
+          const outcomes = yield* FactoryOutcomeStore.FactoryOutcomeStore;
+          const waitsOf = Effect.map(factory.readState({ factoryId }), (state) =>
+            state.waits.filter((wait) => wait.itemKey === itemKeyFor(7560)),
+          );
+          const waitRecords = Effect.map(
+            outcomes.itemRecords({ factoryId, itemKey: itemKeyFor(7560) }),
+            (records) => records.filter(({ record }) => record.type === "waiting"),
+          );
+          yield* proof.reconfigure({ identities: {} });
+          assert.deepStrictEqual(admissionsOnly(yield* advance("clock")), []);
+          const [first] = yield* waitsOf;
+          assert.include(first!.detail, "declares no account identity");
+          assert.strictEqual(first!.reasonClass, "needs_routing");
+          // Unchanged: later passes, a restart and time passing keep the one record and its first-seen.
+          yield* TestClock.adjust("1 hour");
+          for (const trigger of ["clock", "restart", "owner_decision"] as const) {
+            yield* advance(trigger);
+          }
+          assert.strictEqual((yield* waitRecords).length, 1);
+          assert.deepStrictEqual(yield* waitsOf, [first]);
+          // Another reason is another wait; the first stays in history.
+          yield* proof.reconfigure({ consumers: [] });
+          yield* advance("clock");
+          const [changed] = yield* waitsOf;
+          assert.include(changed!.detail, "is not one Root declared");
+          assert.strictEqual(changed!.supersedes, first!.basis);
+          assert.notStrictEqual(changed!.firstSeenAt, first!.firstSeenAt);
+          assert.strictEqual((yield* waitRecords).length, 2);
+          // Resolved: the proof is admitted once and no stale wait hides that progress.
+          yield* proof.reconfigure();
+          admittedBy(yield* advance("clock"));
+          assert.deepStrictEqual(yield* waitsOf, []);
+          yield* advance("restart");
+          assert.deepStrictEqual(yield* waitsOf, []);
+          assert.strictEqual((yield* waitRecords).length, 2);
         }),
       ),
     ),

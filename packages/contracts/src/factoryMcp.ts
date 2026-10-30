@@ -231,6 +231,22 @@ export const FactoryStateResult = Schema.Struct({
     }),
   ),
   /**
+   * Every item that waits now, as recorded durably: what on, who acts, what resumes it, and when
+   * it was first seen waiting on that basis. Absent from servers that predate it.
+   */
+  waits: Schema.optional(
+    Schema.Array(
+      Schema.Struct({
+        itemKey: Schema.String,
+        basis: Schema.String,
+        stage: Schema.String,
+        reasonClass: Schema.optional(Schema.String),
+        detail: Schema.String,
+        firstSeenAt: Schema.String,
+      }),
+    ),
+  ),
+  /**
    * What the latest pass did with the items it read, as counts. `byReasonClass.needs_routing` is
    * the number of eligible items the policy could not start for want of a unit spec: the measure
    * of whether decomposition, not capacity, is the bottleneck. Absent from servers that predate it.
