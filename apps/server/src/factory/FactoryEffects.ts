@@ -395,7 +395,23 @@ const make = Effect.gen(function* () {
       const cwd = project.value.workspaceRoot;
       return yield* tracker.withSession(
         { host: claim.host, cwd: configuration.value.artifactRoot },
-        (session) => attemptPullRequestMerge(session, integrator, { cwd, intent }),
+        (session) =>
+          attemptPullRequestMerge(session, integrator, {
+            cwd,
+            intent,
+            creates: {
+              unresolved:
+                operation.pullRequestCreate !== undefined &&
+                operation.pullRequestCreate.cleared === undefined,
+              record: operations.notePullRequestCreate(operation.operationId),
+              clear: (attempt, by) =>
+                operations.clearPullRequestCreate({
+                  operationId: operation.operationId,
+                  attempt,
+                  by,
+                }),
+            },
+          }),
       );
     }
     if (intent.kind === "tracker_create_issue") {
