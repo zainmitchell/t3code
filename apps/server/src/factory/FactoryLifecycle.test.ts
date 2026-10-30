@@ -22,6 +22,7 @@ import {
   FactoryReservationId,
   MessageId,
   type ModelSelection,
+  NodeId,
   type OrchestrationV2ProviderCapabilities,
   ProjectId,
   ProviderDriverKind,
@@ -2673,7 +2674,7 @@ const answerOf = (result: FactoryLifecycle.FactoryAdmissionResult) =>
   result.type === "refused" ? result.reason : result.type;
 
 it.effect(
-  "Agent ceiling: one count across factories, pools and other runs; the 16th starts, the 17th waits",
+  "Agent ceiling: the owner's 20 across factories, pools and other runs; the 20th starts, the 21st waits",
   () =>
     runIsolated(
       Effect.gen(function* () {
@@ -2684,9 +2685,9 @@ it.effect(
           ],
         });
         yield* configureFactory({ factoryId: gamma, pools: pool(1) });
-        yield* setCeiling(16);
+        yield* setCeiling(20);
         const conversations = yield* Effect.forEach(
-          Array.from({ length: 12 }, (_, i) => i),
+          Array.from({ length: 16 }, (_, i) => i),
           (i) => startUnrelatedConversation(`ceiling-${i}`),
         );
         // No pool subdivides the ceiling: two builders past a pool of one, and a reviewer.
@@ -2698,7 +2699,7 @@ it.effect(
           ],
           ["admitted", "admitted", "admitted"],
         );
-        // At 15 of 16, two factories race for the last place: one starts, one waits.
+        // At 19 of 20, two factories race for the last place: one starts, one waits.
         const raced = yield* Effect.all(
           [admitIn(gamma, "github:beta#1604"), admitIn(factoryId, "github:beta#1605")],
           { concurrency: "unbounded" },
@@ -2707,7 +2708,7 @@ it.effect(
         const full = yield* agentsNow;
         assert.deepStrictEqual(
           [full.ceiling, full.occupied, full.counted],
-          [16, 16, { admitted: 4, descendants: 0, observed: 0, transferred: 0, otherRuns: 12 }],
+          [20, 20, { admitted: 4, descendants: 0, observed: 0, transferred: 0, otherRuns: 16 }],
         );
         assert.strictEqual(
           answerOf(yield* admitIn(gamma, "github:beta#1606")),
@@ -2723,9 +2724,9 @@ it.effect(
         assert.strictEqual(answerOf(yield* retried), "admitted");
 
         // Lowered below what runs, nothing is stopped and nothing new starts.
-        yield* setCeiling(12);
+        yield* setCeiling(16);
         const over = yield* agentsNow;
-        assert.deepStrictEqual([over.ceiling, over.occupied], [12, 16]);
+        assert.deepStrictEqual([over.ceiling, over.occupied], [16, 20]);
         assert.strictEqual(
           answerOf(yield* admitIn(gamma, "github:beta#1607")),
           "capacity_exhausted",
@@ -2752,7 +2753,7 @@ it.effect(
         const worker = admittedExecution(yield* proposeCurrent("github:beta#1611"));
         yield* delegateFrom(worker.threadId, "ceiling-a");
         const [child] = yield* childThreadsOf(worker.threadId);
-        yield* startUnrelatedConversation("ceiling-other");
+        const other = yield* startUnrelatedConversation("ceiling-other");
         assert.deepStrictEqual((yield* agentsNow).counted, {
           admitted: 1,
           descendants: 1,
@@ -2778,11 +2779,54 @@ it.effect(
           "capacity_exhausted",
         );
 
-        // Work outside every factory is counted but not refused: its launchers own that limit.
-        const outside = yield* startUnrelatedConversation("ceiling-outside");
-        yield* delegateFrom(outside, "ceiling-outside-child");
-        const after = yield* agentsNow;
-        assert.deepStrictEqual([after.occupied, after.counted.otherRuns], [5, 3]);
+        // Work outside every factory is an agent too: a person's new conversation and a
+        // delegation from one wait at the ceiling, before anything runs.
+        const outside = ThreadId.make("thread:ceiling-outside");
+        yield* createTopLevelThread(outside, "user");
+        expectRefusal(
+          yield* sendUserMessage(outside, "ceiling-outside").pipe(Effect.flip),
+          "capacity_exhausted",
+        );
+        assert.strictEqual(yield* runCount(outside), 0);
+        expectRefusal(
+          yield* delegateFrom(other, "ceiling-other-child").pipe(Effect.flip),
+          "capacity_exhausted",
+        );
+        assert.deepStrictEqual(yield* childThreadsOf(other), []);
+        // A follow-up to a thread already running is the execution already counted.
+        yield* sendUserMessage(other, "ceiling-other-follow-up");
+        assert.strictEqual((yield* agentsNow).occupied, 3);
+        // At the shared seam, a scheduled start waits too; a restart resumes what was counted.
+        const store = yield* FactoryStore.FactoryStore;
+        const sql = yield* SqlClient.SqlClient;
+        const startOf = (label: string, origin: { scheduled?: true; resumes?: true }) =>
+          sql.withTransaction(
+            store.reserveExecution({
+              commandId: CommandId.make(`command:ceiling-${label}`),
+              executionThreadId: ThreadId.make(`thread:ceiling-${label}`),
+              runId: RunId.make(`run:ceiling-${label}`),
+              taskNodeId: NodeId.make(`node:ceiling-${label}`),
+              modelSelection: betaSelection,
+              origin: {
+                type: "descendant",
+                ownerThreadIds: [],
+                scheduledTaskId:
+                  origin.scheduled === true ? ScheduledTaskId.make("schedule:ceiling") : null,
+                firstRun: origin.resumes !== true,
+                ...(origin.resumes === true ? { resumes: true } : {}),
+              },
+            }),
+          );
+        assert.deepStrictEqual(yield* startOf("scheduled", { scheduled: true }), {
+          type: "refused",
+          refusal: "capacity_exhausted",
+        });
+        assert.deepStrictEqual(yield* startOf("resumed", { resumes: true }), { type: "none" });
+
+        // A place any execution frees is the next start's, factory or not.
+        yield* completeLatestRun((yield* childThreadsOf(worker.threadId))[1]!);
+        yield* sendUserMessage(outside, "ceiling-outside-again");
+        assert.strictEqual((yield* agentsNow).occupied, 3);
       }),
     ),
 );
@@ -2792,7 +2836,7 @@ it.effect("Agent ceiling: unknown and duplicated custody is charged once, across
     Effect.gen(function* () {
       yield* configureFactory({ pools: pool(4) });
       yield* configureFactory({ factoryId: gamma, pools: pool(4) });
-      yield* setCeiling(16);
+      yield* setCeiling(20);
       const store = yield* FactoryStore.FactoryStore;
 
       // One tracker claim nobody can attribute, read by two factories, is one execution.
@@ -22619,7 +22663,7 @@ it.effect(
             }),
           );
           // A shared agent ceiling with room to spare still holds no resource for two.
-          yield* setCeiling(16);
+          yield* setCeiling(20);
           // Only builds hold the OCR engine, on its execution; their reviews do not.
           yield* usePolicy((input) =>
             Effect.map(stageRequest(input), (decision) =>

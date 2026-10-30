@@ -599,6 +599,8 @@ export interface ReserveExecutionInput {
         readonly scheduledTaskId: ScheduledTaskId | null;
         /** False when the thread already ran before this start. */
         readonly firstRun: boolean;
+        /** A restart continuation: it resumes a run counted before the restart. */
+        readonly resumes?: boolean;
       };
 }
 
@@ -1289,6 +1291,26 @@ const make = Effect.gen(function* () {
     return (yield* agentOccupancy()).occupied + units <= ceiling;
   });
 
+  /**
+   * Whether a run counted only while it runs may start: no ceiling is set, it joins its thread's
+   * unfinished run (already counted), it resumes a run counted before a restart, or it fits.
+   */
+  const startFits = Effect.fnUntraced(function* (
+    input: ReserveExecutionInput,
+    origin: Extract<ReserveExecutionInput["origin"], { readonly type: "descendant" }>,
+    units: number,
+  ) {
+    const { ceiling } = yield* environmentCeiling();
+    if (
+      ceiling === null ||
+      origin.resumes === true ||
+      (yield* hasUnfinishedRun(input.executionThreadId))
+    ) {
+      return true;
+    }
+    return (yield* agentOccupancy()).occupied + units <= ceiling;
+  });
+
   /** The admitted decision a native reservation belongs to. */
   const admittedRootOf = Effect.fnUntraced(function* (reservation: NativeReservation) {
     let current: FactoryReservation = reservation;
@@ -1671,16 +1693,13 @@ const make = Effect.gen(function* () {
       if (!(yield* claimReady(bound.value))) {
         return { type: "refused", refusal: "claim_not_ready" } as const;
       }
-      // A descendant counts against the environment's ceiling only while its own run is
-      // unfinished, so running a finished one again is a new start under it.
+      // A descendant, or a stage whose reservation was released, counts against the ceiling only
+      // while its own run is unfinished, so running it again is a new start under it.
       if (
-        bound.value.origin === "inherited" &&
-        !(yield* hasUnfinishedRun(input.executionThreadId))
+        (bound.value.origin === "inherited" || bound.value.state !== "held") &&
+        !(yield* startFits(input, origin, bound.value.units))
       ) {
-        const { ceiling } = yield* environmentCeiling();
-        if (ceiling !== null && (yield* agentOccupancy()).occupied + bound.value.units > ceiling) {
-          return { type: "refused", refusal: "capacity_exhausted" } as const;
-        }
+        return { type: "refused", refusal: "capacity_exhausted" } as const;
       }
       return { type: "none" } as const;
     }
@@ -1705,7 +1724,12 @@ const make = Effect.gen(function* () {
       Option.isSome(candidate) && isNativeReservation(candidate.value) ? [candidate.value] : [],
     );
     const owner = owners[0];
-    if (owner === undefined) return { type: "none" } as const;
+    // Work outside every factory, a person's, a launcher's or a schedule's, is one agent too.
+    if (owner === undefined) {
+      return (yield* startFits(input, origin, 1))
+        ? ({ type: "none" } as const)
+        : ({ type: "refused", refusal: "capacity_exhausted" } as const);
+    }
     if (
       owners.some(
         (other) => other.factoryId !== owner.factoryId || other.decisionKey !== owner.decisionKey,

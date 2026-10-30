@@ -7673,6 +7673,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ownerThreadIds,
           scheduledTaskId,
           firstRun: run.ordinal === 1,
+          ...(command.type === "message.dispatch" &&
+          command.restartContinuationOfRunId !== undefined
+            ? { resumes: true }
+            : {}),
         },
       });
     }
