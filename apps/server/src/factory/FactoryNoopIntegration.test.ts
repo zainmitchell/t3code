@@ -244,7 +244,6 @@ const factory = Effect.gen(function* () {
       itemKey,
       stage: { type: "integrate", reviewOutcomeId: `review:${reviewedHead}`, head: reviewedHead },
       issue: { repository, issueNumber: 81, title: "No-change unit" },
-      branch: "t3-factory/connector/81",
       fence,
     });
   /** Runs every intended operation's effect once, then records what their readback proved. */

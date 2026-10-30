@@ -246,8 +246,6 @@ export const makeNativeStages = (deps: NativeStageDependencies) => {
       readonly issueNumber: number;
       readonly title: string;
     };
-    /** The branch the reviewed head was reported on, if its worker named one. */
-    readonly branch: string | undefined;
     readonly fence: FactoryStore.CustodyFence;
   }): Effect.fn.Return<NativeStagePlan, NativeStageError> {
     const { configuration, itemKey, stage } = input;
@@ -309,7 +307,8 @@ export const makeNativeStages = (deps: NativeStageDependencies) => {
             repository: integration.repository,
             remote: integration.remote,
             base: integration.branch,
-            head: input.branch ?? `t3-factory/${configuration.factoryId}/${issue.issueNumber}`,
+            // T3's own branch: one a worker reports is never a push target (main, say).
+            head: `t3-factory/${configuration.factoryId}/${issue.issueNumber}`,
             reviewedHead: stage.head,
             method: integration.method,
             // The stored marker keeps a recovery from a refused create read-only across restarts.

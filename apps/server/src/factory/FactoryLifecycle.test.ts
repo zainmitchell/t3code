@@ -14208,20 +14208,24 @@ it.effect(
 const pullsFor = (branch: string) =>
   Effect.map(GitHubFake, (fake) => [...fake.pulls.values()].filter((pull) => pull.head === branch));
 
-it.effect(
-  "Lifecycle/beta-PR: the reviewed head merges through its pull request after its checks pass, read back once",
-  () =>
+/** The branch T3 publishes an item's reviewed head on: its own, whatever a worker reports. */
+const prHead = (issueNumber: number) => `t3-factory/${factoryId}/${issueNumber}`;
+
+// A worker's report names the integration base, a branch of its own, or another item's branch.
+it.effect.each(["main", "beta/7201-parse-dates", `t3-factory/${factoryId}/7202`])(
+  "Lifecycle/beta-PR: the reviewed head merges through T3's own pull request after its checks pass, read back once (worker reported %s)",
+  (reported) =>
     runIsolated(
       Effect.scoped(
         Effect.gen(function* () {
           yield* configurePullRequestFactory;
           yield* seedIssue(7201);
-          const branch = "beta/7201-parse-dates";
+          const branch = prHead(7201);
           const implement = admittedBy(yield* advance("tracker_event", 1));
           yield* recordCommit("c0007201", [lifecycleBase]);
           yield* workStage(implement, {
             outcome: "implemented",
-            subject: { ...subjectFor("c0007201", lifecycleBase), branch },
+            subject: { ...subjectFor("c0007201", lifecycleBase), branch: reported },
             summary: "Implemented.",
           });
           const review = admittedBy(yield* advance("outcome"));
@@ -14236,6 +14240,9 @@ it.effect(
           const github = yield* GitHubFake;
           const graph = yield* GitGraphFake;
           assert.strictEqual(github.remoteBranches.get(branch), "c0007201");
+          // Nothing is pushed to, or opened from, the branch the worker named.
+          assert.isFalse(github.remoteBranches.has(reported));
+          assert.deepStrictEqual(yield* pullsFor(reported), []);
           const [pull, ...others] = yield* pullsFor(branch);
           assert.deepStrictEqual(others, []);
           assert.include(pull!.body, "Refs #7201");
@@ -14293,14 +14300,14 @@ it.effect(
 );
 
 it.effect(
-  "Lifecycle/beta-PR: a draft pull request a worker opened at the reviewed head is made ready and merged",
+  "Lifecycle/beta-PR: a draft pull request a worker opened on T3's branch at the reviewed head is made ready and merged",
   () =>
     runIsolated(
       Effect.scoped(
         Effect.gen(function* () {
           yield* configurePullRequestFactory;
           yield* seedIssue(7205);
-          const branch = "beta/7205-parse-dates";
+          const branch = prHead(7205);
           const implement = admittedBy(yield* advance("tracker_event", 1));
           yield* recordCommit("c0007205", [lifecycleBase]);
           yield* workStage(implement, {
@@ -14358,7 +14365,7 @@ it.effect(
           yield* configurePullRequestFactory;
           yield* seedIssue(7202);
           const item = `github:${claimRepository}#7202`;
-          const branch = "beta/7202-settlement";
+          const branch = prHead(7202);
           const github = yield* GitHubFake;
           const implement = admittedBy(yield* advance("tracker_event", 1));
           yield* recordCommit("c0007202", [lifecycleBase]);
@@ -14445,7 +14452,7 @@ const reviewAgainAfterFailedMerge = (
 ) =>
   Effect.gen(function* () {
     const item = `github:${claimRepository}#${issueNumber}`;
-    const branch = `beta/${issueNumber}-same-head`;
+    const branch = prHead(issueNumber);
     const github = yield* GitHubFake;
     yield* configureLifecycleFactory;
     yield* configureFactory(
@@ -14567,7 +14574,7 @@ it.effect(
 const reviewAgainDuringMerge = (issueNumber: number, head: string) =>
   Effect.gen(function* () {
     const item = `github:${claimRepository}#${issueNumber}`;
-    const branch = `beta/${issueNumber}-under-way`;
+    const branch = prHead(issueNumber);
     const implement = admittedBy(yield* advance("tracker_event", 1));
     yield* recordCommit(head, [lifecycleBase]);
     yield* workStage(implement, {
@@ -14695,7 +14702,7 @@ const mergeElsewhereWhileWaiting = (issueNumber: number, reviewed: string, merge
   Effect.gen(function* () {
     const github = yield* GitHubFake;
     const graph = yield* GitGraphFake;
-    const branch = `beta/${issueNumber}-merged-elsewhere`;
+    const branch = prHead(issueNumber);
     yield* configurePullRequestFactory;
     yield* seedIssue(issueNumber);
     const implement = admittedBy(yield* advance("tracker_event", 1));
@@ -15175,7 +15182,7 @@ it.effect(
           const github = yield* GitHubFake;
           github.requiredContexts.add("beta/independent-acceptance");
           yield* seedIssue(7203);
-          const branch = "beta/7203-fees";
+          const branch = prHead(7203);
           const implement = admittedBy(yield* advance("tracker_event", 1));
           yield* recordCommit("c0007203", [lifecycleBase]);
           github.checks.set("c0007203", "success");

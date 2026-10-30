@@ -4010,26 +4010,6 @@ const make = Effect.gen(function* () {
       : { unread: `its sub-issues could not be read: ${listed.failure.message}` };
   });
 
-  /**
-   * The branch the item's work was reported on: the reviewed head's own report first, then the
-   * item's latest implementation that named one.
-   */
-  const reportedBranch = Effect.fnUntraced(function* (
-    events: ReadonlyArray<FactoryOutcomeStore.StoredItemEvent>,
-    head: string,
-  ) {
-    let fallback: string | undefined;
-    for (const event of events.toReversed()) {
-      if (event.type !== "outcome" || event.kind !== "implemented") continue;
-      const outcome = yield* outcomeStore.get(event.outcomeId);
-      const branch = Option.isSome(outcome) ? outcome.value.report.subject?.branch : undefined;
-      if (branch === undefined) continue;
-      if (event.head === head) return branch;
-      fallback ??= branch;
-    }
-    return fallback;
-  });
-
   /** Carries out one item's decision for its current stage, beside the custody it was decided on. */
   /**
    * The item's triage decision as of this pass. After a failed preparation it includes what T3
@@ -4962,7 +4942,6 @@ const make = Effect.gen(function* () {
               itemKey,
               stage,
               issue: { ...subject, title: candidate.issue.title },
-              branch: yield* reportedBranch(candidate.events, stage.head),
               fence: custody,
             })
           : yield* nativeStages.planClosure({ configuration, itemKey, stage, fence: custody });
