@@ -191,6 +191,55 @@ export const bootBoundaryRefusals = (
   ];
 };
 
+/**
+ * What no retained producer fact settles for a historical execution whose provider never joined
+ * its container: where its provider processes ran, and what their shell commands started beyond
+ * T3. An owner may accept exactly this uncertainty; accepting it is a decision, never provenance.
+ */
+export const RESIDUAL_UNCERTAINTIES = [
+  "non_t3_side_effects_unrecordable",
+  "provider_executor_locality_unrecorded",
+] as const;
+export type ResidualUncertainty = (typeof RESIDUAL_UNCERTAINTIES)[number];
+
+/**
+ * Everything an owner's residual decision covers, read from T3's own records in the capture
+ * transaction: the containers' host and serving process, every started attempt's provider thread
+ * and session, and every recorded provider-native descendant with its exact session and fork.
+ */
+export interface ResidualScope {
+  readonly reservationId: string;
+  readonly operationRef: string;
+  readonly host: { readonly platform: string; readonly machineId: string };
+  readonly servingProcess: { readonly admittedIn: string; readonly ownerHost: string };
+  readonly generations: ReadonlyArray<{
+    readonly generationId: string;
+    readonly runId: string;
+    readonly machine: string;
+    readonly session: number;
+  }>;
+  readonly attempts: ReadonlyArray<{
+    readonly attemptId: string;
+    readonly runId: string;
+    readonly providerInstanceId: string;
+    readonly providerThreadId: string;
+    readonly providerSessionId: string;
+    readonly driver: string;
+    readonly nativeThreadId: string;
+  }>;
+  readonly nativeDescendants: ReadonlyArray<{
+    readonly childThreadId: string;
+    readonly parentThreadId: string;
+    readonly subagentId: string;
+    readonly providerInstanceId: string;
+    readonly providerThreadId: string;
+    readonly providerSessionId: string;
+    readonly forkedFromProviderThreadId: string;
+    readonly forkedFromProviderTurnId: string | null;
+    readonly nativeThreadId: string;
+  }>;
+}
+
 /** What a restart proof covers: exactly these attempts, launches and containers. */
 export interface TerminationCoverage {
   readonly attempts: ReadonlyArray<string>;
@@ -206,20 +255,30 @@ const launchKey = (launch: TerminationCoverage["launches"][number]) =>
   `${launch.runId}\u0000${launch.status}\u0000${launch.attemptCount}`;
 
 /**
- * What a recorded restart covers: only a proved one whose capture bound retained provenance of
- * every writer. An unproved capture, or a proof from a build that bound none, covers nothing.
+ * What a recorded restart covers, and on what: a proved restart whose capture bound retained
+ * provenance of every writer, or the owner's accepted residual uncertainty. An unproved capture,
+ * or a proof from a build that bound neither, covers nothing.
  */
 export const provedCoverage = (
   termination:
     | {
-        readonly capture: { readonly covers: TerminationCoverage; readonly provenance?: unknown };
+        readonly capture: {
+          readonly covers: TerminationCoverage;
+          readonly provenance?: unknown;
+          readonly residual?: unknown;
+        };
         readonly proof?: unknown;
       }
     | undefined,
-): TerminationCoverage | undefined =>
-  termination?.proof === undefined || termination.capture.provenance === undefined
-    ? undefined
-    : termination.capture.covers;
+):
+  | { readonly covers: TerminationCoverage; readonly basis: "provenance" | "residual" }
+  | undefined => {
+  if (termination?.proof === undefined) return undefined;
+  const { capture } = termination;
+  if (capture.provenance !== undefined) return { covers: capture.covers, basis: "provenance" };
+  if (capture.residual !== undefined) return { covers: capture.covers, basis: "residual" };
+  return undefined;
+};
 
 /**
  * The attempts a proved restart still covers. Any launch or container it did not name, or a

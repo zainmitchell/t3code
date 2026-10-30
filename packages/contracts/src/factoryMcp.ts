@@ -541,6 +541,18 @@ export const FactoryHistoricalTerminationInput = Schema.Struct({
   operationRef: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
   reason: TrimmedNonEmptyString.check(Schema.isMaxLength(2_000)),
   expectDigest: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(128))),
+  /**
+   * Where no provenance placed the stage's writers, the owner's acceptance of exactly the
+   * uncertainty T3 cannot settle, over the scope the read shows. A decision, never a proof.
+   */
+  acceptResidual: Schema.optional(
+    Schema.Array(
+      Schema.Literals([
+        "non_t3_side_effects_unrecordable",
+        "provider_executor_locality_unrecorded",
+      ]),
+    ),
+  ),
 });
 export const FactoryHistoricalTerminationResult = FactoryQuarantineResult;
 

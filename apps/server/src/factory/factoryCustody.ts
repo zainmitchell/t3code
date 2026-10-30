@@ -37,7 +37,11 @@ export type FactoryCustody =
   | {
       readonly state: "quiescent";
       readonly reasons: ReadonlyArray<
-        "descendants_ended" | "contained_quiet" | "never_started" | "host_restarted"
+        | "descendants_ended"
+        | "contained_quiet"
+        | "never_started"
+        | "host_restarted"
+        | "owner_accepted_residual_after_restart"
       >;
     }
   | {
@@ -135,6 +139,11 @@ type ExecutionFacts =
       readonly refusedBeforeStart: ReadonlySet<RunId>;
       /** Attempts whose processes the owner's proof of a later host boot covers, exactly. */
       readonly hostRestarted: ReadonlySet<string>;
+      /**
+       * What that proof rests on: retained provenance, or the owner's accepted residual
+       * uncertainty, which is shown as its own reason and never as `host_restarted`.
+       */
+      readonly restartBasis?: "provenance" | "residual" | undefined;
       /**
        * Runs whose last workspace preparation failed, by its own failure item, under a settled
        * obligation that this serving process admitted and opened. An open one is still owed to
@@ -410,13 +419,22 @@ function classifyCustody(facts: ExecutionFacts): FactoryCustody {
   ) {
     return { state: "quiescent", reasons: ["never_started"] };
   }
-  const quiescent = new Set<"descendants_ended" | "contained_quiet" | "host_restarted">();
+  const quiescent = new Set<
+    | "descendants_ended"
+    | "contained_quiet"
+    | "host_restarted"
+    | "owner_accepted_residual_after_restart"
+  >();
   for (const fact of [...judgedFacts, ...facts.siblings]) {
     if (fact?.type === "ended") quiescent.add("descendants_ended");
     if (fact?.type === "quiet") quiescent.add("contained_quiet");
   }
   if (attempts.some((attempt) => facts.hostRestarted.has(attempt.id))) {
-    quiescent.add("host_restarted");
+    quiescent.add(
+      facts.restartBasis === "residual"
+        ? "owner_accepted_residual_after_restart"
+        : "host_restarted",
+    );
   }
   return { state: "quiescent", reasons: [...quiescent] };
 }
@@ -574,6 +592,10 @@ export const readExecutionCustody = Effect.fn("factoryCustody.readExecutionCusto
     }
     return state;
   }).pipe(Effect.orElseSucceed(() => "unresolved" as const));
+  const restartCoverage =
+    reservation.origin === "admitted"
+      ? provedCoverage(reservation.historicalTermination)
+      : undefined;
   return classifyCustody({
     type: "readable",
     workspace,
@@ -602,15 +624,11 @@ export const readExecutionCustody = Effect.fn("factoryCustody.readExecutionCusto
       ]),
     ),
     refusedBeforeStart: refusedBeforeStartRuns(projection),
-    hostRestarted: coveredAttempts(
-      reservation.origin === "admitted"
-        ? provedCoverage(reservation.historicalTermination)
-        : undefined,
-      {
-        launches,
-        generations: executionGenerations.map((entry) => entry.generation.generationId),
-      },
-    ),
+    hostRestarted: coveredAttempts(restartCoverage?.covers, {
+      launches,
+      generations: executionGenerations.map((entry) => entry.generation.generationId),
+    }),
+    restartBasis: restartCoverage?.basis,
     preparationFailed: new Set(
       [...preparationFailures(projection).keys()].filter((runId) => settledHere.has(runId)),
     ),

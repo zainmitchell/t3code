@@ -123,10 +123,20 @@ describe("coveredAttempts", () => {
 
 describe("provedCoverage", () => {
   const bound = { covers, provenance: { digest: "d", source: "synthetic" } };
-  it("covers only a proof whose capture bound retained provenance", () => {
-    assert.strictEqual(provedCoverage({ capture: bound, proof: {} }), covers);
-    // Unproved, or proved by a build that bound no provenance (R1): nothing is covered.
+  it("covers only a proof whose capture bound retained provenance or an accepted residual", () => {
+    assert.deepStrictEqual(provedCoverage({ capture: bound, proof: {} }), {
+      covers,
+      basis: "provenance",
+    });
+    // The owner's residual decision covers on its own basis, never reported as provenance.
+    const decided = { covers, residual: { accepted: [], scopeDigest: "s", scope: "{}" } };
+    assert.deepStrictEqual(provedCoverage({ capture: decided, proof: {} }), {
+      covers,
+      basis: "residual",
+    });
+    // Unproved, or proved by a build that bound neither (R1): nothing is covered.
     assert.strictEqual(provedCoverage({ capture: bound }), undefined);
+    assert.strictEqual(provedCoverage({ capture: decided }), undefined);
     assert.strictEqual(provedCoverage({ capture: { covers }, proof: {} }), undefined);
     assert.strictEqual(provedCoverage(undefined), undefined);
   });

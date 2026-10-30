@@ -607,6 +607,19 @@ export interface ProjectionStoreV2Shape {
   readonly getNeverDequeuedRunIds: (
     threadId: ThreadId,
   ) => Effect.Effect<ReadonlySet<RunId>, ProjectionStoreV2Error>;
+  /**
+   * Every thread descended from `threadIds`, at any depth, by lineage or by a subagent's child,
+   * archived and deleted included. `unreadableThreads` counts thread rows whose lineage cannot be
+   * read at all: any one of them could be a descendant, so a caller must not read the set as whole.
+   * Optional so partial test stores need not list it; a store without it reads as unknown lineage.
+   */
+  readonly getLineageDescendants?: (threadIds: ReadonlyArray<ThreadId>) => Effect.Effect<
+    {
+      readonly threadIds: ReadonlyArray<ThreadId>;
+      readonly unreadableThreads: number;
+    },
+    ProjectionStoreV2Error
+  >;
   readonly getUnreadableThreadIds: () => Effect.Effect<
     ReadonlyArray<ThreadId>,
     ProjectionStoreV2Error
@@ -3879,6 +3892,44 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })),
     );
 
+    const getLineageDescendants = Effect.fn("ProjectionStore.getLineageDescendants")(
+      function* (threadIds: ReadonlyArray<ThreadId>) {
+        if (threadIds.length === 0) return { threadIds: [], unreadableThreads: 0 };
+        const rows = yield* sql<{ readonly thread_id: string }>`
+          WITH RECURSIVE descendants(thread_id) AS (
+            SELECT t.thread_id FROM orchestration_v2_projection_threads AS t
+            WHERE json_valid(t.payload_json)
+              AND (json_extract(t.payload_json, '$.lineage.parentThreadId') IN ${sql.in(threadIds)}
+                OR json_extract(t.payload_json, '$.lineage.rootThreadId') IN ${sql.in(threadIds)})
+            UNION
+            SELECT child_thread_id FROM orchestration_v2_projection_subagents
+            WHERE thread_id IN ${sql.in(threadIds)} AND child_thread_id IS NOT NULL
+            UNION
+            SELECT t.thread_id FROM orchestration_v2_projection_threads AS t
+            JOIN descendants AS d
+              ON json_valid(t.payload_json)
+              AND json_extract(t.payload_json, '$.lineage.parentThreadId') = d.thread_id
+            UNION
+            SELECT s.child_thread_id FROM orchestration_v2_projection_subagents AS s
+            JOIN descendants AS d ON s.thread_id = d.thread_id
+            WHERE s.child_thread_id IS NOT NULL
+          )
+          SELECT thread_id FROM descendants
+          WHERE thread_id NOT IN ${sql.in(threadIds)}
+          ORDER BY thread_id
+        `;
+        const unreadable = yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM orchestration_v2_projection_threads
+          WHERE NOT json_valid(payload_json)
+        `;
+        return {
+          threadIds: rows.map((row) => ThreadId.make(row.thread_id)),
+          unreadableThreads: unreadable[0]?.count ?? 0,
+        };
+      },
+      Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })),
+    );
+
     const getRecoveryThreadIds = Effect.fn("ProjectionStore.getRecoveryThreadIds")(
       function* (kind: ProjectionRecoveryKind) {
         const candidates = (() => {
@@ -6838,6 +6889,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getLimitRecoveryCandidates: readOnReader(getLimitRecoveryCandidates),
       getRecoveryThreadIds: readOnReader(getRecoveryThreadIds),
       getNeverDequeuedRunIds: readOnReader(getNeverDequeuedRunIds),
+      getLineageDescendants: readOnReader(getLineageDescendants),
       getUnreadableThreadIds: readOnReader(getUnreadableThreadIds),
       getThreadSnapshot: readOnReader(getThreadSnapshot),
       getThreadSnapshotWindow: readOnReader(getThreadSnapshotWindow),

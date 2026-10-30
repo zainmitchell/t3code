@@ -16,9 +16,12 @@ import { GenerationId } from "./FactoryExecutionGenerations.ts";
 import {
   neverStartedRefusals,
   quarantineRefusals,
+  residualRefusals,
+  residualScopeOf,
   terminationRefusals,
   type NeverStartedEvidence,
   type QuarantineEvidence,
+  type ResidualFacts,
 } from "./factoryDisposition.ts";
 import type { HistoricalProvenance, HostBoot } from "./factoryHistoricalTermination.ts";
 import type { HistoricalTermination } from "./FactoryStore.ts";
@@ -639,5 +642,495 @@ describe("terminationRefusals", () => {
     ["provenance_changed", { ...verify, recorded: { capture: unboundCapture } }],
   ])("refuses %s", (refusal, input) => {
     assert.include(terminationRefusals(input), refusal);
+  });
+});
+
+// The four held executions' structural records, as Root read them from the immutable backup
+// (ids, instances, drivers, hosts; no payload). Ids follow the allocator's own encoding.
+const HOST = { platform: "win32" as const, machineId: "a63c8b86-e9c0-4567-9e26-9eab1ac36f80" };
+const SERVING = "fb0b1c30-6b5c-4542-86f0-ab4ad767962a";
+const OWNER_HOST = "98659ce8-a0c7-49ee-9532-e5b0fa9ac2de";
+const threadOf = (factory: string, key: string) => `thread:factory:${factory}:${key}`;
+const runOf = (thread: string, ordinal: number) =>
+  `run:thread:${encodeURIComponent(thread)}:ordinal:${ordinal}`;
+const attemptOf = (run: string) => `run-attempt:run:${encodeURIComponent(run)}:attempt:1`;
+const pendingProviderThread = (driver: string, run: string) =>
+  `provider-thread:provider:${driver}:native-thread:${encodeURIComponent(`pending:${run}`)}`;
+const sessionOf = (instance: string, thread: string, uuid: string) =>
+  `provider-session:provider-instance:${instance}:thread:${encodeURIComponent(thread)}:${uuid}`;
+
+interface HeldExecution {
+  readonly factory: string;
+  readonly key: string;
+  readonly instance: "claudeAgent" | "codex_cli";
+  readonly driver: "claudeAgent" | "codex";
+  readonly generationId: string;
+  readonly sessionUuid: string;
+  readonly nativeThreadId: string;
+  /** Runs after the first, none started (BTC142's second attempt never started). */
+  readonly laterRuns?: number;
+}
+
+const heldExecutions = {
+  hsa137: {
+    factory: "hsa-native-pilot-20261024",
+    key: "edc9a93c4c24bbd19cb5d2623d20fec450ab8e2f7b3ead3f93f1c7e568887833",
+    instance: "claudeAgent",
+    driver: "claudeAgent",
+    generationId: "90464fb7-195d-4046-9ebb-db305429e80d",
+    sessionUuid: "de02eea4-492e-4efc-8526-d872daf964f6",
+    nativeThreadId: "20e2b00e-0b61-4697-bc50-8fb429277d24",
+  },
+  connector93: {
+    factory: "connector-native-factory-20261028",
+    key: "63f41bcda6adcbcfed13e4a23e47e1d1f225a648632fa49ebe15e6037520f1f4",
+    instance: "codex_cli",
+    driver: "codex",
+    generationId: "d941fd99-4363-44e8-93c3-a9b46f0184fc",
+    sessionUuid: "3dcc6298-d1f9-4779-9613-dfbc30dccd7f",
+    nativeThreadId: "01a18908-bc09-7ad3-8e82-25f527cb3dca",
+  },
+  btc142: {
+    factory: "btc-native-pilot-20261024",
+    key: "d360d72e3df165bcf13b072a5dcfc922334710bbaed1bb900ef5e2dabfc80e28",
+    instance: "codex_cli",
+    driver: "codex",
+    generationId: "d8150448-394c-4349-ae68-64441bda0d3a",
+    sessionUuid: "8411ce5e-0a95-4ac1-9780-25f4ddf839ad",
+    nativeThreadId: "01a18908-7111-7c11-8fff-e2dd4dd1ae20",
+    laterRuns: 1,
+  },
+  btc145: {
+    factory: "btc-native-pilot-20261024",
+    key: "df6add5f7c528ab2351e8414d3f7fb4ec04da617c0f6cc3ae5f37aef2e7d74e9",
+    instance: "claudeAgent",
+    driver: "claudeAgent",
+    generationId: "7733e50f-4f49-47cd-9498-8295b2e723a6",
+    sessionUuid: "a2a8f90b-cf36-435d-aa81-2bd76e5d8170",
+    nativeThreadId: "a374b88d-e5f2-4c98-a175-a6535ed4dd7d",
+  },
+} satisfies Record<string, HeldExecution>;
+
+// connector93's two provider-native Codex children, exactly as Root's cross-binding read shows.
+const connectorChildren = [
+  { call: "call_710d676612a34c81b2892699c4c408f0", native: "01a18909-c009-77e1-92d3-e9d505d5b9d2" },
+  { call: "call_fa16ab68fd4d43e8a53945fef47815a1", native: "01a18909-d700-7b91-b9df-167c76c0d76c" },
+];
+const forkTurn = "provider-turn:provider:codex:native-turn:01a18908-bf45-7ee0-8d85-dbbd9e8de1b9";
+
+type Loose = Record<string, unknown>;
+interface FactsFixture {
+  containers: Array<{
+    generationId: string;
+    runId: string;
+    machine: string;
+    session: number;
+    ownerHost: string;
+    providerJoins: number;
+  }>;
+  projection: {
+    thread: Loose;
+    runs: Array<Loose>;
+    attempts: Array<Loose>;
+    providerThreads: Array<Loose>;
+    providerSessions: Array<Loose>;
+    providerTurns: Array<Loose>;
+    subagents: Array<Loose>;
+  };
+  unreadableThreads: number;
+  descendants: Array<{
+    threadId: string;
+    projection: {
+      thread: Loose;
+      runs: Array<Loose>;
+      attempts: Array<Loose>;
+      providerThreads: Array<Loose>;
+      providerSessions: Array<Loose>;
+      providerTurns: Array<Loose>;
+      subagents: Array<Loose>;
+    } | null;
+  }>;
+}
+// Fixtures carry only the fields the predicates read; the cast is to the projection's full type.
+const asFacts = (fixture: FactsFixture) => fixture as unknown as ResidualFacts;
+
+const residualFactsOf = (execution: HeldExecution): FactsFixture => {
+  const thread = threadOf(execution.factory, execution.key);
+  const firstRun = runOf(thread, 1);
+  const providerThread = pendingProviderThread(execution.driver, firstRun);
+  const session = sessionOf(execution.instance, thread, execution.sessionUuid);
+  const runs = [
+    firstRun,
+    ...Array.from({ length: execution.laterRuns ?? 0 }, (_, i) => runOf(thread, i + 2)),
+  ];
+  const children = execution === heldExecutions.connector93 ? connectorChildren : [];
+  return {
+    containers: [
+      {
+        generationId: execution.generationId,
+        runId: firstRun,
+        machine: HOST.machineId,
+        session: 1,
+        ownerHost: OWNER_HOST,
+        providerJoins: 0,
+      },
+    ],
+    projection: {
+      thread: {
+        id: thread,
+        lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: thread },
+      },
+      runs: runs.map((id, index) => ({
+        id,
+        startedAt: index === 0 ? "2026-10-29T19:00:00Z" : null,
+      })),
+      attempts: runs.map((runId, index) => ({
+        id: attemptOf(runId),
+        runId,
+        startedAt: index === 0 ? "2026-10-29T19:00:00Z" : null,
+        providerInstanceId: execution.instance,
+        providerThreadId: providerThread,
+        nativeThreadId: `pending:${runId}`,
+      })),
+      providerThreads: [
+        {
+          id: providerThread,
+          driver: execution.driver,
+          providerInstanceId: execution.instance,
+          providerSessionId: session,
+          forkedFrom: null,
+          nativeThreadRef: {
+            driver: execution.driver,
+            nativeId: execution.nativeThreadId,
+            strength: "strong",
+          },
+        },
+      ],
+      providerSessions: [
+        { id: session, driver: execution.driver, providerInstanceId: execution.instance },
+      ],
+      providerTurns: [{ id: forkTurn, providerThreadId: providerThread }],
+      subagents: children.map((child) => ({
+        id: `node:provider:codex:native-item:${child.call}%3A${child.native}`,
+        threadId: thread,
+        origin: "provider_native",
+        providerInstanceId: execution.instance,
+        providerThreadId: `provider-thread:provider:codex:native-thread:${child.native}`,
+        childThreadId: `thread:provider:codex:native-thread:${child.native}`,
+        nativeTaskRef: {
+          driver: "codex",
+          nativeId: `${child.call}:${child.native}`,
+          strength: "strong",
+        },
+      })),
+    },
+    unreadableThreads: 0,
+    descendants: children.map((child) => {
+      const childThread = `thread:provider:codex:native-thread:${child.native}`;
+      return {
+        threadId: childThread,
+        projection: {
+          thread: {
+            id: childThread,
+            lineage: {
+              parentThreadId: thread,
+              relationshipToParent: "subagent",
+              rootThreadId: thread,
+            },
+          },
+          runs: [],
+          attempts: [],
+          providerSessions: [],
+          providerTurns: [],
+          subagents: [],
+          providerThreads: [
+            {
+              id: `provider-thread:provider:codex:native-thread:${child.native}`,
+              driver: "codex",
+              providerInstanceId: execution.instance,
+              providerSessionId: session,
+              forkedFrom: { providerThreadId: providerThread, providerTurnId: forkTurn },
+              nativeThreadRef: { driver: "codex", nativeId: child.native, strength: "strong" },
+            },
+          ],
+        },
+      };
+    }),
+  };
+};
+
+const scopeInput = (execution: HeldExecution) => ({
+  reservationId: `reservation:factory:${execution.factory}:decision:${execution.key}`,
+  admittedIn: SERVING,
+  operationRef: "restart:20261030",
+  host: HOST,
+});
+
+describe("residualScopeOf: the four held executions", () => {
+  it("composes Root's exact ids", () => {
+    const hsa = threadOf(heldExecutions.hsa137.factory, heldExecutions.hsa137.key);
+    const connector = threadOf(heldExecutions.connector93.factory, heldExecutions.connector93.key);
+    assert.strictEqual(
+      attemptOf(runOf(hsa, 1)),
+      "run-attempt:run:run%3Athread%3Athread%253Afactory%253Ahsa-native-pilot-20261024%253Aedc9a93c4c24bbd19cb5d2623d20fec450ab8e2f7b3ead3f93f1c7e568887833%3Aordinal%3A1:attempt:1",
+    );
+    assert.strictEqual(
+      pendingProviderThread("codex", runOf(connector, 1)),
+      "provider-thread:provider:codex:native-thread:pending%3Arun%3Athread%3Athread%253Afactory%253Aconnector-native-factory-20261028%253A63f41bcda6adcbcfed13e4a23e47e1d1f225a648632fa49ebe15e6037520f1f4%3Aordinal%3A1",
+    );
+    assert.strictEqual(
+      sessionOf("codex_cli", connector, "3dcc6298-d1f9-4779-9613-dfbc30dccd7f"),
+      "provider-session:provider-instance:codex_cli:thread:thread%3Afactory%3Aconnector-native-factory-20261028%3A63f41bcda6adcbcfed13e4a23e47e1d1f225a648632fa49ebe15e6037520f1f4:3dcc6298-d1f9-4779-9613-dfbc30dccd7f",
+    );
+  });
+
+  it.each(Object.entries(heldExecutions))("%s scopes exactly its records", (_name, execution) => {
+    const { scope, refusals } = residualScopeOf(
+      asFacts(residualFactsOf(execution)),
+      scopeInput(execution),
+    );
+    assert.deepStrictEqual(refusals, []);
+    assert.deepStrictEqual(scope?.servingProcess, { admittedIn: SERVING, ownerHost: OWNER_HOST });
+    assert.deepStrictEqual(scope?.host, HOST);
+    // The started attempt only: BTC142's second attempt never started.
+    assert.deepStrictEqual(
+      scope?.attempts.map((attempt) => [attempt.driver, attempt.nativeThreadId]),
+      [[execution.driver, execution.nativeThreadId]],
+    );
+    assert.deepStrictEqual(
+      scope?.nativeDescendants.map((child) => child.nativeThreadId),
+      execution === heldExecutions.connector93
+        ? connectorChildren.map((child) => child.native)
+        : [],
+    );
+  });
+
+  it("binds connector93's children to the parent's session, provider thread and fork turn", () => {
+    const { scope } = residualScopeOf(
+      asFacts(residualFactsOf(heldExecutions.connector93)),
+      scopeInput(heldExecutions.connector93),
+    );
+    assert.strictEqual(scope?.nativeDescendants.length, 2);
+    for (const child of scope?.nativeDescendants ?? []) {
+      assert.strictEqual(child.providerSessionId, scope?.attempts[0]?.providerSessionId);
+      assert.strictEqual(child.forkedFromProviderThreadId, scope?.attempts[0]?.providerThreadId);
+      assert.strictEqual(child.forkedFromProviderTurnId, forkTurn);
+    }
+  });
+});
+
+describe("residualScopeOf: refusals", () => {
+  const connector = heldExecutions.connector93;
+  const refusalsOf = (change: (facts: FactsFixture) => void) => {
+    const facts = residualFactsOf(connector);
+    change(facts);
+    return residualScopeOf(asFacts(facts), scopeInput(connector)).refusals;
+  };
+  const child = (facts: FactsFixture) => facts.descendants[0]!.projection!;
+
+  it.each<[string, (facts: FactsFixture) => void]>([
+    // T2: a copied database, a joined container, an uncontained started run.
+    [
+      "residual_container_foreign_host",
+      (f) => void (f.containers[0] = { ...f.containers[0]!, machine: "machine:copy" }),
+    ],
+    [
+      "residual_joined_use_custody",
+      (f) => void (f.containers[0] = { ...f.containers[0]!, providerJoins: 1 }),
+    ],
+    ["residual_run_uncontained", (f) => void (f.containers.length = 0)],
+    // T3: two serving processes.
+    [
+      "residual_serving_process_split",
+      (f) =>
+        void f.containers.push({ ...f.containers[0]!, generationId: "g2", ownerHost: "other" }),
+    ],
+    // T4: an attempt whose thread, session, instance, adapter or native id does not bind.
+    ["residual_attempt_unbound", (f) => void (f.projection.providerSessions = [])],
+    [
+      "residual_attempt_foreign_instance",
+      (f) => void (f.projection.providerSessions[0]!.providerInstanceId = "claudeAgent"),
+    ],
+    [
+      "residual_attempt_foreign_instance",
+      (f) => void (f.projection.providerSessions[0]!.driver = "cursor"),
+    ],
+    [
+      "residual_native_id_unrecorded",
+      (f) =>
+        void (f.projection.providerThreads[0]!.nativeThreadRef = {
+          driver: "codex",
+          nativeId: "pending:run",
+          strength: "strong",
+        }),
+    ],
+    [
+      "residual_native_id_unrecorded",
+      (f) =>
+        void (f.projection.providerThreads[0]!.nativeThreadRef = {
+          driver: "codex",
+          nativeId: connector.nativeThreadId,
+          strength: "weak",
+        }),
+    ],
+    [
+      "residual_native_id_conflict",
+      (f) =>
+        void (f.projection.attempts[0]!.nativeThreadId = "01a18900-0000-7000-8000-000000000000"),
+    ],
+    ["residual_no_started_attempt", (f) => void (f.projection.attempts = [])],
+    // T5: incomplete, unreadable, remote, delegated, separately launched or unbound children.
+    ["residual_lineage_unreadable", (f) => void (f.unreadableThreads = 1)],
+    [
+      "residual_descendant_unreadable",
+      (f) => void (f.descendants[0] = { ...f.descendants[0]!, projection: null }),
+    ],
+    [
+      "residual_descendant_remote",
+      (f) => void (f.projection.subagents[0]!.remoteChild = { environmentId: "remote" }),
+    ],
+    [
+      "residual_descendant_delegated",
+      (f) => void (child(f).thread.delegatedFrom = { environmentId: "remote" }),
+    ],
+    ["residual_descendant_t3_launched", (f) => void (child(f).runs = [{ id: "run:child" }])],
+    [
+      "residual_descendant_t3_launched",
+      (f) =>
+        void (child(f).thread.lineage = {
+          parentThreadId: f.projection.thread.id,
+          relationshipToParent: "fork",
+        }),
+    ],
+    [
+      "residual_descendant_unbound",
+      (f) => void (f.projection.subagents[0]!.providerInstanceId = "claudeAgent"),
+    ],
+    ["residual_descendant_unbound", (f) => void (f.projection.subagents[0]!.origin = "app_owned")],
+    [
+      "residual_descendant_unbound",
+      (f) => void (child(f).providerThreads[0]!.providerSessionId = "provider-session:other"),
+    ],
+    [
+      "residual_descendant_unbound",
+      (f) =>
+        void (child(f).providerThreads[0]!.forkedFrom = {
+          providerThreadId: "provider-thread:other",
+        }),
+    ],
+    [
+      "residual_descendant_unbound",
+      (f) =>
+        void (child(f).providerThreads[0]!.forkedFrom = {
+          providerThreadId: f.projection.providerThreads[0]!.id,
+          providerTurnId: "provider-turn:other",
+        }),
+    ],
+    [
+      "residual_descendant_unbound",
+      (f) =>
+        void (f.projection.subagents[0]!.nativeTaskRef = {
+          driver: "codex",
+          nativeId: "call_1:other",
+          strength: "strong",
+        }),
+    ],
+    [
+      "residual_descendant_unbound",
+      (f) => void (f.projection.subagents[0]!.childThreadId = "thread:other"),
+    ],
+    [
+      "residual_descendant_unbound",
+      (f) =>
+        void (child(f).thread.lineage = {
+          parentThreadId: "thread:elsewhere",
+          relationshipToParent: "subagent",
+        }),
+    ],
+  ])("refuses %s", (refusal, change) => {
+    assert.include(refusalsOf(change), refusal);
+  });
+
+  it("accepts the second Codex producer's item shape only with the same binding", () => {
+    // subAgentActivity.started names its item `<activity id>:<child>`, as spawnAgent does.
+    assert.deepStrictEqual(
+      refusalsOf((f) => {
+        f.projection.subagents[0]!.nativeTaskRef = {
+          driver: "codex",
+          nativeId: `activity_1:${connectorChildren[0]!.native}`,
+          strength: "strong",
+        };
+      }),
+      [],
+    );
+  });
+});
+
+describe("the owner's residual decision in terminationRefusals", () => {
+  const exact = ["non_t3_side_effects_unrecordable", "provider_executor_locality_unrecorded"];
+  it.each<[string, ReadonlyArray<string>, ReadonlyArray<string>]>([
+    ["the exact set", [...exact].reverse(), []],
+    ["an incomplete set", ["provider_executor_locality_unrecorded"], ["residual_mismatch"]],
+    ["a repeated entry", [...exact, "non_t3_side_effects_unrecordable"], ["residual_mismatch"]],
+    ["nothing", [], ["residual_mismatch"]],
+  ])("accepts only %s", (_name, accepted, expected) => {
+    assert.deepStrictEqual(residualRefusals({ accepted, refusals: [] }), expected);
+  });
+
+  const unproved = { ...capture, provenance: "missing" as const, provenanceDigest: null };
+  const decided = {
+    ...unproved,
+    residual: { accepted: exact, refusals: [], scopeDigest: "scope-1" },
+  };
+  const residualCapture: HistoricalTermination = {
+    capture: {
+      ...unboundCapture,
+      residual: {
+        accepted: ["non_t3_side_effects_unrecordable", "provider_executor_locality_unrecorded"],
+        scopeDigest: "scope-1",
+        scope: "{}",
+      },
+    },
+  };
+
+  it("never captures an unproved execution without the owner's exact decision", () => {
+    assert.deepStrictEqual(terminationRefusals(unproved), ["historical_provenance_missing"]);
+    assert.deepStrictEqual(terminationRefusals(decided), []);
+    assert.include(
+      terminationRefusals({
+        ...decided,
+        residual: { ...decided.residual, refusals: ["residual_descendant_remote"] },
+      }),
+      "residual_descendant_remote",
+    );
+    // A decision never stands beside provenance.
+    assert.include(
+      terminationRefusals({ ...capture, residual: decided.residual }),
+      "residual_with_provenance",
+    );
+  });
+
+  it("verifies only the very scope and set its capture recorded, on a later boot", () => {
+    const verifyDecided = {
+      ...verify,
+      provenance: "missing" as const,
+      provenanceDigest: null,
+      residual: decided.residual,
+      recorded: residualCapture,
+    };
+    assert.deepStrictEqual(terminationRefusals(verifyDecided), []);
+    assert.include(
+      terminationRefusals({
+        ...verifyDecided,
+        residual: { ...decided.residual, scopeDigest: "scope-2" },
+      }),
+      "residual_scope_changed",
+    );
+    // A capture that bound provenance, or nothing, is not this decision.
+    assert.include(
+      terminationRefusals({ ...verifyDecided, recorded: captured }),
+      "residual_scope_changed",
+    );
+    assert.include(terminationRefusals({ ...verifyDecided, host: capturedBoot }), "same_boot");
   });
 });

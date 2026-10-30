@@ -135,6 +135,7 @@ import {
   type HistoricalProvenance,
   HistoricalProvenanceSource,
   type HostBoot,
+  type ResidualScope,
   HostBootReader,
   HostBootUnreadable,
 } from "./factoryHistoricalTermination.ts";
@@ -11820,6 +11821,277 @@ it.effect(
           assert.deepStrictEqual([held?.state, held?.custody], ["held", unknown]);
           assert.deepStrictEqual(yield* itemHistory(7901), ["implement", "implemented"]);
           assert.strictEqual(yield* runCount(execution.threadId), runsBefore);
+        }),
+      ),
+    ),
+);
+
+// The owner's residual decision runs on the same machine its containers name (the containment
+// fake's), through the production provenance source, which retained nothing.
+const residualBefore: HostBoot = { ...beforeRestart, machineId: "test-machine" };
+const residualAfter: HostBoot = { ...afterRestart, machineId: "test-machine" };
+const exactResidual = [
+  "provider_executor_locality_unrecorded",
+  "non_t3_side_effects_unrecordable",
+] as const;
+
+const decideResidual = (
+  reservationId: FactoryReservationId,
+  action: "capture" | "verify",
+  host: HostBoot,
+  acceptResidual?: ReadonlyArray<(typeof exactResidual)[number]>,
+  expectDigest?: string,
+) =>
+  Effect.flatMap(FactoryLifecycle.FactoryLifecycle, (factory) =>
+    factory.historicalTermination({
+      factoryId,
+      reservationId,
+      action,
+      operationRef,
+      by: "owner",
+      reason: "the owner accepts the named residual uncertainty for this restart",
+      ...(acceptResidual === undefined ? {} : { acceptResidual }),
+      ...(expectDigest === undefined ? {} : { expectDigest }),
+    }),
+  ).pipe(Effect.provideService(HostBootReader, { read: Effect.succeed(host) }));
+
+const residualOf = (evidence: string | undefined) =>
+  (JSON.parse(evidence ?? "{}") as { residual?: Record<string, unknown> }).residual;
+
+it.effect(
+  "Termination/R1: an owner's exact residual decision, captured before a real restart and verified after, settles as itself",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const { execution, reservationId } = yield* historicalAt(7881, "implement");
+          // The read needs no acceptance: it shows the exact set and scope, and refuses.
+          const shown = yield* decideResidual(reservationId, "capture", residualBefore);
+          assert.deepStrictEqual(shown.refusals, ["historical_provenance_missing"]);
+          const preview = residualOf(shown.evidence);
+          assert.deepStrictEqual(preview?.required, [
+            "non_t3_side_effects_unrecordable",
+            "provider_executor_locality_unrecorded",
+          ]);
+          assert.deepStrictEqual(preview?.refusals, []);
+          const scope = preview?.scope as ResidualScope;
+          assert.strictEqual(scope.reservationId, reservationId);
+          assert.deepStrictEqual(scope.host, { platform: "win32", machineId: "test-machine" });
+          assert.strictEqual(scope.attempts.length, 1);
+          assert.deepStrictEqual(scope.nativeDescendants, []);
+          assert.isFalse(
+            (yield* decideResidual(
+              reservationId,
+              "capture",
+              residualBefore,
+              undefined,
+              shown.evidenceDigest,
+            )).applied,
+          );
+
+          // Only the exact set, confirmed on the very preview it was shown, captures.
+          for (const accepted of [
+            ["provider_executor_locality_unrecorded"],
+            [...exactResidual, "non_t3_side_effects_unrecordable"],
+          ] as const) {
+            assert.include(
+              (yield* decideResidual(reservationId, "capture", residualBefore, accepted)).refusals,
+              "residual_mismatch",
+            );
+          }
+          const read = yield* decideResidual(
+            reservationId,
+            "capture",
+            residualBefore,
+            exactResidual,
+          );
+          assert.deepStrictEqual(read.refusals, []);
+          assert.deepStrictEqual(
+            (yield* decideResidual(
+              reservationId,
+              "capture",
+              residualBefore,
+              exactResidual,
+              "0".repeat(64),
+            )).refusals,
+            ["evidence_changed"],
+          );
+          const [first, second] = yield* Effect.all(
+            [
+              decideResidual(
+                reservationId,
+                "capture",
+                residualBefore,
+                exactResidual,
+                read.evidenceDigest,
+              ),
+              decideResidual(
+                reservationId,
+                "capture",
+                residualBefore,
+                exactResidual,
+                read.evidenceDigest,
+              ),
+            ],
+            { concurrency: 2 },
+          );
+          assert.deepStrictEqual([first.applied, second.applied].toSorted(), [false, true]);
+
+          // Recorded as a decision, never as provenance; it proves nothing before the restart.
+          const captured = yield* reservationOf(reservationId);
+          const recorded =
+            captured?.origin === "admitted" ? captured.historicalTermination : undefined;
+          assert.isUndefined(recorded?.capture.provenance);
+          assert.deepStrictEqual(
+            recorded?.capture.residual?.accepted.toSorted(),
+            [...exactResidual].toSorted(),
+          );
+          assert.deepStrictEqual(JSON.parse(recorded!.capture.residual!.scope), scope);
+          assert.deepStrictEqual(captured?.custody, {
+            state: "unknown",
+            reasons: ["process_containment_unsupported"],
+          });
+          assert.deepStrictEqual(admissionsOnly(yield* advance("clock")), []);
+          // The same boot, read later, verifies nothing.
+          const sameBoot = yield* decideResidual(
+            reservationId,
+            "verify",
+            { ...residualBefore, uptimeMs: residualBefore.uptimeMs + 3_600_000 },
+            exactResidual,
+          );
+          assert.includeMembers(
+            [...sameBoot.refusals],
+            ["same_boot", "uptime_not_reset", "container_not_ended"],
+          );
+
+          // A real later boot: verified once, with the very scope and set captured.
+          yield* restartHost;
+          const runsBefore = yield* runCount(execution.threadId);
+          assert.include(
+            (yield* decideResidual(reservationId, "verify", residualAfter)).refusals,
+            "historical_provenance_missing",
+          );
+          assert.include(
+            (yield* decideResidual(reservationId, "verify", residualAfter, [
+              "provider_executor_locality_unrecorded",
+            ])).refusals,
+            "residual_mismatch",
+          );
+          const proof = yield* decideResidual(
+            reservationId,
+            "verify",
+            residualAfter,
+            exactResidual,
+          );
+          assert.deepStrictEqual(proof.refusals, []);
+          const [left, right] = yield* Effect.all(
+            [
+              decideResidual(
+                reservationId,
+                "verify",
+                residualAfter,
+                exactResidual,
+                proof.evidenceDigest,
+              ),
+              decideResidual(
+                reservationId,
+                "verify",
+                residualAfter,
+                exactResidual,
+                proof.evidenceDigest,
+              ),
+            ],
+            { concurrency: 2 },
+          );
+          assert.deepStrictEqual([left.applied, right.applied].toSorted(), [false, true]);
+          // Its own visible reason: never host_restarted, never a join or never_started.
+          assert.deepStrictEqual((yield* reservationOf(reservationId))?.custody, {
+            state: "quiescent",
+            reasons: ["descendants_ended", "owner_accepted_residual_after_restart"],
+          });
+
+          // Ordinary settlement: the next stage, once; the implement stage never relaunches.
+          const review = admittedBy(yield* advance("owner_decision"));
+          assert.deepStrictEqual(stageOf(review), [itemKeyFor(7881), "review"]);
+          yield* (yield* ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService).recover;
+          for (const trigger of ["restart", "clock"] as const) {
+            assert.deepStrictEqual(
+              admissionsOnly(yield* advance(trigger))
+                .map(stageOf)
+                .filter((stage) => stage?.[1] !== "review"),
+              [],
+            );
+          }
+          assert.strictEqual(yield* runCount(execution.threadId), runsBefore);
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Termination/R2: another machine, or a lineage changed since the capture, never takes a residual decision",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const { execution, reservationId } = yield* historicalAt(7891, "correct");
+          // Containers on another machine than the one restarting: a copied database.
+          assert.include(
+            (yield* decideResidual(reservationId, "capture", beforeRestart, exactResidual))
+              .refusals,
+            "residual_container_foreign_host",
+          );
+          const read = yield* decideResidual(
+            reservationId,
+            "capture",
+            residualBefore,
+            exactResidual,
+          );
+          assert.deepStrictEqual(read.refusals, []);
+          assert.isTrue(
+            (yield* decideResidual(
+              reservationId,
+              "capture",
+              residualBefore,
+              exactResidual,
+              read.evidenceDigest,
+            )).applied,
+          );
+          yield* restartHost;
+          // A descendant recorded after the capture, which nothing in the decision covers.
+          const sql = yield* SqlClient.SqlClient;
+          const at = "2026-10-30T12:00:00.000Z";
+          yield* sql`
+            INSERT INTO orchestration_v2_projection_threads (
+              thread_id, project_id, title, default_provider, runtime_mode, interaction_mode,
+              created_at, updated_at, archived_at, deleted_at, payload_json
+            ) VALUES (
+              'thread:late-child', 'project:test', 'late', 'codex', 'full-access', 'default',
+              ${at}, ${at}, NULL, NULL,
+              ${JSON.stringify({ lineage: { parentThreadId: execution.threadId, relationshipToParent: "subagent" } })}
+            )
+          `;
+          const changed = yield* decideResidual(
+            reservationId,
+            "verify",
+            residualAfter,
+            exactResidual,
+          );
+          assert.include(changed.refusals, "residual_descendant_unreadable");
+          assert.isFalse(
+            (yield* decideResidual(
+              reservationId,
+              "verify",
+              residualAfter,
+              exactResidual,
+              changed.evidenceDigest,
+            )).applied,
+          );
+          // Still held and unknown: nothing was recorded on the changed scope.
+          assert.deepStrictEqual((yield* reservationOf(reservationId))?.custody, {
+            state: "unknown",
+            reasons: ["process_containment_unsupported"],
+          });
         }),
       ),
     ),

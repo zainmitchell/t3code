@@ -219,6 +219,34 @@ it.effect("N23: only the owner's own client answers, disposes, rejects, revokes 
   }),
 );
 
+it.effect(
+  "only the owner's client accepts a residual uncertainty, and only the two named ones",
+  () =>
+    Effect.gen(function* () {
+      const accepting = (acceptResidual: ReadonlyArray<string>) => (toolkit: Toolkit) =>
+        toolkit
+          .handle("t3_factory_historical_termination", {
+            factoryId,
+            reservationId: FactoryReservationId.make("reservation-1"),
+            action: "capture",
+            operationRef: "restart:1",
+            reason: "owner accepts the named residual uncertainty",
+            acceptResidual: acceptResidual as never,
+          })
+          .pipe(Stream.unwrap, lastResult);
+      const exact = ["provider_executor_locality_unrecorded", "non_t3_side_effects_unrecordable"];
+      const owner = yield* handle(scope("owner"), accepting(exact));
+      expect(owner.asked).toMatchObject([{ acceptResidual: exact, by: "mcp-client:Owner laptop" }]);
+      const agent = yield* handle(scope("agent"), accepting(exact));
+      expect(agent.result).toMatchObject({ code: "capability_denied" });
+      expect(agent.asked).toEqual([]);
+      // Anything else is not a residual T3 names: the decoder refuses it before any handler runs.
+      const invented = yield* handle(scope("owner"), accepting(["provenance_proved"]));
+      expect(invented.result).toMatchObject({ reason: { _tag: "ToolParameterValidationError" } });
+      expect(invented.asked).toEqual([]);
+    }),
+);
+
 it.effect("a report is bound to the calling thread's own execution", () =>
   Effect.gen(function* () {
     const report = (toolkit: Toolkit) =>

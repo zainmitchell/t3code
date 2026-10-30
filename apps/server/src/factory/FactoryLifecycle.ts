@@ -79,13 +79,17 @@ import {
   quarantineRefusals,
   readNeverStartedEvidence,
   readQuarantineEvidence,
+  readResidualFacts,
   readTerminationEvidence,
+  residualScopeOf,
   terminationRefusals,
 } from "./factoryDisposition.ts";
 import {
   decodeHistoricalProvenance,
   HistoricalProvenanceSource,
   HostBootReader,
+  RESIDUAL_UNCERTAINTIES,
+  type ResidualUncertainty,
 } from "./factoryHistoricalTermination.ts";
 import { makeNativeStages, TICKET_DECISION_STAGE } from "./factoryNativeStages.ts";
 import { makeBookkeeping } from "./factoryBookkeeping.ts";
@@ -5133,6 +5137,8 @@ const make = Effect.gen(function* () {
         readonly by: string;
         readonly reason: string;
         readonly expectDigest?: string | undefined;
+        /** The owner's acceptance of exactly the residual uncertainty; never provenance. */
+        readonly acceptResidual?: ReadonlyArray<ResidualUncertainty> | undefined;
       }) {
         // Read from the OS before the transaction; never from the caller.
         const host = Option.getOrNull(yield* Effect.option((yield* HostBootReader).read));
@@ -5166,6 +5172,30 @@ const make = Effect.gen(function* () {
             ).pipe(Effect.provide(custodyContext));
             const executionDigest = sha256(canonical(termination.execution));
             const recorded = reservation.historicalTermination;
+            // Where no provenance was retained, the scope an owner's residual decision would cover,
+            // read from T3's own records in this transaction and shown whether or not accepted.
+            const boundHost = recorded?.capture.host ?? host;
+            const scoped =
+              provenance === "missing" && boundHost !== null
+                ? residualScopeOf(
+                    yield* readResidualFacts(reservation).pipe(Effect.provide(custodyContext)),
+                    {
+                      reservationId: reservation.reservationId,
+                      admittedIn: reservation.admittedIn ?? null,
+                      operationRef: input.operationRef,
+                      host: boundHost,
+                    },
+                  )
+                : undefined;
+            const scopeDigest = scoped?.scope == null ? null : sha256(canonical(scoped.scope));
+            const residual =
+              input.acceptResidual === undefined
+                ? undefined
+                : {
+                    accepted: input.acceptResidual,
+                    refusals: scoped?.refusals ?? [],
+                    scopeDigest,
+                  };
             const evidence = canonical({
               action: input.action,
               operationRef: input.operationRef,
@@ -5176,6 +5206,17 @@ const make = Effect.gen(function* () {
                   : { platform: host.platform, machineId: host.machineId, bootId: host.bootId },
               servingId: store.servingId,
               provenance: provenanceDigest,
+              ...(scoped === undefined
+                ? {}
+                : {
+                    residual: {
+                      required: RESIDUAL_UNCERTAINTIES,
+                      accepted: input.acceptResidual ?? null,
+                      scopeDigest,
+                      scope: scoped.scope,
+                      refusals: scoped.refusals,
+                    },
+                  }),
               ...(input.action === "verify" && recorded !== undefined
                 ? {
                     capture: {
@@ -5199,13 +5240,28 @@ const make = Effect.gen(function* () {
               provenance,
               provenanceDigest,
               providerSessions: termination.execution.providerSessions,
+              ...(residual === undefined ? {} : { residual }),
             });
+            const basis =
+              typeof provenance !== "string" && provenanceDigest !== null
+                ? ({
+                    type: "provenance",
+                    digest: provenanceDigest,
+                    source: provenance.source,
+                  } as const)
+                : residual !== undefined && scoped?.scope != null && scopeDigest !== null
+                  ? ({
+                      type: "residual",
+                      accepted: residual.accepted,
+                      scopeDigest,
+                      scope: canonical(scoped.scope),
+                    } as const)
+                  : undefined;
             if (
               refusals.length > 0 ||
               input.expectDigest === undefined ||
               host === null ||
-              typeof provenance === "string" ||
-              provenanceDigest === null
+              basis === undefined
             ) {
               return { applied: false, refusals, ...read };
             }
@@ -5232,7 +5288,15 @@ const make = Effect.gen(function* () {
                         ...signed,
                         operationRef: input.operationRef,
                         executionDigest,
-                        provenance: { digest: provenanceDigest, source: provenance.source },
+                        ...(basis.type === "provenance"
+                          ? { provenance: { digest: basis.digest, source: basis.source } }
+                          : {
+                              residual: {
+                                accepted: basis.accepted,
+                                scopeDigest: basis.scopeDigest,
+                                scope: basis.scope,
+                              },
+                            }),
                         covers: {
                           attempts: facts.attempts.map((attempt) => attempt.attemptId),
                           launches: facts.launches.map((launch) => ({

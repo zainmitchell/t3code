@@ -194,7 +194,7 @@ const FactoryQuarantineTool = Tool.make("t3_factory_quarantine", {
 
 const FactoryHistoricalTerminationTool = Tool.make("t3_factory_historical_termination", {
   description:
-    "Owner only: prove that a full restart of this server's host ended a held historical stage's processes. `capture` before the restart binds its exact execution and this boot to operationRef; `verify` after it, with the same operationRef, needs a later boot of the same host, every container ended and nothing about the execution changed. A proof lets the stage settle normally; it releases or relaunches nothing. Call without expectDigest to read the evidence and refusals, then again with that digest. Agents are refused.",
+    "Owner only: prove that a full restart of this server's host ended a held historical stage's processes. `capture` before the restart binds its exact execution and this boot to operationRef; `verify` after it, with the same operationRef, needs a later boot of the same host, every container ended and nothing about the execution changed. A proof lets the stage settle normally; it releases or relaunches nothing. When no provenance places its writers, the read shows the residual uncertainty and its exact scope; the owner may accept exactly that set with acceptResidual, a decision recorded as such, never as provenance. Call without expectDigest to read the evidence and refusals, then again with that digest. Agents are refused.",
   parameters: FactoryHistoricalTerminationInput,
   success: FactoryHistoricalTerminationResult,
   failure: OrchestratorMcpFailure,

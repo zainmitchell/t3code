@@ -36,7 +36,7 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import { PreparationOwnerId } from "../orchestration-v2/preparationOwner.ts";
-import { HostBoot } from "./factoryHistoricalTermination.ts";
+import { HostBoot, RESIDUAL_UNCERTAINTIES } from "./factoryHistoricalTermination.ts";
 
 export class FactoryStoreError extends Schema.TaggedError<FactoryStoreError>()(
   "FactoryStoreError",
@@ -349,6 +349,17 @@ const HistoricalTerminationCapture = Schema.Struct({
    * operation. A capture without it, from earlier builds, proves nothing however it is verified.
    */
   provenance: Schema.optional(Schema.Struct({ digest: Bounded, source: Schema.String })),
+  /**
+   * The owner's decision to accept exactly the uncertainty no retained record settles, over the
+   * canonical scope it was shown. A decision, never provenance: nothing here places a writer.
+   */
+  residual: Schema.optional(
+    Schema.Struct({
+      accepted: Schema.Array(Schema.Literals(RESIDUAL_UNCERTAINTIES)),
+      scopeDigest: Bounded,
+      scope: Schema.String,
+    }),
+  ),
   capturedAt: Schema.String,
 });
 const HistoricalTerminationProof = Schema.Struct({

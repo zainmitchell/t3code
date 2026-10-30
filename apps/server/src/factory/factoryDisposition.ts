@@ -2,6 +2,8 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 
+import type { OrchestrationV2ThreadProjection } from "@t3tools/contracts";
+
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as EffectOutbox from "../orchestration-v2/EffectOutbox.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
@@ -12,6 +14,8 @@ import {
   type HistoricalProvenance,
   type HostBoot,
   LOCAL_PROCESS_DRIVERS,
+  RESIDUAL_UNCERTAINTIES,
+  type ResidualScope,
 } from "./factoryHistoricalTermination.ts";
 import type * as FactoryOutcomeStore from "./FactoryOutcomeStore.ts";
 import * as FactoryStore from "./FactoryStore.ts";
@@ -341,6 +345,280 @@ const sameSet = (left: ReadonlyArray<string>, right: ReadonlyArray<string>) => {
   return a.length === b.length && a.every((value, index) => value === b[index]);
 };
 
+type ResidualProjection = Pick<
+  OrchestrationV2ThreadProjection,
+  | "thread"
+  | "runs"
+  | "attempts"
+  | "providerThreads"
+  | "providerSessions"
+  | "providerTurns"
+  | "subagents"
+>;
+
+/**
+ * T3's own records a residual decision is scoped by: every container of the execution's runs as
+ * its host recorded it, the execution thread's projection, and every recorded descendant thread
+ * with its projection (null when it cannot be read).
+ */
+export const readResidualFacts = Effect.fn("factoryDisposition.readResidualFacts")(function* (
+  reservation: AdmittedReservation,
+) {
+  const projections = yield* ProjectionStore.ProjectionStoreV2;
+  const generations = yield* FactoryExecutionGenerations.FactoryExecutionGenerations;
+  const { threadId } = reservation.execution;
+  const projection: ResidualProjection = yield* projections.getThreadProjection(threadId);
+  const containers = [];
+  for (const run of projection.runs) {
+    for (const generation of yield* generations.generations(run.id)) {
+      containers.push({
+        generationId: generation.generationId,
+        runId: generation.runId,
+        machine: generation.identity.machine,
+        session: generation.identity.session,
+        ownerHost: generation.ownerHost,
+        providerJoins: generation.providerJoins ?? 0,
+      });
+    }
+  }
+  const lineage =
+    projections.getLineageDescendants === undefined
+      ? { threadIds: [], unreadableThreads: 1 }
+      : yield* projections.getLineageDescendants([threadId]);
+  const descendants = [];
+  for (const childId of lineage.threadIds) {
+    const child = yield* projections.getThreadProjection(childId).pipe(Effect.option);
+    descendants.push({ threadId: childId, projection: Option.getOrNull(child) });
+  }
+  return {
+    containers,
+    projection,
+    unreadableThreads: lineage.unreadableThreads,
+    descendants: descendants as ReadonlyArray<{
+      readonly threadId: string;
+      readonly projection: ResidualProjection | null;
+    }>,
+  };
+});
+export type ResidualFacts = Effect.Success<ReturnType<typeof readResidualFacts>>;
+
+const isLiteralNativeId = (value: string | null | undefined): value is string =>
+  typeof value === "string" && value.length > 0 && !value.startsWith("pending:");
+
+/**
+ * The exact scope an owner's residual decision covers, or why none can be: containers on `host`
+ * never joined (T2), one serving process (T3), each started attempt's exact provider binding (T4),
+ * and every descendant a provider-native subagent bound to its scoped parent (T5).
+ */
+export const residualScopeOf = (
+  facts: ResidualFacts,
+  input: {
+    readonly reservationId: string;
+    readonly admittedIn: string | null;
+    readonly operationRef: string;
+    readonly host: Pick<HostBoot, "platform" | "machineId">;
+  },
+): { readonly scope: ResidualScope | null; readonly refusals: ReadonlyArray<string> } => {
+  const refusals = new Set<string>();
+  const { projection, containers } = facts;
+  // T2: containers on this host, none ever joined (joined work settles through ordinary custody).
+  for (const run of projection.runs) {
+    if (run.startedAt !== null && !containers.some((container) => container.runId === run.id)) {
+      refusals.add("residual_run_uncontained");
+    }
+  }
+  if (containers.some((container) => container.machine !== input.host.machineId)) {
+    refusals.add("residual_container_foreign_host");
+  }
+  if (containers.some((container) => container.providerJoins > 0)) {
+    refusals.add("residual_joined_use_custody");
+  }
+  // T3: the one serving process that admitted the stage and opened its containers.
+  const owners = new Set(containers.map((container) => container.ownerHost));
+  if (input.admittedIn === null || input.admittedIn === "") {
+    refusals.add("residual_admission_unrecorded");
+  }
+  if (owners.size !== 1) refusals.add("residual_serving_process_split");
+
+  // T4: each started attempt's own provider thread, session, instance, adapter and native id.
+  const attempts = [];
+  const started = projection.attempts.filter((attempt) => attempt.startedAt !== null);
+  if (started.length === 0) refusals.add("residual_no_started_attempt");
+  for (const attempt of started) {
+    const providerThread = projection.providerThreads.find(
+      (candidate) => candidate.id === attempt.providerThreadId,
+    );
+    const session = projection.providerSessions.find(
+      (candidate) => candidate.id === providerThread?.providerSessionId,
+    );
+    const native = providerThread?.nativeThreadRef;
+    if (providerThread === undefined || session === undefined) {
+      refusals.add("residual_attempt_unbound");
+      continue;
+    }
+    if (
+      providerThread.providerInstanceId !== attempt.providerInstanceId ||
+      session.providerInstanceId !== attempt.providerInstanceId ||
+      session.driver !== providerThread.driver ||
+      !FactoryExecutionGenerations.CONTAINED_DRIVERS.has(session.driver)
+    ) {
+      refusals.add("residual_attempt_foreign_instance");
+      continue;
+    }
+    if (native?.strength !== "strong" || !isLiteralNativeId(native.nativeId)) {
+      refusals.add("residual_native_id_unrecorded");
+      continue;
+    }
+    if (isLiteralNativeId(attempt.nativeThreadId) && attempt.nativeThreadId !== native.nativeId) {
+      refusals.add("residual_native_id_conflict");
+      continue;
+    }
+    attempts.push({
+      attemptId: attempt.id,
+      runId: attempt.runId,
+      providerInstanceId: attempt.providerInstanceId,
+      providerThreadId: providerThread.id,
+      providerSessionId: session.id,
+      driver: session.driver,
+      nativeThreadId: native.nativeId,
+    });
+  }
+
+  // T5: every recorded descendant, bound level by level from the execution thread.
+  if (facts.unreadableThreads > 0) refusals.add("residual_lineage_unreadable");
+  const scoped = new Map<string, ResidualProjection>([[projection.thread.id, projection]]);
+  const sessionsOf = (thread: ResidualProjection) =>
+    new Set(
+      thread.providerThreads.flatMap((p) =>
+        p.providerSessionId === null ? [] : [p.providerSessionId],
+      ),
+    );
+  const nativeDescendants = [];
+  let pending = facts.descendants;
+  for (const scopedThread of scoped.values()) {
+    if (scopedThread.subagents.some((subagent) => subagent.remoteChild !== undefined)) {
+      refusals.add("residual_descendant_remote");
+    }
+  }
+  // Level by level: a child is judged once its parent is scoped; one never reached stays unbound.
+  let progressed = true;
+  while (progressed) {
+    progressed = false;
+    const waiting: Array<(typeof pending)[number]> = [];
+    for (const descendant of pending) {
+      const child = descendant.projection;
+      if (child === null) {
+        refusals.add("residual_descendant_unreadable");
+        continue;
+      }
+      const parent = scoped.get(child.thread.lineage.parentThreadId ?? "");
+      if (parent === undefined) {
+        waiting.push(descendant);
+        continue;
+      }
+      progressed = true;
+      const subagent = parent.subagents.find(
+        (candidate) => candidate.childThreadId === child.thread.id,
+      );
+      const providerThread =
+        child.providerThreads.find((candidate) => candidate.id === subagent?.providerThreadId) ??
+        parent.providerThreads.find((candidate) => candidate.id === subagent?.providerThreadId);
+      const fork = providerThread?.forkedFrom ?? null;
+      const forkThread = parent.providerThreads.find(
+        (candidate) => candidate.id === fork?.providerThreadId,
+      );
+      const native = providerThread?.nativeThreadRef;
+      if (child.thread.delegatedFrom !== undefined || child.thread.linkOrigin !== undefined) {
+        refusals.add("residual_descendant_delegated");
+      } else if (subagent?.remoteChild !== undefined) {
+        refusals.add("residual_descendant_remote");
+      } else if (
+        child.thread.lineage.relationshipToParent !== "subagent" ||
+        child.runs.length > 0 ||
+        child.attempts.length > 0 ||
+        child.providerSessions.length > 0
+      ) {
+        refusals.add("residual_descendant_t3_launched");
+      } else if (
+        subagent === undefined ||
+        subagent.origin !== "provider_native" ||
+        providerThread === undefined ||
+        forkThread === undefined ||
+        providerThread.providerInstanceId !== subagent.providerInstanceId ||
+        forkThread.providerInstanceId !== subagent.providerInstanceId ||
+        providerThread.providerSessionId === null ||
+        !sessionsOf(parent).has(providerThread.providerSessionId) ||
+        (fork?.providerTurnId !== undefined &&
+          !parent.providerTurns.some(
+            (turn) => turn.id === fork.providerTurnId && turn.providerThreadId === forkThread.id,
+          )) ||
+        native?.strength !== "strong" ||
+        !isLiteralNativeId(native.nativeId) ||
+        // Both Codex producers name the subagent's item `<call>:<child native id>`.
+        !(subagent.nativeTaskRef?.nativeId ?? "").endsWith(`:${native.nativeId}`)
+      ) {
+        refusals.add("residual_descendant_unbound");
+      } else {
+        scoped.set(child.thread.id, child);
+        nativeDescendants.push({
+          childThreadId: child.thread.id,
+          parentThreadId: parent.thread.id,
+          subagentId: subagent.id,
+          providerInstanceId: subagent.providerInstanceId,
+          providerThreadId: providerThread.id,
+          providerSessionId: providerThread.providerSessionId,
+          forkedFromProviderThreadId: forkThread.id,
+          forkedFromProviderTurnId: fork?.providerTurnId ?? null,
+          nativeThreadId: native.nativeId,
+        });
+        if (child.subagents.some((nested) => nested.remoteChild !== undefined)) {
+          refusals.add("residual_descendant_remote");
+        }
+      }
+    }
+    pending = waiting;
+  }
+  if (pending.length > 0) refusals.add("residual_descendant_unbound");
+  if (refusals.size > 0) return { scope: null, refusals: [...refusals].toSorted() };
+  const [ownerHost] = owners;
+  return {
+    refusals: [],
+    scope: {
+      reservationId: input.reservationId,
+      operationRef: input.operationRef,
+      host: { platform: input.host.platform, machineId: input.host.machineId },
+      servingProcess: { admittedIn: input.admittedIn!, ownerHost: ownerHost! },
+      generations: containers
+        .map(({ generationId, runId, machine, session }) => ({
+          generationId,
+          runId,
+          machine,
+          session,
+        }))
+        .toSorted((a, b) => a.generationId.localeCompare(b.generationId)),
+      attempts: attempts.toSorted((a, b) => a.attemptId.localeCompare(b.attemptId)),
+      nativeDescendants: nativeDescendants.toSorted((a, b) =>
+        a.childThreadId.localeCompare(b.childThreadId),
+      ),
+    },
+  };
+};
+
+/**
+ * Why an owner's residual decision cannot be recorded: the scope's own refusals, and acceptance
+ * that is not exactly the uncertainty no retained record settles.
+ */
+export const residualRefusals = (residual: {
+  readonly accepted: ReadonlyArray<string>;
+  readonly refusals: ReadonlyArray<string>;
+}): ReadonlyArray<string> => [
+  ...residual.refusals,
+  ...(new Set(residual.accepted).size === residual.accepted.length &&
+  sameSet(residual.accepted, RESIDUAL_UNCERTAINTIES)
+    ? []
+    : ["residual_mismatch"]),
+];
+
 /**
  * Why retained provenance does not show that restarting `host` ends every writer of this exact
  * execution and operation: it must name exactly the recorded runs, attempts, launches and sessions
@@ -418,8 +696,17 @@ export const terminationRefusals = (input: {
   readonly provenance: HistoricalProvenance | "missing" | "malformed";
   readonly provenanceDigest: string | null;
   readonly providerSessions: ReadonlyArray<string>;
+  /**
+   * The owner's residual decision, when given: what it accepts, the scope's refusals and digest.
+   * It stands in for provenance only where none was retained, and never as provenance.
+   */
+  readonly residual?: {
+    readonly accepted: ReadonlyArray<string>;
+    readonly refusals: ReadonlyArray<string>;
+    readonly scopeDigest: string | null;
+  };
 }): ReadonlyArray<string> => {
-  const { facts } = input;
+  const { facts, residual } = input;
   // Provenance places the historical writers on the host the capture read, never the one now.
   const boundHost = input.recorded?.capture.host ?? input.host;
   const eligibility = [
@@ -430,16 +717,21 @@ export const terminationRefusals = (input: {
       ? ["driver_not_local"]
       : []),
     ...(input.host === null ? ["host_boot_unreadable"] : []),
+    ...(residual !== undefined && input.provenance !== "missing"
+      ? ["residual_with_provenance"]
+      : []),
     ...(boundHost === null
       ? []
-      : provenanceRefusals({
-          provenance: input.provenance,
-          reservationId: facts.reservation.reservationId,
-          operationRef: input.operationRef,
-          facts,
-          providerSessions: input.providerSessions,
-          host: boundHost,
-        })),
+      : residual !== undefined && input.provenance === "missing"
+        ? residualRefusals(residual)
+        : provenanceRefusals({
+            provenance: input.provenance,
+            reservationId: facts.reservation.reservationId,
+            operationRef: input.operationRef,
+            facts,
+            providerSessions: input.providerSessions,
+            host: boundHost,
+          })),
   ];
   const recorded = input.recorded;
   if (recorded?.proof !== undefined) return ["already_proved", ...eligibility];
@@ -454,10 +746,16 @@ export const terminationRefusals = (input: {
     ...eligibility,
     ...(capture.operationRef === input.operationRef ? [] : ["operation_mismatch"]),
     ...(capture.executionDigest === input.executionDigest ? [] : ["execution_changed"]),
-    // The very provenance the capture bound; one read only since may describe other writers.
-    ...(capture.provenance !== undefined && capture.provenance.digest === input.provenanceDigest
-      ? []
-      : ["provenance_changed"]),
+    // The very provenance, or the very residual scope, the capture bound; one read since may not.
+    ...(residual !== undefined
+      ? capture.residual !== undefined &&
+        capture.residual.scopeDigest === residual.scopeDigest &&
+        sameSet(capture.residual.accepted, residual.accepted)
+        ? []
+        : ["residual_scope_changed"]
+      : capture.provenance !== undefined && capture.provenance.digest === input.provenanceDigest
+        ? []
+        : ["provenance_changed"]),
     ...(facts.runs.some((run) => run.generations.some((generation) => generation.state !== "ended"))
       ? ["container_not_ended"]
       : []),
