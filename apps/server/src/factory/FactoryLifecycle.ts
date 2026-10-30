@@ -1460,6 +1460,15 @@ export const admittedBinding = (packetText: string, packetDigest: string) => {
   return found === undefined ? Option.none() : decodeBindingMarker(found);
 };
 
+/** The line T3 integrates onto, as preparation reads candidate bases against it. */
+const integrationLineOf = (configuration: FactoryStore.FactoryConfiguration) => {
+  const integration = configuration.integration;
+  if (integration === undefined) return "no configured integration line";
+  return integration.remote === null
+    ? `refs/heads/${integration.branch}`
+    : `refs/remotes/${integration.remote}/${integration.branch}`;
+};
+
 /** The item's own content and evidence, without the claims on it. */
 const substantiveDigest = (
   observation: Pick<FactoryStore.ItemObservation, "itemVersion" | "evidence">,
@@ -3088,7 +3097,7 @@ const make = Effect.gen(function* () {
             candidate.observation,
           ),
           // No triage is offered while a failed preparation's readback cannot be made.
-          ...(triage === undefined ? {} : { triageDecisionKey: triage.key }),
+          ...(triage === undefined || "unread" in triage ? {} : { triageDecisionKey: triage.key }),
         });
       }
       const answer = yield* proposer.value.decide({ configuration, items, active });
@@ -3279,7 +3288,22 @@ const make = Effect.gen(function* () {
     const plain = triageDecisionOf(input, candidate.observation, outcomes);
     const reservationId = plain.failed?.origin.reservationId;
     if (plain.failed === undefined) return plain;
-    if (reservationId === undefined) return undefined;
+    const failed = plain.failed;
+    const unread = (what: string, actor: string, action: string) => ({
+      unread: {
+        what: `its last preparation ${failed.outcomeId} (failure ${failed.failureDigest?.slice(0, 12)}) failed, and ${what}`,
+        actor,
+        action,
+      },
+    });
+    const line = integrationLineOf(configuration);
+    if (reservationId === undefined) {
+      return unread(
+        "names no execution whose proposal T3 can read back",
+        "owner",
+        `reject outcome ${failed.outcomeId} with the factory's reject-outcome control, so the item is prepared afresh`,
+      );
+    }
     const filed = yield* outcomeStore.listForOrigin(reservationId);
     const base = filed.find((outcome) => outcome.report.outcome === "unit_proposed")?.report.subject
       ?.baseCommit;
@@ -3287,7 +3311,13 @@ const make = Effect.gen(function* () {
       base === undefined
         ? Option.some<string | undefined>(undefined)
         : yield* candidateBaseProblem(gitReadback, configuration, base).pipe(Effect.option);
-    if (Option.isNone(read)) return undefined;
+    if (Option.isNone(read)) {
+      return unread(
+        `T3 could not read its candidate base ${base} against ${line}`,
+        "T3 (git readback of the project repository)",
+        `read ${base} and ${line} back again; restore the project repository or that line if it is missing`,
+      );
+    }
     // A retry of this failure may name another candidate. T3 rejected it for that base alone, so
     // it counts once its base reads otherwise than that rejection; a further failure changes nothing.
     const { itemVersion } = candidate.observation;
@@ -3331,7 +3361,13 @@ const make = Effect.gen(function* () {
         const now = yield* candidateBaseProblem(gitReadback, configuration, named).pipe(
           Effect.option,
         );
-        if (Option.isNone(now)) return undefined;
+        if (Option.isNone(now)) {
+          return unread(
+            `T3 could not read its retried candidate base ${named} against ${line}`,
+            "T3 (git readback of the project repository)",
+            `read ${named} and ${line} back again; restore the project repository or that line if it is missing`,
+          );
+        }
         if (now.value !== proposal.rejection) {
           retried.set(named, now.value ?? "on the integration line");
         }
@@ -3372,8 +3408,22 @@ const make = Effect.gen(function* () {
     candidate: Candidate,
     decision: FactoryAdmissionRequest,
     outcomeId: string,
-  ) {
-    if (candidate.stage.type !== "implement") return "the item is past its first build";
+  ): Effect.fn.Return<
+    { readonly what: string; readonly actor: string; readonly action: string } | undefined,
+    Effect.Error<ReturnType<typeof triageDecisionFor>>
+  > {
+    const policy = (what: string, action: string) => ({ what, actor: "project policy", action });
+    const prepare = (what: string) => ({
+      what,
+      actor: "T3 (preparation)",
+      action: "prepare the unit again on the item's current text, evidence and policy",
+    });
+    if (candidate.stage.type !== "implement") {
+      return policy(
+        `prepared unit ${outcomeId} was proposed past the item's first build`,
+        "propose this stage without a prepared unit",
+      );
+    }
     const outcomes = yield* policyOutcomes({ outcomeStore, store }, candidate.events);
     const outcome = outcomes.find((each) => each.outcomeId === outcomeId);
     if (
@@ -3381,26 +3431,46 @@ const make = Effect.gen(function* () {
       outcome.state !== "verified" ||
       outcome.report.outcome !== "unit_proposed"
     ) {
-      return `${outcomeId} is not a verified proposal`;
+      return policy(
+        `${outcomeId} is not a verified unit proposal of this item`,
+        "name the item's verified unit_proposed outcome as its prepared unit",
+      );
     }
     const current = yield* triageDecisionFor(configuration, candidate, outcomes);
-    if (current === undefined) return `${outcomeId}'s preparation cannot be read back now`;
+    if (current === undefined) return prepare(`${outcomeId}'s preparation cannot be read back now`);
+    if ("unread" in current) return current.unread;
     if (outcome.decisionKey !== current.key) {
-      return `${outcomeId} was prepared on other inputs than the item's current text, evidence and policy`;
+      return prepare(
+        `${outcomeId} was prepared on other inputs than the item's current text, evidence and policy`,
+      );
     }
     const base = outcome.report.subject?.baseCommit;
-    if (base === undefined) return `${outcomeId} names no candidate base`;
+    if (base === undefined) return prepare(`${outcomeId} names no candidate base`);
     const workspace = decision.workspaceStrategy;
     if (
       workspace?.type !== "worktree" ||
       workspace.baseRef !== base ||
       workspace.startFromOrigin === true
     ) {
-      return `the build would not start at its prepared base ${base}`;
+      return policy(
+        `the build would not start at ${outcomeId}'s prepared base ${base}`,
+        `start the build's worktree exactly at ${base}, not from origin`,
+      );
     }
-    return yield* candidateBaseProblem(gitReadback, configuration, base).pipe(
-      Effect.orElseSucceed(() => `base ${base} cannot be read back now`),
+    const line = integrationLineOf(configuration);
+    const problem = yield* candidateBaseProblem(gitReadback, configuration, base).pipe(
+      Effect.option,
     );
+    if (Option.isNone(problem)) {
+      return {
+        what: `T3 could not read ${outcomeId}'s prepared base ${base} against ${line}`,
+        actor: "T3 (git readback of the project repository)",
+        action: `read ${base} and ${line} back again; restore the project repository or that line if it is missing`,
+      };
+    }
+    return problem.value === undefined
+      ? undefined
+      : prepare(`${outcomeId}'s prepared base ${base} no longer holds: ${problem.value}`);
   });
 
   /**
@@ -3725,10 +3795,18 @@ const make = Effect.gen(function* () {
         candidate,
         yield* policyOutcomes({ outcomeStore, store }, candidate.events),
       );
-      if (triage === undefined) {
+      if (triage === undefined || "unread" in triage) {
+        const unread = triage?.unread;
         return {
           disposition: "nothing_proposed",
-          detail: "its last preparation failed, and what it named cannot be read back now",
+          detail: waitText({
+            issue: subject.issueNumber,
+            what: unread?.what ?? "its last preparation failed, and it cannot be read back now",
+            actor: unread?.actor ?? "T3 (preparation)",
+            action: unread?.action ?? "read the failed preparation back again",
+            consequence: "no new preparation starts on facts T3 cannot read",
+            resume: "those facts read back, or the item's text, evidence or policy change",
+          }),
           reasonClass: "waiting",
         };
       }
@@ -3756,7 +3834,15 @@ const make = Effect.gen(function* () {
       if (stale !== undefined) {
         return {
           disposition: "nothing_proposed",
-          detail: `prepared unit is stale: ${stale}`,
+          detail: waitText({
+            issue: subject.issueNumber,
+            what: `prepared unit is stale: ${stale.what}`,
+            actor: stale.actor,
+            action: stale.action,
+            consequence: "the prepared build does not start; the proposal stays as recorded",
+            resume:
+              "a verified proposal for the item's current inputs, or the facts named here change",
+          }),
           reasonClass: "prepared_stale",
         };
       }

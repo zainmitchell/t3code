@@ -1587,6 +1587,8 @@ class GitGraphFake extends Context.Service<
     loseNextAnswer: boolean;
     /** Every integration write the fake applied, in order. */
     readonly writes: Array<string>;
+    /** While set, every readback fails, as a repository T3 cannot read would. */
+    unreadable?: boolean;
   }
 >()("t3/factory/FactoryLifecycle.test/GitGraphFake") {}
 
@@ -1680,10 +1682,18 @@ const layerGitGraphFake = Layer.effect(
       }
       return seen;
     };
+    const read = <A>(operation: string, answer: () => A) =>
+      graph.unreadable === true
+        ? Effect.fail(
+            new FactoryGitReadback.FactoryGitReadbackError({ operation, cause: "unreadable" }),
+          )
+        : Effect.sync(answer);
     return FactoryGitReadback.FactoryGitReadback.of({
-      commitExists: (input) => Effect.succeed(graph.parents.has(resolve(input.commit))),
-      isAncestor: (input) => Effect.succeed(ancestors(input.descendant).has(input.ancestor)),
-      branchExists: (input) => Effect.succeed(graph.branches.has(input.branch)),
+      commitExists: (input) =>
+        read("commit-exists", () => graph.parents.has(resolve(input.commit))),
+      isAncestor: (input) =>
+        read("is-ancestor", () => ancestors(input.descendant).has(input.ancestor)),
+      branchExists: (input) => read("branch-exists", () => graph.branches.has(input.branch)),
     });
   }),
 );
@@ -20563,28 +20573,117 @@ it.effect(
           const triage = admittedBy(yield* advance("tracker_event", 1));
           yield* workStage(triage, preparedUnit(admittedVersion(triage), lifecycleBase));
           assert.deepStrictEqual(admittedOnly(yield* advance("outcome", 3)), []);
-          assert.deepStrictEqual(yield* lastDisposition(7933), [
-            "nothing_proposed",
-            "prepared_stale",
-            `prepared unit is stale: the build would not start at its prepared base ${lifecycleBase}`,
-          ]);
+          const [disposition, reasonClass, detail] = yield* lastDisposition(7933);
+          assert.deepStrictEqual(
+            [disposition, reasonClass],
+            ["nothing_proposed", "prepared_stale"],
+          );
+          assert.match(
+            `${detail}`,
+            new RegExp(
+              `^#7933 waits \\[[0-9a-f]{12}\\]: prepared unit is stale: the build would not start at \\S+'s prepared base ${lifecycleBase}\\. Actor: project policy\\. Action: start the build's worktree exactly at ${lifecycleBase}, not from origin\\..* Resume: `,
+            ),
+          );
+          // Kept once from when it was first seen, however often it is decided again.
+          const waitsOf = Effect.map(
+            (yield* FactoryLifecycle.FactoryLifecycle).readState({ factoryId }),
+            (state) => state.waits.filter((wait) => wait.itemKey === item),
+          );
+          const [first] = yield* waitsOf;
+          assert.strictEqual(first!.detail, detail);
+          yield* TestClock.adjust("1 hour");
+          for (const trigger of ["clock", "restart"] as const) {
+            assert.deepStrictEqual(admittedOnly(yield* advance(trigger, 2)), []);
+          }
+          assert.deepStrictEqual(yield* waitsOf, [first]);
+          assert.deepStrictEqual(
+            (yield* (yield* FactoryOutcomeStore.FactoryOutcomeStore).reservedDecisions(
+              factoryId,
+            )).filter((decision) => decision.itemKey === item),
+            [],
+          );
 
           // Launched at its base, but the integration line was moved off it since it was verified.
           yield* usePolicy(preparedPolicy());
           const graph = yield* GitGraphFake;
           graph.branches.set("main", "c0000001");
           assert.deepStrictEqual(admittedOnly(yield* advance("clock", 3)), []);
-          assert.deepStrictEqual(yield* lastDisposition(7933), [
-            "nothing_proposed",
-            "prepared_stale",
-            `prepared unit is stale: base ${lifecycleBase} is not on the integration line refs/heads/main`,
-          ]);
+          const [, , moved] = yield* lastDisposition(7933);
+          assert.include(
+            `${moved}`,
+            `prepared base ${lifecycleBase} no longer holds: base ${lifecycleBase} is not on the integration line refs/heads/main. Actor: T3 (preparation). Action: prepare the unit again on the item's current text, evidence and policy.`,
+          );
+          // The changed fact is another wait, superseding the first.
+          const [second] = yield* waitsOf;
+          assert.deepStrictEqual([second!.detail, second!.supersedes], [moved, first!.basis]);
 
           // Back on the line, the build starts at that exact base, once.
           graph.branches.set("main", "b0000002");
           const implement = admittedBy(yield* advance("clock", 1));
           assert.deepStrictEqual(stageOf(implement), [item, "implement"]);
           assert.deepStrictEqual(admittedOnly(yield* advance("clock", 3)), []);
+          assert.deepStrictEqual(yield* waitsOf, []);
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Decompose/D9b: a failed preparation T3 cannot read back waits precisely, once, until it reads",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* configureLifecycleFactory;
+          yield* usePolicy(preparedPolicy());
+          // A candidate base off the integration line: T3 rejects the proposal at verification.
+          yield* recordCommit("c0000009", []);
+          yield* seedIssue(7937, { body: "Make the CSV import idempotent." });
+          const item = itemKeyFor(7937);
+          const triage = admittedBy(yield* advance("tracker_event", 1));
+          yield* workStage(triage, preparedUnit(admittedVersion(triage), "c0000009"));
+          yield* advance("outcome", 1);
+          // The repository cannot be read when the failure is weighed: what it named cannot be.
+          const graph = yield* GitGraphFake;
+          graph.unreadable = true;
+          assert.deepStrictEqual(admittedOnly(yield* advance("outcome", 2)), []);
+          const failed = (yield* (yield* FactoryOutcomeStore.FactoryOutcomeStore).itemEvents({
+            factoryId,
+            itemKey: item,
+          })).findLast((event) => event.type === "outcome" && event.kind === "failed");
+          assert.isDefined(failed);
+          const failedId = failed!.type === "outcome" ? failed!.outcomeId : "";
+
+          const [, reasonClass, detail] = yield* lastDisposition(7937);
+          assert.strictEqual(reasonClass, "waiting");
+          assert.include(`${detail}`, `its last preparation ${failedId} (failure `);
+          assert.include(
+            `${detail}`,
+            "T3 could not read its candidate base c0000009 against refs/heads/main. Actor: T3 (git readback of the project repository). Action: read c0000009 and refs/heads/main back again; restore the project repository or that line if it is missing.",
+          );
+          const waitsOf = Effect.map(
+            (yield* FactoryLifecycle.FactoryLifecycle).readState({ factoryId }),
+            (state) => state.waits.filter((wait) => wait.itemKey === item),
+          );
+          const [first] = yield* waitsOf;
+          assert.strictEqual(first!.detail, detail);
+          // Unchanged across time and a restart: one wait, first seen once, no question, no run.
+          yield* TestClock.adjust("1 hour");
+          for (const trigger of ["clock", "restart"] as const) {
+            assert.deepStrictEqual(admittedOnly(yield* advance(trigger, 2)), []);
+          }
+          assert.deepStrictEqual(yield* waitsOf, [first]);
+          assert.deepStrictEqual(
+            (yield* (yield* FactoryOutcomeStore.FactoryOutcomeStore).reservedDecisions(
+              factoryId,
+            )).filter((decision) => decision.itemKey === item),
+            [],
+          );
+          // It reads again: the preparation is retried and the wait no longer stands.
+          graph.unreadable = false;
+          const retry = admittedBy(yield* advance("clock", 1));
+          assert.deepStrictEqual(stageOf(retry), [item, "triage"]);
+          assert.deepStrictEqual(yield* waitsOf, []);
         }),
       ),
     ),
