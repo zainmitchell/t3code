@@ -7,7 +7,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
-import { OperationWait } from "./factoryOperationWait.ts";
+import { OperationWait, redact } from "./factoryOperationWait.ts";
 import * as FactoryStore from "./FactoryStore.ts";
 
 const IssueTarget = { repository: Schema.String, issueNumber: Schema.Int };
@@ -460,12 +460,19 @@ const make = Effect.gen(function* () {
         readonly text: string;
       }) {
         const at = DateTime.formatIso(yield* DateTime.now);
+        const text = redact(input.text);
+        const wait = {
+          ...input.wait,
+          actor: redact(input.wait.actor),
+          action: redact(input.wait.action),
+          resume: redact(input.wait.resume),
+        };
         const written = yield* amend(input.operationId, (current) => {
           const previous = current.wait;
-          const same = previous?.basis === input.wait.basis && previous.kind === input.wait.kind;
-          if (same && current.lastError === input.text) return undefined;
+          const same = previous?.basis === wait.basis && previous.kind === wait.kind;
+          if (same && current.lastError === text) return undefined;
           const since = same ? previous.since : at;
-          return { ...current, lastError: input.text, wait: { ...input.wait, since } };
+          return { ...current, lastError: text, wait: { ...wait, since } };
         });
         return Option.isSome(written);
       },
