@@ -615,10 +615,12 @@ const make = Effect.gen(function* () {
     // The account is what the selected instance itself reports now, never a configured name.
     if (Option.isNone(registry)) return "provider_identity_unobservable";
     const instanceId = reservation.modelSelection.instanceId;
-    const observed = (yield* registry.value.refreshInstance(instanceId)).find(
-      (provider) => provider.instanceId === instanceId,
-    )?.auth;
-    if (observed?.status !== "authenticated") return "provider_not_authenticated";
+    // Fresh probes only: a cached or fallback account is not who this run will be.
+    const observe = registry.value.observeInstance;
+    const fresh = observe === undefined ? Option.none() : yield* observe(instanceId);
+    if (Option.isNone(fresh)) return "provider_identity_unobservable";
+    const observed = fresh.value.auth;
+    if (observed.status !== "authenticated") return "provider_not_authenticated";
     if (expected.some(([key, value]) => observed[key as keyof typeof observed] !== value)) {
       return "provider_identity_mismatch";
     }

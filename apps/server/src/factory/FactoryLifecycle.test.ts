@@ -1484,6 +1484,11 @@ const layerLaunchObservations = Layer.mergeAll(
             fake.refreshes++;
             return [{ ...codexSnapshot, instanceId, auth: fake.auth }];
           }),
+        observeInstance: (instanceId: ServerProvider["instanceId"]) =>
+          Effect.sync(() => {
+            fake.refreshes++;
+            return Option.some({ ...codexSnapshot, instanceId, auth: fake.auth });
+          }),
       } as unknown as ProviderRegistry.ProviderRegistry["Service"]),
     ),
   ),

@@ -200,20 +200,35 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
     // Per-instance capabilities cache: keyed on binary + resolved HOME so
     // account-specific probes never share auth metadata across instances.
     // A transient miss may reuse the last account once, but its usage windows keep their age.
+    // An explicit invalidation starts a new generation: a probe begun before it, still in flight,
+    // never becomes the fallback after it.
+    const probeGeneration = yield* Ref.make(0);
     const lastGoodCapabilities = yield* Ref.make<ClaudeCapabilitiesProbe | undefined>(undefined);
     const capabilitiesProbeCache = yield* Cache.makeWith(
       () =>
-        probeClaudeCapabilities(effectiveConfig, processEnv, stateDir).pipe(
-          Effect.flatMap((capabilities) =>
-            ClaudeResetCredits.readClaudeOrganizationId(accountConfigPath).pipe(
-              Effect.map((workspaceId) => ({
-                _tag: "fresh" as const,
-                capabilities:
-                  workspaceId === undefined ? capabilities : { ...capabilities, workspaceId },
-              })),
+        Ref.get(probeGeneration).pipe(
+          Effect.flatMap((generation) =>
+            probeClaudeCapabilities(effectiveConfig, processEnv, stateDir).pipe(
+              Effect.flatMap((capabilities) =>
+                ClaudeResetCredits.readClaudeOrganizationId(accountConfigPath).pipe(
+                  Effect.map((workspaceId) => ({
+                    _tag: "fresh" as const,
+                    capabilities:
+                      workspaceId === undefined ? capabilities : { ...capabilities, workspaceId },
+                  })),
+                ),
+              ),
+              Effect.tap(({ capabilities }) =>
+                Ref.get(probeGeneration).pipe(
+                  Effect.flatMap((current) =>
+                    current === generation
+                      ? Ref.set(lastGoodCapabilities, capabilities)
+                      : Effect.void,
+                  ),
+                ),
+              ),
             ),
           ),
-          Effect.tap(({ capabilities }) => Ref.set(lastGoodCapabilities, capabilities)),
           Effect.catch((error) =>
             Ref.getAndSet(lastGoodCapabilities, undefined).pipe(
               Effect.flatMap((capabilities) =>
@@ -396,7 +411,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
       accentColor,
       enabled,
       snapshot,
-      invalidateCaches: Cache.invalidateAll(capabilitiesProbeCache),
+      invalidateCaches: Ref.update(probeGeneration, (generation) => generation + 1).pipe(
+        Effect.andThen(Cache.invalidateAll(capabilitiesProbeCache)),
+      ),
       snapshotForCwd: (cwd: string) =>
         snapshot.getSnapshot.pipe(
           Effect.flatMap((machineSnapshot) =>

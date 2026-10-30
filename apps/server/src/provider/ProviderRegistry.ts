@@ -61,6 +61,15 @@ export class ProviderRegistry extends Context.Service<
       instanceId: ProviderInstanceId,
     ) => Effect.Effect<ReadonlyArray<ServerProvider>>;
 
+    /**
+     * The instance as its provider reports it on probes begun after this call, never a cached or
+     * earlier fallback account; for a guard that must know who a run will be. None for an unknown
+     * instance, or a driver whose report cannot be had fresh this way.
+     */
+    readonly observeInstance?: (
+      instanceId: ProviderInstanceId,
+    ) => Effect.Effect<Option.Option<ServerProvider>>;
+
     /** Only refreshed instances can verify an update; the published list still includes every row. */
     readonly refreshAfterUpdate: (
       provider: ProviderDriverKind,
@@ -316,6 +325,14 @@ const correlateSnapshotWithSource = (
 const snapshotInstanceKey = (provider: ServerProvider): ProviderInstanceId => {
   return provider.instanceId;
 };
+
+/**
+ * Drivers whose caches and one-probe fallback `invalidateCaches` and a forced refresh are known
+ * to clear, so their reported account can be had fresh. Others report what they cached.
+ */
+const FRESH_OBSERVATION: ReadonlySet<ProviderDriverKind> = new Set([
+  ProviderDriverKind.make("claudeAgent"),
+]);
 
 // Rebuilt instances have new PubSubs; capture their fresh closures instead of a closed source.
 const buildSnapshotSource = (instance: ProviderInstance): ProviderSnapshotSource => ({
@@ -657,6 +674,24 @@ export const layer = Layer.effect(
         return yield* Ref.get(providersRef);
       }
       return yield* refreshOneSource(providerSource);
+    });
+
+    // Each forced refresh first drops the instance's caches. A failed probe may stand in the last
+    // good account once, so the first refresh spends whatever earlier account was kept; the second
+    // reports a probe begun after this call, or that one standing in for itself, or no account.
+    const observeInstance = Effect.fn("ProviderRegistry.observeInstance")(function* (
+      instanceId: ProviderInstanceId,
+    ) {
+      const instance = yield* instanceRegistry.getInstance(instanceId);
+      if (instance?.invalidateCaches === undefined || !FRESH_OBSERVATION.has(instance.driverKind)) {
+        return Option.none<ServerProvider>();
+      }
+      const source = buildSnapshotSource(instance);
+      yield* instance.invalidateCaches;
+      yield* refreshOneSource(source);
+      yield* instance.invalidateCaches;
+      const providers = yield* refreshOneSource(source);
+      return Option.fromNullishOr(providers.find((provider) => provider.instanceId === instanceId));
     });
 
     const refreshAfterUpdate = Effect.fn("refreshAfterUpdate")(function* (
@@ -1008,6 +1043,7 @@ export const layer = Layer.effect(
         refresh(provider).pipe(Effect.catchCause(recoverRefreshFailure)),
       refreshInstance: (instanceId: ProviderInstanceId) =>
         refreshInstance(instanceId).pipe(Effect.catchCause(recoverRefreshFailure)),
+      observeInstance,
       refreshWorkspaceSnapshot: (input) =>
         refreshWorkspaceSnapshot(input).pipe(Effect.catchCause(recoverRefreshFailure)),
       refreshAfterUpdate,
