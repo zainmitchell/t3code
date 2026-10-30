@@ -2738,6 +2738,55 @@ const make = Effect.gen(function* () {
         ? Option.some<string | undefined>(undefined)
         : yield* candidateBaseProblem(gitReadback, configuration, base).pipe(Effect.option);
     if (Option.isNone(read)) return undefined;
+    // A retry of this failure may name another candidate. T3 rejected it for that base alone, so
+    // it counts once its base reads otherwise than that rejection; a further failure changes nothing.
+    const { itemVersion } = candidate.observation;
+    const retryBasis = `${triageBasis(itemVersion, plain.failed.failureDigest)}:after:`;
+    const retried = new Map<string, string>();
+    for (const outcome of outcomes) {
+      const retryId = outcome.origin.reservationId;
+      if (
+        outcome === plain.failed ||
+        outcome.stage !== "triage" ||
+        outcome.state !== "verified" ||
+        outcome.report.outcome !== "failed" ||
+        retryId === undefined
+      ) {
+        continue;
+      }
+      const retry = yield* store.getReservation(retryId);
+      if (Option.isNone(retry) || retry.value.origin !== "admitted") continue;
+      const basis = retry.value.stageBasis;
+      if (
+        basis?.startsWith(retryBasis) !== true ||
+        decisionKeyOf(
+          { ...input, taskKind: "triage", stage: { type: "triage", basis } },
+          candidate.observation,
+        ) !== outcome.decisionKey
+      ) {
+        continue;
+      }
+      for (const proposal of yield* outcomeStore.listForOrigin(retryId)) {
+        const named = proposal.report.subject?.baseCommit;
+        if (
+          proposal.state !== "rejected" ||
+          proposal.report.outcome !== "unit_proposed" ||
+          proposal.report.proposal?.basis !== itemVersion ||
+          named === undefined ||
+          named === base ||
+          retried.has(named)
+        ) {
+          continue;
+        }
+        const now = yield* candidateBaseProblem(gitReadback, configuration, named).pipe(
+          Effect.option,
+        );
+        if (Option.isNone(now)) return undefined;
+        if (now.value !== proposal.rejection) {
+          retried.set(named, now.value ?? "on the integration line");
+        }
+      }
+    }
     const blockers = yield* policyBlockers(
       { outcomeStore, store },
       {
@@ -2757,6 +2806,7 @@ const make = Effect.gen(function* () {
           blocker.itemKey,
           blocker.outcomes.map((outcome) => [outcome.outcomeId, outcome.state]),
         ]),
+        ...(retried.size === 0 ? [] : [[...retried].toSorted(([a], [b]) => a.localeCompare(b))]),
       ]),
     ).slice(0, 32);
     return triageDecisionOf(input, candidate.observation, outcomes, readback);

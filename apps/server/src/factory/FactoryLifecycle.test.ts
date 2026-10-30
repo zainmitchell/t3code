@@ -19741,6 +19741,91 @@ it.effect(
 );
 
 /**
+ * The first preparation names `first` (or ends without any result), and its retry names another
+ * candidate `later` that exists off the integration line: both fail, and nothing more runs.
+ */
+const retryNamesLater = (issueNumber: number, first: string | undefined, later: string) =>
+  Effect.gen(function* () {
+    const triage = admittedBy(yield* advance("tracker_event", 1));
+    const version = admittedVersion(triage);
+    yield* workStage(triage, first === undefined ? undefined : preparedUnit(version, first));
+    const retry = admittedBy(yield* advance("outcome", 3));
+    assert.isTrue(admittedBasis(retry)?.startsWith(`triage:${version}:retry:`));
+    yield* recordCommit(later, [lifecycleBase]);
+    yield* workStage(retry, preparedUnit(version, later));
+    const starts = (yield* startedTurns).length;
+    for (const trigger of ["outcome", "clock", "restart", "clock"] as const) {
+      assert.deepStrictEqual(
+        admittedOnly(yield* advance(trigger, 2)),
+        [],
+        `#${issueNumber} ${trigger}`,
+      );
+    }
+    assert.strictEqual((yield* startedTurns).length, starts);
+    return version;
+  });
+
+/** `later` lands: one preparation at it and one build from it, then nothing more runs. */
+const landsOnce = (issueNumber: number, version: string, later: string) =>
+  Effect.gen(function* () {
+    (yield* GitGraphFake).branches.set("main", later);
+    const starts = (yield* startedTurns).length;
+    const again = admittedBy(yield* advance("clock", 1));
+    assert.deepStrictEqual(stageOf(again), [itemKeyFor(issueNumber), "triage"]);
+    assert.isTrue(admittedBasis(again)?.includes(":after:"), admittedBasis(again));
+    yield* workStage(again, preparedUnit(version, later));
+    const implement = admittedBy(yield* advance("outcome"));
+    assert.deepStrictEqual(stageOf(implement), [itemKeyFor(issueNumber), "implement"]);
+    yield* startStage(implement);
+    for (const trigger of ["clock", "restart", "clock"] as const) {
+      assert.deepStrictEqual(admittedOnly(yield* advance(trigger, 2)), []);
+    }
+    // One preparation and one build, the build at the landed candidate.
+    assert.strictEqual((yield* startedTurns).length, starts + 2);
+    if (again.type !== "admitted") throw new Error("Expected the preparation admitted");
+    const prepared = yield* (yield* FactoryOutcomeStore.FactoryOutcomeStore).listForOrigin(
+      again.reservation.reservationId,
+    );
+    assert.deepStrictEqual(
+      prepared.map((outcome) => [outcome.state, outcome.report.subject?.baseCommit]),
+      [["verified", later]],
+    );
+  });
+
+it.effect(
+  "Decompose/D13: a candidate first named by the retry of a preparation without a result is prepared once when it lands",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* configureLifecycleFactory;
+          yield* usePolicy(preparedPolicy());
+          yield* seedIssue(7938, { body: "Make the CSV import idempotent." });
+          const version = yield* retryNamesLater(7938, undefined, "b0000079");
+          yield* landsOnce(7938, version, "b0000079");
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Decompose/D14: a candidate named by the retry instead of the first one is prepared once when it lands",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* configureLifecycleFactory;
+          yield* usePolicy(preparedPolicy());
+          yield* seedIssue(7939, { body: "Make the CSV import idempotent." });
+          // The first names a candidate that never appears; only the retry's lands.
+          const version = yield* retryNamesLater(7939, "b00000a1", "b0000080");
+          yield* landsOnce(7939, version, "b0000080");
+        }),
+      ),
+    ),
+);
+
+/**
  * The HSA policy's hold (connector #50), from the input its command receives: a build that
  * committed nothing and names something outside its worker, after a correction written on the same
  * text whose build did the same, waits for the owner or for the text to change.
