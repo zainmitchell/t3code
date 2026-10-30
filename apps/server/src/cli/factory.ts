@@ -9,6 +9,7 @@ import {
   EnvironmentHttpApi,
   type FactoryDecideInput,
   factoryDecisionChoices,
+  FactoryHistoricalTerminationInput,
   FactoryId,
   FactoryReservationId,
   type FactoryStateResult,
@@ -72,6 +73,11 @@ const decodeDocumentFactory = Schema.decodeUnknownEffect(
   Schema.fromJsonString(Schema.Struct({ factoryId: FactoryId })),
 );
 const decodeTransfer = Schema.decodeUnknownEffect(Schema.fromJsonString(FactoryTransferInput));
+// Exact: a key the server does not take, such as an actor, is refused, never silently dropped.
+const decodeHistoricalTermination = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(FactoryHistoricalTerminationInput),
+  { onExcessProperty: "error" },
+);
 const encodeAudit = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 const factoryIdFlag = Flag.String("factory").pipe(
@@ -96,7 +102,7 @@ const factoryLocationFlags = {
   ),
   tokenFile: Flag.String("token-file").pipe(
     Flag.withDescription(
-      "A file holding a bearer session issued on the --server host (`t3 auth session issue` with orchestration:read, orchestration:operate and, for install or dispose, settings:write).",
+      "A file holding a bearer session issued on the --server host (`t3 auth session issue` with orchestration:read, orchestration:operate and, for install, dispose or historical-termination, settings:write).",
     ),
     Flag.optional,
   ),
@@ -835,6 +841,49 @@ const disposeCommand = Command.make("dispose", {
   ),
 );
 
+const historicalTerminationCommand = Command.make("historical-termination", {
+  ...factoryLocationFlags,
+  request: fileArgument(
+    "request",
+    "The request (JSON), exactly the t3_factory_historical_termination input: factoryId, reservationId, action, operationRef, reason, and optionally acceptResidual and expectDigest.",
+  ),
+  expectSha256: expectSha256Flag,
+}).pipe(
+  Command.withDescription(
+    "Read or record, as the owner, a held historical stage's capture before a full host restart or its verification after. Without expectDigest in the request it only reads, and prints the evidence: where no provenance exists, the residual uncertainty, its exact scope and refusals. With it, only that exact evidence is recorded. Prints the server's response; nothing is retried or accepted for you.",
+  ),
+  Command.withHandler((flags) =>
+    Effect.gen(function* () {
+      const request = yield* readPinned(
+        "historical-termination",
+        flags.request,
+        flags.expectSha256,
+      );
+      const input = yield* decodeHistoricalTermination(request.text).pipe(
+        Effect.mapError(
+          (error) =>
+            new FactoryCliError({
+              operation: "historical-termination",
+              reason: `${flags.request} is not a historical termination request: ${error.message}`,
+            }),
+        ),
+      );
+      return yield* withHostAdmin(
+        flags,
+        {
+          operation:
+            input.expectDigest === undefined
+              ? `historical-termination-${input.action}-read`
+              : `historical-termination-${input.action}`,
+          request: input,
+          documentSha256: request.sha256,
+        },
+        (client) => client[WS_METHODS.factoryHistoricalTermination](input),
+      );
+    }).pipe(Effect.flatMap(printJson)),
+  ),
+);
+
 type ReservedDecision = FactoryStateResult["reservedDecisions"][number];
 
 /** Every pending decision, oldest first, with the answers its card and Settings offer. */
@@ -1078,7 +1127,7 @@ const decideCommand = Command.make("decide", {
 
 export const factoryCommand = Command.make("factory").pipe(
   Command.withDescription(
-    "Administer this environment's factories as its host administrator: install, switch providers, enter issues, observe, transfer, retire, recover, dispose and answer decisions.",
+    "Administer this environment's factories as its host administrator: install, switch providers, enter issues, observe, transfer, retire, recover, dispose, settle historical stages and answer decisions.",
   ),
   Command.withSubcommands([
     stateCommand,
@@ -1090,6 +1139,7 @@ export const factoryCommand = Command.make("factory").pipe(
     retireCommand,
     recoverCommand,
     disposeCommand,
+    historicalTerminationCommand,
     decisionsCommand,
     decideCommand,
   ]),

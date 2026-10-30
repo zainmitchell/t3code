@@ -1,3 +1,6 @@
+// @effect-diagnostics nodeBuiltinImport:off - request files are pinned by their sha256.
+import * as NodeCrypto from "node:crypto";
+
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
@@ -645,4 +648,65 @@ it.effect("Remote: --server without --token-file, or the reverse, is refused bef
       assert.include((error as FactoryCliError).reason, "go together");
     }
   }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NetService.layer))),
+);
+
+it.effect(
+  "Historical termination: a request not exactly as pinned, naming an actor, or inventing a residual is refused before any session",
+  () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "factory-cli-" });
+      const request = {
+        factoryId: "btc-native-pilot-20261024",
+        reservationId: "reservation:1",
+        action: "capture",
+        operationRef: "restart:1",
+        reason: "owner read before the restart",
+      };
+      const reasonFor = (body: unknown, pin?: string) =>
+        Effect.gen(function* () {
+          const file = path.join(baseDir, "request.json");
+          const text = JSON.stringify(body);
+          yield* fs.writeFileString(file, text);
+          const exit = yield* Effect.exit(
+            Command.runWith(cli, { version: "0.0.0" })([
+              "factory",
+              "historical-termination",
+              file,
+              "--expect-sha256",
+              pin ?? NodeCrypto.createHash("sha256").update(text).digest("hex"),
+              "--base-dir",
+              baseDir,
+            ]),
+          );
+          const error = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined;
+          assert.instanceOf(error, FactoryCliError);
+          return (error as FactoryCliError).reason;
+        });
+      // Other bytes than pinned: refused before anything is read further.
+      assert.include(yield* reasonFor(request, "0".repeat(64)), "not the expected");
+      // The actor is the session's own; a request naming one is not this request.
+      assert.include(
+        yield* reasonFor({ ...request, by: "someone-else" }),
+        "is not a historical termination request",
+      );
+      assert.include(
+        yield* reasonFor({ ...request, acceptResidual: ["provenance_proved"] }),
+        "is not a historical termination request",
+      );
+      // An exact request goes on to its destination: with no server running, nothing is issued.
+      assert.include(yield* reasonFor(request), "no running T3 server");
+      assert.include(
+        yield* reasonFor({
+          ...request,
+          acceptResidual: [
+            "provider_executor_locality_unrecorded",
+            "non_t3_side_effects_unrecordable",
+          ],
+          expectDigest: "a".repeat(64),
+        }),
+        "no running T3 server",
+      );
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NetService.layer))),
 );

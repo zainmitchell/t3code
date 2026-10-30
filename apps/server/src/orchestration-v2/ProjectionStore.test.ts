@@ -1374,14 +1374,12 @@ it.effect("lists only active subagent IDs without loading shell data", () =>
   }).pipe(Effect.provide(layerTest)),
 );
 
-it.effect(
-  "lists every lineage descendant, archived and deleted, and counts unreadable lineage",
-  () =>
-    Effect.gen(function* () {
-      const store = yield* ProjectionStore.ProjectionStoreV2;
-      const sql = yield* SqlClient.SqlClient;
-      const at = "2026-10-29T19:00:00.000Z";
-      const insertThread = (id: string, payload: string, archivedAt: string | null = null) => sql`
+it.effect("lists every lineage descendant, archived and deleted, and counts unusable lineage", () =>
+  Effect.gen(function* () {
+    const store = yield* ProjectionStore.ProjectionStoreV2;
+    const sql = yield* SqlClient.SqlClient;
+    const at = "2026-10-29T19:00:00.000Z";
+    const insertThread = (id: string, payload: string, archivedAt: string | null = null) => sql`
       INSERT INTO orchestration_v2_projection_threads (
         thread_id, project_id, title, default_provider, runtime_mode, interaction_mode,
         created_at, updated_at, archived_at, deleted_at, payload_json
@@ -1390,18 +1388,18 @@ it.effect(
         ${at}, ${at}, ${archivedAt}, ${archivedAt}, ${payload}
       )
     `;
-      const lineage = (parentThreadId: string | null, rootThreadId: string) =>
-        JSON.stringify({
-          lineage: { parentThreadId, rootThreadId, relationshipToParent: "subagent" },
-        });
-      yield* insertThread("execution", lineage(null, "execution"));
-      yield* insertThread("child-a", lineage("execution", "execution"));
-      // A deleted grandchild still counts: a deletion never proves its work ended.
-      yield* insertThread("grandchild", lineage("child-a", "execution"), at);
-      yield* insertThread("unrelated", lineage(null, "unrelated"));
-      // A child recorded only by its parent's subagent row, its own lineage never written.
-      yield* insertThread("child-b", JSON.stringify({ lineage: {} }));
-      yield* sql`
+    const lineage = (parentThreadId: string | null, rootThreadId: string) =>
+      JSON.stringify({
+        lineage: { parentThreadId, rootThreadId, relationshipToParent: "subagent" },
+      });
+    yield* insertThread("execution", lineage(null, "execution"));
+    yield* insertThread("child-a", lineage("execution", "execution"));
+    // A deleted grandchild still counts: a deletion never proves its work ended.
+    yield* insertThread("grandchild", lineage("child-a", "execution"), at);
+    yield* insertThread("unrelated", lineage(null, "unrelated"));
+    // A child recorded only by its parent's subagent row; its own lineage names itself as root.
+    yield* insertThread("child-b", lineage(null, "child-b"));
+    yield* sql`
       INSERT INTO orchestration_v2_projection_subagents (
         subagent_id, thread_id, run_id, parent_node_id, provider, provider_thread_id,
         child_thread_id, origin, status, started_at, completed_at, updated_at, payload_json
@@ -1411,17 +1409,39 @@ it.effect(
       )
     `;
 
-      assert.deepStrictEqual(yield* store.getLineageDescendants!([ThreadId.make("execution")]), {
-        threadIds: ["child-a", "child-b", "grandchild"].map((id) => ThreadId.make(id)),
-        unreadableThreads: 0,
-      });
-      // A row whose lineage cannot be read could be anyone's descendant; it is counted, never dropped.
-      yield* insertThread("corrupt", "{not json");
-      assert.strictEqual(
-        (yield* store.getLineageDescendants!([ThreadId.make("execution")])).unreadableThreads,
-        1,
-      );
-    }).pipe(Effect.provide(layerTest)),
+    assert.deepStrictEqual(yield* store.getLineageDescendants!([ThreadId.make("execution")]), {
+      threadIds: ["child-a", "child-b", "grandchild"].map((id) => ThreadId.make(id)),
+      unreadableThreads: 0,
+    });
+    // Explicit root lineage, null parent and relationship, is known: it counts nothing.
+    const root = { parentThreadId: null, relationshipToParent: null, rootThreadId: "legacy-root" };
+    yield* insertThread("legacy-root", JSON.stringify({ lineage: root }), at);
+    assert.strictEqual(
+      (yield* store.getLineageDescendants!([ThreadId.make("execution")])).unreadableThreads,
+      0,
+    );
+    // A row whose lineage the schema cannot read could be anyone's descendant: counted, never
+    // dropped. Valid JSON without usable lineage is unknown membership too.
+    const unusable = [
+      ["corrupt", "{not json"],
+      ["unknown-lineage", "{}"],
+      ["null-lineage", JSON.stringify({ lineage: null })],
+      ["no-root", JSON.stringify({ lineage: { ...root, rootThreadId: undefined } })],
+      ["empty-root", JSON.stringify({ lineage: { ...root, rootThreadId: " " } })],
+      ["no-parent-key", JSON.stringify({ lineage: { ...root, parentThreadId: undefined } })],
+      [
+        "odd-relationship",
+        JSON.stringify({ lineage: { ...root, relationshipToParent: "sibling" } }),
+      ],
+    ] as const;
+    for (const [id, payload] of unusable) yield* insertThread(id, payload);
+    const withUnknown = yield* store.getLineageDescendants!([ThreadId.make("execution")]);
+    assert.strictEqual(withUnknown.unreadableThreads, unusable.length);
+    assert.deepStrictEqual(
+      withUnknown.threadIds,
+      ["child-a", "child-b", "grandchild"].map((id) => ThreadId.make(id)),
+    );
+  }).pipe(Effect.provide(layerTest)),
 );
 
 it.layer(layerTest)("ProjectionStoreV2", (it) => {

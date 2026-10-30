@@ -1683,10 +1683,44 @@ const make = Effect.gen(function* () {
         }
       : input.workspaceStrategy;
 
+  /**
+   * Custody that rests on an owner's residual decision holds only while the decision's exact scope
+   * does: any descendant, launch or binding since, or one that cannot be read, is a writer the
+   * owner never weighed, so custody is unknown again. Every other custody is as read.
+   */
+  const residualStillScoped = Effect.fnUntraced(function* (
+    reservation: FactoryStore.FactoryReservation,
+    custody: FactoryCustody,
+  ) {
+    const capture =
+      reservation.origin === "admitted" ? reservation.historicalTermination?.capture : undefined;
+    if (
+      reservation.origin !== "admitted" ||
+      capture?.residual === undefined ||
+      custody.state !== "quiescent" ||
+      !custody.reasons.includes("owner_accepted_residual_after_restart")
+    ) {
+      return custody;
+    }
+    const scoped = residualScopeOf(yield* readResidualFacts(reservation), {
+      reservationId: reservation.reservationId,
+      admittedIn: reservation.admittedIn ?? null,
+      operationRef: capture.operationRef,
+      host: capture.host,
+    });
+    return scoped.scope !== null && sha256(canonical(scoped.scope)) === capture.residual.scopeDigest
+      ? custody
+      : ({ state: "unknown", reasons: ["residual_scope_changed"] } satisfies FactoryCustody);
+  });
+
   const custodyOf = (
     reservation: FactoryStore.FactoryReservation,
     options?: { readonly judgeDeleted?: boolean },
-  ) => readExecutionCustody(reservation, options).pipe(Effect.provide(custodyContext));
+  ) =>
+    readExecutionCustody(reservation, options).pipe(
+      Effect.flatMap((custody) => residualStillScoped(reservation, custody)),
+      Effect.provide(custodyContext),
+    );
 
   const operationsThread = (factoryId: FactoryId) =>
     ThreadId.make(`thread:factory:${factoryId}:operations`);
@@ -1774,7 +1808,43 @@ const make = Effect.gen(function* () {
   });
 
   const outcomeOps = makeFactoryOutcomes({
-    store,
+    // A stage held on an owner's residual decision is released only in a transaction that reads
+    // its custody, scope included, again: nothing committed after that read can be inherited.
+    store: {
+      ...store,
+      releaseReservation: (reservationId, reason) =>
+        reason !== "outcome_verified"
+          ? store.releaseReservation(reservationId, reason)
+          : sql
+              .withTransaction(
+                Effect.gen(function* () {
+                  const found = yield* store.getReservation(reservationId);
+                  if (
+                    Option.isSome(found) &&
+                    found.value.origin === "admitted" &&
+                    found.value.historicalTermination?.capture.residual !== undefined &&
+                    (yield* custodyOf(found.value).pipe(
+                      Effect.map((custody) => custody.state !== "quiescent"),
+                      Effect.orElseSucceed(() => true),
+                    ))
+                  ) {
+                    return false;
+                  }
+                  return yield* store.releaseReservation(reservationId, reason);
+                }),
+              )
+              .pipe(
+                Effect.catchTags({
+                  SqlError: (cause) =>
+                    Effect.fail(
+                      new FactoryStore.FactoryStoreError({
+                        operation: "release-reservation",
+                        cause,
+                      }),
+                    ),
+                }),
+              ),
+    },
     outcomes: outcomeStore,
     projections,
     git: gitReadback,

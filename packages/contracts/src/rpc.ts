@@ -381,6 +381,8 @@ import {
   FactoryDisposeNeverStartedResult,
   FactoryEnterInput,
   FactoryEnterResult,
+  FactoryHistoricalTerminationInput,
+  FactoryHistoricalTerminationResult,
   FactoryObserveClaimsInput,
   FactoryObserveClaimsResult,
   FactoryOverview,
@@ -570,6 +572,7 @@ export const WS_METHODS = {
   factoryRevokeGrant: "factory.revokeGrant",
   factoryRecoverRun: "factory.recoverRun",
   factoryDisposeNeverStarted: "factory.disposeNeverStarted",
+  factoryHistoricalTermination: "factory.historicalTermination",
   factoryConfigure: "factory.configure",
   factorySwitchProvider: "factory.switchProvider",
   factoryObserveClaims: "factory.observeClaims",
@@ -1978,6 +1981,12 @@ const WsFactoryDisposeNeverStartedRpc = Rpc.make(WS_METHODS.factoryDisposeNeverS
   error: Schema.Union([FactoryOwnerError, EnvironmentAuthorizationError]),
 });
 
+const WsFactoryHistoricalTerminationRpc = Rpc.make(WS_METHODS.factoryHistoricalTermination, {
+  payload: FactoryHistoricalTerminationInput,
+  success: FactoryHistoricalTerminationResult,
+  error: Schema.Union([FactoryOwnerError, EnvironmentAuthorizationError]),
+});
+
 const WsFactoryConfigureRpc = Rpc.make(WS_METHODS.factoryConfigure, {
   payload: FactoryConfigureInput,
   success: FactoryConfigureResult,
@@ -2121,6 +2130,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsFactoryRevokeGrantRpc,
   WsFactoryRecoverRunRpc,
   WsFactoryDisposeNeverStartedRpc,
+  WsFactoryHistoricalTerminationRpc,
   WsFactoryConfigureRpc,
   WsFactorySwitchProviderRpc,
   WsFactoryObserveClaimsRpc,

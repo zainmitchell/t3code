@@ -12010,6 +12010,29 @@ it.effect(
             reasons: ["descendants_ended", "owner_accepted_residual_after_restart"],
           });
 
+          // After verification, before settlement: a descendant the decision never weighed, whose
+          // lineage cannot be read. Its writer is unknown, so the stage stays held and unknown.
+          const sql = yield* SqlClient.SqlClient;
+          const at = "2026-10-30T12:00:00.000Z";
+          yield* sql`
+            INSERT INTO orchestration_v2_projection_threads (
+              thread_id, project_id, title, default_provider, runtime_mode, interaction_mode,
+              created_at, updated_at, archived_at, deleted_at, payload_json
+            ) VALUES (
+              'thread:post-proof-child', 'project:test', 'late', 'codex', 'full-access', 'default',
+              ${at}, ${at}, NULL, NULL,
+              ${JSON.stringify({ lineage: { parentThreadId: execution.threadId, relationshipToParent: "subagent" } })}
+            )
+          `;
+          assert.deepStrictEqual((yield* reservationOf(reservationId))?.custody, {
+            state: "unknown",
+            reasons: ["residual_scope_changed"],
+          });
+          assert.deepStrictEqual(admissionsOnly(yield* advance("owner_decision")), []);
+          assert.strictEqual((yield* reservationOf(reservationId))?.state, "held");
+          // That exact scope again, and only then, settles.
+          yield* sql`DELETE FROM orchestration_v2_projection_threads WHERE thread_id = 'thread:post-proof-child'`;
+
           // Ordinary settlement: the next stage, once; the implement stage never relaunches.
           const review = admittedBy(yield* advance("owner_decision"));
           assert.deepStrictEqual(stageOf(review), [itemKeyFor(7881), "review"]);

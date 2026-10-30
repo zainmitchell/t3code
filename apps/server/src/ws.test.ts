@@ -1,12 +1,17 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
+  type AuthEnvironmentScope,
   AuthOrchestrationOperateScope,
+  AuthOrchestrationReadScope,
+  AuthSettingsWriteScope,
+  EnvironmentAuthorizationError,
   AuthSessionId,
   CommandId,
   EnvironmentId,
   FactoryId,
   FactoryOwnerError,
+  FactoryReservationId,
   RuntimeRequestId,
   ProjectId,
   ThreadId,
@@ -1013,6 +1018,144 @@ it.effect("a factory owner answer acts as the authenticated session and never se
     ),
     Effect.scoped,
   ),
+);
+
+it.effect(
+  "a historical termination needs settings:write and acts as the authenticated session, never the payload's actor",
+  () =>
+    Effect.gen(function* () {
+      const asked: Array<{ readonly by: string; readonly acceptResidual?: unknown }> = [];
+      const tested = [WS_METHODS.factoryHistoricalTermination] as const;
+      const group = WsRpcGroup.omit(
+        ...[...WsRpcGroup.requests.keys()].filter(
+          (
+            tag,
+          ): tag is Exclude<RpcGroup.Rpcs<typeof WsRpcGroup>["_tag"], (typeof tested)[number]> =>
+            !(tested as ReadonlyArray<string>).includes(tag),
+        ),
+      );
+      const serve = (scopes: ReadonlyArray<AuthEnvironmentScope>) =>
+        Effect.gen(function* () {
+          const responses = yield* Queue.unbounded<unknown>();
+          const server = yield* RpcServer.makeNoSerialization(group, {
+            ...WS_RPC_SERVER_OPTIONS,
+            onFromServer: (response) =>
+              response._tag === "Exit" ? Queue.offer(responses, response.exit) : Effect.void,
+          }).pipe(
+            Effect.provide(
+              Layer.merge(
+                RpcAuthorization.layer(scopes),
+                layerWsRpc(
+                  {
+                    sessionId: AuthSessionId.make("host-admin-session"),
+                    subject: "host-admin",
+                    method: "bearer-access-token",
+                    scopes: [],
+                  },
+                  {},
+                  yield* ServerBrowser.ServerBrowser,
+                ).pipe(
+                  Layer.provide(
+                    Layer.mergeAll(
+                      layerUnusedConfigRpcServices,
+                      Layer.mock(ExternalLauncher.ExternalLauncher)({}),
+                      Layer.mock(ProviderRegistry.ProviderRegistry)({}),
+                      Layer.mock(UsageLimitSources.UsageLimitSources)({}),
+                      Layer.mock(RemoteOpenTargets.RemoteOpenTargets)({}),
+                      Layer.mock(DirectEndpoints.DirectEndpoints)({}),
+                      Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+                        namedProjectsRoot: "",
+                      }),
+                      Layer.mock(ScratchThreadPromotion.ScratchThreadPromotion)({}),
+                      Layer.mock(ServerEnvironment.ServerEnvironment)({}),
+                      Layer.mock(EnvironmentAuth.EnvironmentAuth)({}),
+                      Layer.mock(FactoryLifecycle.FactoryLifecycle)({
+                        historicalTermination: (input) =>
+                          Effect.sync(() => asked.push(input)).pipe(
+                            Effect.as({
+                              applied: false,
+                              refusals: ["historical_provenance_missing"],
+                              evidence: "{}",
+                              evidenceDigest: "digest",
+                            }),
+                          ),
+                      }),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          );
+          // A client that names its own actor is still recorded as the session it authenticated as.
+          const forged = {
+            factoryId: FactoryId.make("alpha"),
+            reservationId: FactoryReservationId.make("reservation:1"),
+            action: "capture" as const,
+            operationRef: "restart:1",
+            reason: "owner read",
+            acceptResidual: [
+              "provider_executor_locality_unrecorded" as const,
+              "non_t3_side_effects_unrecordable" as const,
+            ],
+            by: "someone-else",
+          };
+          yield* server.write(0, {
+            _tag: "Request",
+            id: RpcMessage.RequestId("historical"),
+            tag: WS_METHODS.factoryHistoricalTermination,
+            payload: forged,
+            headers: Headers.empty,
+          });
+          return yield* Queue.take(responses);
+        });
+
+      // A read-only or operate-only session is refused before the factory is asked.
+      for (const scopes of [
+        [AuthOrchestrationReadScope],
+        [AuthOrchestrationReadScope, AuthOrchestrationOperateScope],
+      ]) {
+        const refused = yield* serve(scopes);
+        assert.isTrue(Exit.isExit(refused) && Exit.isFailure(refused));
+        assert.instanceOf(
+          Exit.isExit(refused) && Exit.isFailure(refused) ? Cause.squash(refused.cause) : null,
+          EnvironmentAuthorizationError,
+        );
+      }
+      assert.deepStrictEqual(asked, []);
+
+      const answered = yield* serve([
+        AuthOrchestrationReadScope,
+        AuthOrchestrationOperateScope,
+        AuthSettingsWriteScope,
+      ]);
+      assert.deepInclude(answered, {
+        _tag: "Success",
+        value: {
+          applied: false,
+          refusals: ["historical_provenance_missing"],
+          evidence: "{}",
+          evidenceDigest: "digest",
+        },
+      });
+      assert.deepStrictEqual(
+        asked.map((input) => [input.by, input.acceptResidual]),
+        [
+          [
+            "session:host-admin:host-admin-session",
+            ["provider_executor_locality_unrecorded", "non_t3_side_effects_unrecordable"],
+          ],
+        ],
+      );
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.fresh(layerConfigSources),
+          Layer.mock(PreviewAutomationBroker.PreviewAutomationBroker)({}),
+          Layer.mock(ServerBrowser.ServerBrowser)({}),
+        ),
+      ),
+      Effect.scoped,
+    ),
 );
 
 // Compaction keeps the oldest and newest event per message, so a cursor older

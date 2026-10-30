@@ -235,7 +235,7 @@ export interface ResidualScope {
     readonly providerThreadId: string;
     readonly providerSessionId: string;
     readonly forkedFromProviderThreadId: string;
-    readonly forkedFromProviderTurnId: string | null;
+    readonly forkedFromProviderTurnId: string;
     readonly nativeThreadId: string;
   }>;
 }

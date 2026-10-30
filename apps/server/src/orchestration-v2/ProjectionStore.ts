@@ -609,8 +609,8 @@ export interface ProjectionStoreV2Shape {
   ) => Effect.Effect<ReadonlySet<RunId>, ProjectionStoreV2Error>;
   /**
    * Every thread descended from `threadIds`, at any depth, by lineage or by a subagent's child,
-   * archived and deleted included. `unreadableThreads` counts thread rows whose lineage cannot be
-   * read at all: any one of them could be a descendant, so a caller must not read the set as whole.
+   * archived and deleted included. `unreadableThreads` counts thread rows whose lineage does not
+   * have the schema's shape: any one of them could be a descendant, so the set is not whole.
    * Optional so partial test stores need not list it; a store without it reads as unknown lineage.
    */
   readonly getLineageDescendants?: (threadIds: ReadonlyArray<ThreadId>) => Effect.Effect<
@@ -3895,6 +3895,18 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
     const getLineageDescendants = Effect.fn("ProjectionStore.getLineageDescendants")(
       function* (threadIds: ReadonlyArray<ThreadId>) {
         if (threadIds.length === 0) return { threadIds: [], unreadableThreads: 0 };
+        // The schema's lineage: rootThreadId text, parentThreadId null or text, relationship null,
+        // fork or subagent. Explicit root lineage is known; anything else, a missing key's NULL
+        // included, is unknown membership.
+        const usableLineage = sql`CASE WHEN json_valid(payload_json) THEN COALESCE(
+          json_type(payload_json, '$.lineage') = 'object'
+          AND json_type(payload_json, '$.lineage.rootThreadId') = 'text'
+          AND length(trim(json_extract(payload_json, '$.lineage.rootThreadId'))) > 0
+          AND json_type(payload_json, '$.lineage.parentThreadId') IN ('null', 'text')
+          AND (json_type(payload_json, '$.lineage.relationshipToParent') = 'null'
+            OR json_extract(payload_json, '$.lineage.relationshipToParent') IN ('fork', 'subagent')),
+          0
+        ) ELSE 0 END`;
         const rows = yield* sql<{ readonly thread_id: string }>`
           WITH RECURSIVE descendants(thread_id) AS (
             SELECT t.thread_id FROM orchestration_v2_projection_threads AS t
@@ -3920,7 +3932,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         `;
         const unreadable = yield* sql<{ readonly count: number }>`
           SELECT COUNT(*) AS count FROM orchestration_v2_projection_threads
-          WHERE NOT json_valid(payload_json)
+          WHERE NOT (${usableLineage})
         `;
         return {
           threadIds: rows.map((row) => ThreadId.make(row.thread_id)),

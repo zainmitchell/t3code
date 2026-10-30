@@ -546,13 +546,18 @@ export const residualScopeOf = (
         forkThread === undefined ||
         providerThread.providerInstanceId !== subagent.providerInstanceId ||
         forkThread.providerInstanceId !== subagent.providerInstanceId ||
+        // One adapter throughout: the subagent, its provider thread, its native ref, its fork.
+        providerThread.driver !== subagent.driver ||
+        providerThread.driver !== forkThread.driver ||
+        native?.driver !== providerThread.driver ||
         providerThread.providerSessionId === null ||
         !sessionsOf(parent).has(providerThread.providerSessionId) ||
-        (fork?.providerTurnId !== undefined &&
-          !parent.providerTurns.some(
-            (turn) => turn.id === fork.providerTurnId && turn.providerThreadId === forkThread.id,
-          )) ||
-        native?.strength !== "strong" ||
+        // The parent's own turn it was forked at; without one the fork is not bound.
+        fork?.providerTurnId === undefined ||
+        !parent.providerTurns.some(
+          (turn) => turn.id === fork.providerTurnId && turn.providerThreadId === forkThread.id,
+        ) ||
+        native.strength !== "strong" ||
         !isLiteralNativeId(native.nativeId) ||
         // Both Codex producers name the subagent's item `<call>:<child native id>`.
         !(subagent.nativeTaskRef?.nativeId ?? "").endsWith(`:${native.nativeId}`)
@@ -568,7 +573,7 @@ export const residualScopeOf = (
           providerThreadId: providerThread.id,
           providerSessionId: providerThread.providerSessionId,
           forkedFromProviderThreadId: forkThread.id,
-          forkedFromProviderTurnId: fork?.providerTurnId ?? null,
+          forkedFromProviderTurnId: fork.providerTurnId,
           nativeThreadId: native.nativeId,
         });
         if (child.subagents.some((nested) => nested.remoteChild !== undefined)) {

@@ -2278,6 +2278,24 @@ export const layerWsRpc = (
             ),
             factoryOwnerFailure(WS_METHODS.factoryDisposeNeverStarted, input.factoryId),
           ),
+        // Read without expectDigest; with it, only that exact evidence is recorded.
+        [WS_METHODS.factoryHistoricalTermination]: (input) =>
+          factoryLifecycle.historicalTermination({ ...input, by: factoryActor }).pipe(
+            Effect.tap((result) =>
+              Effect.logInfo("Factory owner historical termination", {
+                factoryId: input.factoryId,
+                reservationId: input.reservationId,
+                action: input.action,
+                operationRef: input.operationRef,
+                acceptResidual: input.acceptResidual ?? null,
+                by: factoryActor,
+                applied: result.applied,
+                refusals: result.refusals,
+                evidenceDigest: result.evidenceDigest,
+              }),
+            ),
+            factoryOwnerFailure(WS_METHODS.factoryHistoricalTermination, input.factoryId),
+          ),
         [WS_METHODS.factoryConfigure]: (input) =>
           factoryLifecycle.installConfiguration(input.configuration).pipe(
             Effect.map((configuration) => ({

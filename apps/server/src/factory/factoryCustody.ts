@@ -57,6 +57,7 @@ export type FactoryCustody =
         | "external_claim_unattributed"
         | "legacy_custody_unproven"
         | "workspace_obligation_unresolved"
+        | "residual_scope_changed"
       >;
     };
 

@@ -814,6 +814,7 @@ const residualFactsOf = (execution: HeldExecution): FactsFixture => {
         id: `node:provider:codex:native-item:${child.call}%3A${child.native}`,
         threadId: thread,
         origin: "provider_native",
+        driver: "codex",
         providerInstanceId: execution.instance,
         providerThreadId: `provider-thread:provider:codex:native-thread:${child.native}`,
         childThreadId: `thread:provider:codex:native-thread:${child.native}`,
@@ -1047,21 +1048,62 @@ describe("residualScopeOf: refusals", () => {
           relationshipToParent: "subagent",
         }),
     ],
+    // One adapter throughout: a child thread, native ref or subagent of another driver is foreign.
+    [
+      "residual_descendant_unbound",
+      (f) => void (child(f).providerThreads[0]!.driver = "claudeAgent"),
+    ],
+    [
+      "residual_descendant_unbound",
+      (f) =>
+        void (child(f).providerThreads[0]!.nativeThreadRef = {
+          driver: "claudeAgent",
+          nativeId: connectorChildren[0]!.native,
+          strength: "strong",
+        }),
+    ],
+    [
+      "residual_descendant_unbound",
+      (f) => void (f.projection.subagents[0]!.driver = "claudeAgent"),
+    ],
+    // The parent's fork turn is required, not merely checked when present.
+    [
+      "residual_descendant_unbound",
+      (f) =>
+        void (child(f).providerThreads[0]!.forkedFrom = {
+          providerThreadId: f.projection.providerThreads[0]!.id,
+        }),
+    ],
   ])("refuses %s", (refusal, change) => {
     assert.include(refusalsOf(change), refusal);
   });
 
   it("accepts the second Codex producer's item shape only with the same binding", () => {
     // subAgentActivity.started names its item `<activity id>:<child>`, as spawnAgent does.
-    assert.deepStrictEqual(
+    const activityShape = (f: FactsFixture) => {
+      f.projection.subagents[0]!.nativeTaskRef = {
+        driver: "codex",
+        nativeId: `activity_1:${connectorChildren[0]!.native}`,
+        strength: "strong",
+      };
+    };
+    assert.deepStrictEqual(refusalsOf(activityShape), []);
+    // The same driver and fork-turn bindings hold for that shape too.
+    assert.include(
       refusalsOf((f) => {
-        f.projection.subagents[0]!.nativeTaskRef = {
-          driver: "codex",
-          nativeId: `activity_1:${connectorChildren[0]!.native}`,
-          strength: "strong",
+        activityShape(f);
+        child(f).providerThreads[0]!.driver = "claudeAgent";
+      }),
+      "residual_descendant_unbound",
+    );
+    assert.include(
+      refusalsOf((f) => {
+        activityShape(f);
+        child(f).providerThreads[0]!.forkedFrom = {
+          providerThreadId: f.projection.providerThreads[0]!.id,
         };
       }),
-      [],
+      "residual_descendant_unbound",
     );
   });
 });

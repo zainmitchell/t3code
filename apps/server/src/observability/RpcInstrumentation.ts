@@ -101,6 +101,7 @@ const RPC_AGGREGATES = {
   [WS_METHODS.factoryRevokeGrant]: "factory",
   [WS_METHODS.factoryRecoverRun]: "factory",
   [WS_METHODS.factoryDisposeNeverStarted]: "factory",
+  [WS_METHODS.factoryHistoricalTermination]: "factory",
   [WS_METHODS.factoryConfigure]: "factory",
   [WS_METHODS.factorySwitchProvider]: "factory",
   [WS_METHODS.factoryObserveClaims]: "factory",

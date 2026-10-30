@@ -75,6 +75,8 @@ export const CLIENT_GUARDED_RPC_SCOPES = {
   [WS_METHODS.factorySwitchProvider]: AuthSettingsWriteScope,
   // It releases custody nothing proves, on the owner's word alone.
   [WS_METHODS.factoryDisposeNeverStarted]: AuthSettingsWriteScope,
+  // It records the owner's decision on a historical stage's unprovable writers, or its proof.
+  [WS_METHODS.factoryHistoricalTermination]: AuthSettingsWriteScope,
   // A guest link hands thread access to someone outside, like a pairing link.
   [WS_METHODS.guestShareCreate]: AuthAccessWriteScope,
   [WS_METHODS.peerLinksLink]: AuthAccessWriteScope,
