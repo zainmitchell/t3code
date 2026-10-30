@@ -7,6 +7,7 @@ import {
   type FactoryId,
   type FactoryReadGeneration,
   type FactoryReservationId,
+  type ProjectId,
   type RunId,
   type ThreadId,
 } from "@t3tools/contracts";
@@ -43,7 +44,9 @@ import * as FactoryExecutionGenerations from "./FactoryExecutionGenerations.ts";
 import * as FactoryTracker from "./FactoryTracker.ts";
 import { admittedBinding, deriveVerificationBinding, makeInsideRoot } from "./FactoryLifecycle.ts";
 import * as FactoryOutcomeStore from "./FactoryOutcomeStore.ts";
+import type { Landing } from "./factoryCoordination.ts";
 import { subjectOf } from "./factoryOutcomes.ts";
+import * as ProjectService from "../project/ProjectService.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 
 export class FactoryClaimServiceError extends Schema.TaggedError<FactoryClaimServiceError>()(
@@ -117,6 +120,58 @@ export class FactoryClaimService extends Context.Service<
 const sha256 = (content: string | Uint8Array) =>
   NodeCrypto.createHash("sha256").update(content).digest("hex");
 
+/**
+ * Why the landed commit cannot be the bound worktree's base in its thread's repository, if it
+ * cannot: it is fetched from its own operation's integration target when absent, and the object
+ * found must be the receipt's commit, tree and parents. No other head substitutes for it.
+ */
+export const bindingLandingUnavailable = Effect.fnUntraced(function* (
+  deps: {
+    readonly operations: {
+      readonly get: (
+        operationId: string,
+      ) => Effect.Effect<
+        Option.Option<{ readonly intent: FactoryOperationStore.FactoryOperationIntent }>,
+        FactoryOperationStore.FactoryOperationStoreError
+      >;
+    };
+    readonly projects: Option.Option<{
+      readonly getById: (
+        projectId: ProjectId,
+      ) => Effect.Effect<
+        Option.Option<{ readonly workspaceRoot: string }>,
+        ProjectService.ProjectOperationError
+      >;
+    }>;
+    readonly workspaceHead: FactoryRunPreparation.FactoryWorkspaceHeadShape;
+  },
+  projectId: ProjectId,
+  landed: Landing,
+) {
+  const materialize = deps.workspaceHead.materializeLanded;
+  if (materialize === undefined) return undefined;
+  const operation = yield* deps.operations.get(landed.operationId);
+  const intent = Option.isSome(operation) ? operation.value.intent : undefined;
+  if (intent?.kind !== "git_integrate" && intent?.kind !== "pull_request_merge") {
+    return `binding_landing_unavailable: operation ${landed.operationId} names no integration target`;
+  }
+  const project = Option.isNone(deps.projects)
+    ? Option.none()
+    : Option.flatten(yield* Effect.option(deps.projects.value.getById(projectId)));
+  if (Option.isNone(project)) return "binding_landing_unavailable: its project is unreadable";
+  const found = yield* materialize({
+    cwd: project.value.workspaceRoot,
+    remote: intent.remote,
+    branch: intent.kind === "git_integrate" ? intent.branch : intent.base,
+    commit: landed.commit,
+  });
+  if (found.type === "unavailable") return `binding_landing_unavailable: ${found.detail}`;
+  if (found.object.tree !== landed.tree || found.object.parents.join() !== landed.parents.join()) {
+    return "binding_landing_mismatch";
+  }
+  return undefined;
+});
+
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const fs = yield* FileSystem.FileSystem;
@@ -133,6 +188,8 @@ const make = Effect.gen(function* () {
   // The server's provider registry, read-only: the account a selected instance reports itself.
   const registry = yield* Effect.serviceOption(ProviderRegistry.ProviderRegistry);
   const workspaceHead = yield* FactoryRunPreparation.FactoryWorkspaceHead;
+  // Read-only: the repository a bound worktree is cut from.
+  const projects = yield* Effect.serviceOption(ProjectService.ProjectService);
   // Built on this service's own database: it reads the records a binding rests on, nothing else.
   const outcomeStore = yield* Effect.provide(
     FactoryOutcomeStore.FactoryOutcomeStore,
@@ -624,7 +681,13 @@ const make = Effect.gen(function* () {
     if (expected.some(([key, value]) => observed[key as keyof typeof observed] !== value)) {
       return "provider_identity_mismatch";
     }
-    if (!prepared) return undefined;
+    if (!prepared) {
+      return yield* bindingLandingUnavailable(
+        { operations: operationStore, projects, workspaceHead },
+        projection.thread.projectId,
+        derived.landed,
+      );
+    }
     const worktree = projection.thread.worktreePath;
     const checkout = worktree === null ? Option.none() : yield* workspaceHead.read(worktree);
     if (
