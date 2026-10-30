@@ -151,12 +151,14 @@ const scriptedClaude = Effect.fn("ClaudeDriver.test.scriptedClaude")(function* (
     fail: false,
     probes: 0,
     hold: undefined as Promise<void> | undefined,
+    onStart: undefined as (() => void) | undefined,
   };
   const query = vi.spyOn(ClaudeSdk, "query").mockImplementation(
     () =>
       ({
         initializationResult: async () => {
           state.probes++;
+          state.onStart?.();
           // The account is read when the probe answers, as the CLI reads its login then.
           if (state.hold !== undefined) await state.hold;
           if (state.fail) throw new Error("initialization failed");
@@ -270,13 +272,21 @@ describe("ClaudeDriver account freshness", () => {
     Effect.gen(function* () {
       if (yield* HostProcess.isWindows) return;
       const { state, instance } = yield* scriptedClaude();
-      // The first probe ever is held, then the caches are dropped while it is in flight.
+      // No account was ever read, so there is no earlier fallback.
+      state.fail = true;
+      yield* instance.snapshot.refresh;
+      state.fail = false;
+      // A probe of account A starts and is held; the caches are dropped while it is in flight.
       let open!: () => void;
       state.hold = new Promise((resolve) => {
         open = resolve;
       });
+      const started = new Promise<void>((resolve) => {
+        state.onStart = resolve;
+      });
       const inFlight = yield* Effect.forkScoped(instance.snapshot.refresh);
-      yield* Effect.yieldNow;
+      yield* Effect.promise(() => started);
+      state.onStart = undefined;
       yield* instance.invalidateCaches ?? Effect.void;
       open();
       state.hold = undefined;
