@@ -11905,7 +11905,16 @@ const verifierExecution = {
  * A proof item whose prerequisite landed through T3, which failed and was corrected, with the
  * template Root adopted for it and a policy that proposes its rerun with that pointer only.
  */
-const setUpBoundProof = (issue: number, prerequisite: number, commit: string) =>
+const setUpBoundProof = (
+  issue: number,
+  prerequisite: number,
+  commit: string,
+  // The issue's own scope declaration and the files the adopted template binds to it.
+  scope: { readonly body: string; readonly owned: ReadonlyArray<string> } = {
+    body: `Rerun the settlement proof.\n\n## Owned files\n\nNone\n`,
+    owned: [],
+  },
+) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
@@ -11929,7 +11938,7 @@ const setUpBoundProof = (issue: number, prerequisite: number, commit: string) =>
           inputs: [{ path: "inputs/fixture.json", sha256: sha256('{"settlement":"fixture"}') }],
           consumer: { contract: "settlement-proof", version: "1" },
           policyIdentity: "policy-r1",
-          ownership: { owned: [] },
+          ownership: { owned: scope.owned },
           ...change,
         });
         yield* fs.writeFileString(path.join(templates, name), text);
@@ -11964,10 +11973,7 @@ const setUpBoundProof = (issue: number, prerequisite: number, commit: string) =>
     const landed = yield* landThroughT3(prerequisite, commit);
     yield* seedIssue(prerequisite + 1, { state: "closed" });
     // A verification-only unit declares that it owns no file, as HSA writes it.
-    yield* seedIssue(issue, {
-      blockerNumbers: [prerequisite, prerequisite + 1],
-      body: `Rerun the settlement proof.\n\n## Owned files\n\nNone\n`,
-    });
+    yield* seedIssue(issue, { blockerNumbers: [prerequisite, prerequisite + 1], body: scope.body });
     yield* workStage(admittedBy(yield* advance("tracker_event", 1)), {
       outcome: "failed",
       failure: "settlement check failed",
@@ -12108,6 +12114,8 @@ it.effect(
           proofIssue.body = "Rerun the proof.\n\n## Owned files\n\n- `src/app.py`\n";
           yield* refusedWith("which is not exactly what #7501 declares");
           proofIssue.body = "<!-- connector-unit writes=src/ effort=high -->\nRerun the proof.";
+          yield* refusedWith("which is not exactly what #7501 declares");
+          proofIssue.body = `<!-- connector-unit writes=src/ -->\n${declared}`;
           yield* refusedWith("declares no owned files in a notation T3 reads");
           proofIssue.body = declared;
           // Earlier output in the derived directory is never written over.
@@ -12257,6 +12265,80 @@ it.effect.each(launchFaults)("Binding/B2: %s starts no provider", ([, issue, fau
         assert.isTrue(
           (yield* startRefusalOf(admitted)).some((message) => message.includes(reason)),
           JSON.stringify(yield* startRefusalOf(admitted)),
+        );
+      }),
+    ),
+  ),
+);
+
+const connectorScope = {
+  body: "Rerun the send-path proof.\n\n<!-- connector-unit writes=tests/proof/ edits=tests/proof/check.py effort=medium -->\n",
+  owned: ["tests/proof/"],
+};
+
+it.effect(
+  "Binding/B4: a connector unit's writes reservation is the bound scope; its edits, a mixed or duplicated declaration never are",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const proof = yield* setUpBoundProof(7580, 7581, "c0007580", connectorScope);
+          const launch = yield* LaunchFake;
+          launch.head = { commit: proof.landed.mergeCommit, tree: proof.landed.tree };
+          const waitsOn = (detail: string) =>
+            Effect.gen(function* () {
+              const startsBefore = (yield* startedTurns).length;
+              assert.deepStrictEqual(admissionsOnly(yield* advance("clock")), []);
+              assert.include((yield* recordOf(7580))?.detail ?? "", detail);
+              assert.strictEqual((yield* startedTurns).length, startsBefore);
+            });
+          // The narrower edit authority is not the reservation the binding must name.
+          const template = proof.proposal.pointer;
+          proof.proposal.pointer = yield* proof.writeTemplate("7580-edits.json", {
+            ownership: { owned: ["tests/proof/check.py"] },
+          });
+          yield* waitsOn("which is not exactly what #7580 declares");
+          proof.proposal.pointer = template;
+          // A declaration with a field twice, or beside another notation, is no scope at all.
+          const proofIssue = (yield* GitHubFake).issues.get(issueKey(claimRepository, 7580))!;
+          proofIssue.body =
+            "<!-- connector-unit writes=tests/proof/ writes=src/ effort=medium -->\nRerun the proof.";
+          yield* waitsOn("declares no owned files in a notation T3 reads");
+          proofIssue.body = `${connectorScope.body}\n## Owned files\n\n- \`tests/proof/check.py\`\n`;
+          yield* waitsOn("declares no owned files in a notation T3 reads");
+          proofIssue.body = connectorScope.body;
+          // Exactly the reservation: admitted once, and its provider starts once.
+          const startsBefore = (yield* startedTurns).length;
+          const admitted = admittedBy(yield* advance("clock"));
+          assert.deepStrictEqual(stageOf(admitted), [itemKeyFor(7580), "rework"]);
+          assert.strictEqual((yield* startedTurns).length - startsBefore, 1);
+          assert.deepStrictEqual(admissionsOnly(yield* advance("restart")), []);
+        }),
+      ),
+    ),
+);
+
+it.effect("Binding/B5: a connector reservation narrowed while preparing starts no provider", () =>
+  runIsolated(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const proof = yield* setUpBoundProof(7590, 7591, "c0007590", connectorScope);
+        const launch = yield* LaunchFake;
+        launch.head = { commit: proof.landed.mergeCommit, tree: proof.landed.tree };
+        const github = yield* GitHubFake;
+        const preparation = yield* PreparationFake;
+        preparation.beforeRelease = Effect.sync(() => {
+          github.issues.get(issueKey(claimRepository, 7590))!.body =
+            "<!-- connector-unit writes=tests/proof/check.py effort=medium -->\nRerun the proof.";
+        });
+        const startsBefore = (yield* startedTurns).length;
+        const admitted = admittedBy(yield* advance("clock", 2));
+        assert.deepStrictEqual(stageOf(admitted), [itemKeyFor(7590), "rework"]);
+        assert.strictEqual((yield* startedTurns).length - startsBefore, 0);
+        assert.isTrue(
+          (yield* startRefusalOf(admitted)).some((message) =>
+            message.includes("binding_scope_changed"),
+          ),
         );
       }),
     ),

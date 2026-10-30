@@ -146,13 +146,78 @@ const btcWrites = (body: string) => {
   return written.length === 0 || written.includes(undefined) ? undefined : written;
 };
 
+// The connector policy's unit marker (`connector_policy.py` `UNIT`, `PATH`, `clean_paths`,
+// `marker`): `writes` is the collision reservation, `edits` the narrower edit authority inside it.
+const CONNECTOR_UNIT = /<!-- connector-unit ((?:[a-z]+=\S+ ?)+)-->/g;
+const CONNECTOR_PATH = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9_.@+/-]{1,200}$/;
+const CONNECTOR_WRITES_LIMIT = 40;
+const CONNECTOR_EDITS_LIMIT = 100;
+
+/** Paths as the connector policy cleans them: sorted, once each; none if any is unsafe. */
+const connectorPaths = (raw: ReadonlyArray<string>, limit: number) => {
+  if (raw.length === 0 || raw.length > limit) return undefined;
+  const paths = new Set<string>();
+  for (const entry of raw) {
+    let path = entry.trim().replace(/^`+|`+$/g, "");
+    if (path.startsWith("./")) path = path.slice(2);
+    if (!CONNECTOR_PATH.test(path)) return undefined;
+    paths.add(path);
+  }
+  return [...paths].toSorted();
+};
+
 /**
- * Whether a bounded issue's own declaration owns exactly `owned`, as HSA and BTC read it: HSA's
- * `## Owned files` section (`None` for none), which any BTC Builder marker must name exactly,
- * else BTC's Builder marker alone. Undefined when the body declares nothing either reads, or
- * declares it ambiguously; other notations are not read here.
+ * The issue's one connector-unit marker as the connector policy reads it, or none when it has no
+ * such marker, more than one, a field twice or unknown, or a path that policy would refuse.
+ */
+const connectorUnit = (body: string) => {
+  const found = [...body.matchAll(CONNECTOR_UNIT)];
+  if (found.length !== 1 || (body.match(/connector-unit/g)?.length ?? 0) !== 1) return undefined;
+  const fields = new Map<string, string>();
+  for (const part of found[0]![1]!.trim().split(/\s+/)) {
+    const at = part.indexOf("=");
+    const key = part.slice(0, at);
+    if (fields.has(key)) return undefined;
+    fields.set(key, part.slice(at + 1));
+  }
+  if ([...fields.keys()].some((key) => !["writes", "edits", "effort", "closure"].includes(key))) {
+    return undefined;
+  }
+  const effort = fields.get("effort");
+  const closure = fields.get("closure") ?? "bounded";
+  if (
+    (effort !== undefined && effort !== "high" && effort !== "medium") ||
+    (closure !== "bounded" && closure !== "whole")
+  ) {
+    return undefined;
+  }
+  const writes = connectorPaths((fields.get("writes") ?? "").split(";"), CONNECTOR_WRITES_LIMIT);
+  if (writes === undefined) return undefined;
+  const editsField = fields.get("edits");
+  if (editsField === undefined) return { writes, effort, closure };
+  const edits = connectorPaths(editsField.split(";"), CONNECTOR_EDITS_LIMIT);
+  const inside = (path: string) =>
+    writes.some((write) => path === write || (write.endsWith("/") && path.startsWith(write)));
+  if (edits === undefined || !edits.every(inside)) return undefined;
+  return { writes, edits, effort, closure };
+};
+
+/**
+ * Whether a bounded issue's own declaration owns exactly `owned`, as its policy reads it: one
+ * connector-unit marker's `writes` reservation alone; HSA's `## Owned files` section (`None` for
+ * none), which any BTC Builder marker must name exactly; else BTC's Builder marker alone.
+ * Undefined when the body declares nothing these read, or declares it ambiguously or mixed.
  */
 export const declaresOwnedFiles = (body: string, owned: ReadonlyArray<string>) => {
+  const connector = /connector-unit/.test(body);
+  if (connector) {
+    // One notation per issue: a connector unit beside another declaration is ambiguous.
+    if (/^#+\s*owned files\b/im.test(body) || /btc-unit/i.test(body)) return undefined;
+    const unit = connectorUnit(body);
+    if (unit === undefined) return undefined;
+    const claimed = connectorPaths(owned, CONNECTOR_WRITES_LIMIT);
+    return claimed !== undefined && sameScope(unit.writes, claimed);
+  }
   if (/^## Owned files[ \t\r]*$/m.test(body)) {
     const files = listedOwnedFiles(body, true);
     if (files === undefined || !btcWritesListed(body, files)) return undefined;
