@@ -17365,12 +17365,20 @@ it.effect(
  * A pending gate on `issueNumber`, then a policy whose next decision withdraws it exactly as its
  * input names it, after `meanwhile` changed what that input was read from.
  */
-const withdrawAfter = (
+const withdrawAfter = <E>(
   issueNumber: number,
   meanwhile: (
     input: Parameters<ProposeFn>[0],
     gate: FactoryOutcomeStore.ReservedDecision,
-  ) => Effect.Effect<unknown, unknown, FactoryStore.FactoryStore | FactoryOutcomeStore.FactoryOutcomeStore | FactoryLifecycle.FactoryLifecycle | FactoryWorkspace | ProjectService.ProjectService>,
+  ) => Effect.Effect<
+    unknown,
+    E,
+    | FactoryStore.FactoryStore
+    | FactoryOutcomeStore.FactoryOutcomeStore
+    | FactoryLifecycle.FactoryLifecycle
+    | FactoryWorkspace
+    | ProjectService.ProjectService
+  >,
 ) =>
   Effect.gen(function* () {
     yield* configureLifecycleFactory;
@@ -17385,6 +17393,7 @@ const withdrawAfter = (
     yield* advance("tracker_event", 2);
     const store = yield* FactoryStore.FactoryStore;
     const outcomes = yield* FactoryOutcomeStore.FactoryOutcomeStore;
+    const policy = yield* PolicyFake;
     const lifecycle = yield* FactoryLifecycle.FactoryLifecycle;
     const workspace = yield* FactoryWorkspace;
     const projects = yield* ProjectService.ProjectService;
@@ -17401,12 +17410,15 @@ const withdrawAfter = (
           Effect.orDie,
         );
         // Later passes hold without withdrawing: only the stale decision names the gate.
-        yield* usePolicy(() => Effect.succeed(heldWithdrawing()));
+        policy.propose = () => Effect.succeed(heldWithdrawing());
         return heldWithdrawing(withdrawal);
       }),
     );
-    yield* advance("clock", 2);
-    return { gate: (yield* decisionsOf(issueNumber))[0]!, detail: yield* waitDetailOf(issueNumber) };
+    yield* advance("clock", 1);
+    return {
+      gate: (yield* decisionsOf(issueNumber))[0]!,
+      detail: yield* waitDetailOf(issueNumber),
+    };
   });
 
 it.effect(
@@ -17426,19 +17438,17 @@ it.effect(
     ),
 );
 
-it.effect(
-  "Gates/W2: a withdrawal decided on an item version read over withdraws nothing",
-  () =>
-    runIsolated(
-      Effect.scoped(
-        Effect.gen(function* () {
-          const { gate } = yield* withdrawAfter(7892, (input) =>
-            observe(input.observation.itemKey, { itemVersion: "newer-durable-version" }),
-          );
-          assert.deepStrictEqual([gate.state, gate.superseded], ["pending", undefined]);
-        }),
-      ),
+it.effect("Gates/W2: a withdrawal decided on an item version read over withdraws nothing", () =>
+  runIsolated(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { gate } = yield* withdrawAfter(7892, (input) =>
+          observe(input.observation.itemKey, { itemVersion: "newer-durable-version" }),
+        );
+        assert.deepStrictEqual([gate.state, gate.superseded], ["pending", undefined]);
+      }),
     ),
+  ),
 );
 
 it.effect(

@@ -2642,7 +2642,7 @@ const make = Effect.gen(function* () {
           if (
             Option.isNone(current) ||
             current.value.revision !== configuration.revision ||
-            current.value.policyRevision !== withdrawal.policyRevision
+            current.value.policyRevision !== configuration.policyRevision
           ) {
             return stale("was decided on a factory configuration since replaced");
           }
@@ -2662,7 +2662,11 @@ const make = Effect.gen(function* () {
           }
           const checked = withdrawalOf(
             yield* outcomeStore.reservedDecisions(factoryId),
-            { itemKey: candidate.itemKey, stage: nextStage(events), observation: candidate.observation },
+            {
+              itemKey: candidate.itemKey,
+              stage: nextStage(events),
+              observation: candidate.observation,
+            },
             withdrawal,
             current.value.policyRevision,
           );
@@ -2677,7 +2681,10 @@ const make = Effect.gen(function* () {
         Effect.catchTags({
           SqlError: (cause) =>
             Effect.fail(
-              new FactoryOutcomeStore.FactoryOutcomeStoreError({ operation: "withdraw-gate", cause }),
+              new FactoryOutcomeStore.FactoryOutcomeStoreError({
+                operation: "withdraw-gate",
+                cause,
+              }),
             ),
         }),
       );
