@@ -406,6 +406,8 @@ const AdmittedReservation = Schema.Struct({
   historicalTermination: Schema.optional(HistoricalTermination),
   /** The single-capacity resources it holds while held, from its stage basis. */
   resources: Schema.optional(Schema.Array(Bounded)),
+  /** The configured execution its decision chose by name, when it holds resources or verifies. */
+  executionChoice: Schema.optional(Bounded),
 });
 
 /** A counted descendant of a native execution, admitted under the configuration current then. */
@@ -1438,6 +1440,8 @@ const make = Effect.gen(function* () {
         return { type: "refused", refusal: "resource_held" } as const;
       }
     }
+    const choice = /\|exe:([^|]+)/.exec(admission.stageBasis ?? "")?.[1];
+    const executionChoice = choice === undefined ? undefined : decodeURIComponent(choice);
     const reservationId = makeReservationId(`reservation:${input.commandId}`);
     if (admission.grant !== undefined) {
       const spent = yield* spendGrant({
@@ -1478,6 +1482,7 @@ const make = Effect.gen(function* () {
       observationId: admission.observationId,
       ...(admission.grant === undefined ? {} : { grantId: admission.grant.grantId }),
       ...(resources.length === 0 ? {} : { resources }),
+      ...(executionChoice === undefined ? {} : { executionChoice }),
     };
     yield* insertReservation(reservation);
     // The same commit records the admission in the item's lifecycle order.

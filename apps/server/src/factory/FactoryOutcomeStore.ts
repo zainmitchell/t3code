@@ -41,6 +41,11 @@ export const FactoryOutcomeReport = Schema.Struct({
     "not_actionable",
     "ticket_opened",
   ]),
+  /**
+   * For T3's own record of a missing result: `environment` when the execution never started or
+   * its run did not complete, and no report was rejected. Its work was never judged.
+   */
+  failureClass: Schema.optional(Schema.Literal("environment")),
   /** The correction ticket T3 opened for a verification-only item's spec. */
   ticket: Schema.optional(Schema.Struct({ repository: Schema.String, number: Schema.Int })),
   integration: Schema.optional(

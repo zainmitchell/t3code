@@ -680,10 +680,14 @@ export const makeFactoryOutcomes = (deps: FactoryOutcomeDependencies) => {
       ),
       ...rejected.map((reason) => `Its report was rejected: ${reason}`),
     ].join(" ");
+    const environment =
+      rejected.length === 0 &&
+      (preparationFailures(projection).size > 0 || runs.some((run) => run.status !== "completed"));
     const outcomeReport: FactoryOutcomeStore.FactoryOutcomeReport = {
       outcome: "failed",
       failure,
       summary: "No result was reported.",
+      ...(environment ? { failureClass: "environment" as const } : {}),
     };
     // The same stage ending without a result on the same footing is the same failure, however
     // often it repeats, so a fast-failing worker cannot refill it (HSA #94). A review or

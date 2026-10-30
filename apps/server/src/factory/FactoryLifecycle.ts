@@ -458,6 +458,20 @@ export type FactoryReconcileResult =
   | FactoryCollectionResult
   | { readonly type: "idle"; readonly reason: "not_configured" | "no_claim" };
 
+/**
+ * The stage-basis suffix naming the execution chosen for a decision that holds resources or
+ * verifies a no-edit unit, so its reservation records that choice. Other decisions keep their keys.
+ */
+const choiceBasis = (decision: {
+  readonly execution?: string | undefined;
+  readonly resources?: ReadonlyArray<string> | undefined;
+  readonly noEdit?: unknown;
+}) =>
+  decision.execution === undefined ||
+  ((decision.resources ?? []).length === 0 && decision.noEdit === undefined)
+    ? ""
+    : `|exe:${encodeURIComponent(decision.execution)}`;
+
 /** The stage-basis suffix naming the single-capacity resources a decision holds. */
 const resourceBasis = (resources: ReadonlyArray<string> | undefined) =>
   resources === undefined || resources.length === 0 ? "" : `|res:${resources.join(",")}`;
@@ -3581,6 +3595,8 @@ const make = Effect.gen(function* () {
       const reads = { outcomeStore, store, operations: operationStore };
       const itemFacts = new Map<FactoryItemKey, FactoryPolicyItemFacts>();
       const items: Array<FactoryPolicyItem> = [];
+      // Why T3 offers an item no preparation now, shown on its wait whatever the policy decides.
+      const preparationBlocked = new Map<FactoryItemKey, string>();
       // One read of the criteria root serves every item of the pass.
       const criteriaRoot = configuration.parents?.criteriaRoot;
       const listing =
@@ -3623,6 +3639,12 @@ const make = Effect.gen(function* () {
           candidate.stage.type === "implement"
             ? yield* triageDecisionFor(configuration, candidate, outcomes)
             : undefined;
+        if (triage !== undefined && "unread" in triage) {
+          preparationBlocked.set(
+            candidate.itemKey,
+            `its preparation waits on ${triage.unread.actor}: ${triage.unread.what}; ${triage.unread.action}`,
+          );
+        }
         const transferred = transferOf.get(candidate.itemKey);
         const legacyWork = transferred?.adopted?.items.find(
           (item) => item.itemKey === candidate.itemKey,
@@ -3743,10 +3765,17 @@ const make = Effect.gen(function* () {
               yield* outcomeStore.supersedeDecision({ decisionId: pending.decisionId, reason });
             }
           }
-          const detail =
-            withdrawal !== undefined && "refused" in withdrawal
-              ? `${result.detail}; T3 withdrew nothing: ${withdrawal.refused}`
-              : result.detail;
+          const blocked =
+            result.disposition === "nothing_proposed" ? preparationBlocked.get(itemKey) : undefined;
+          const detail = [
+            result.detail,
+            ...(withdrawal !== undefined && "refused" in withdrawal
+              ? [`T3 withdrew nothing: ${withdrawal.refused}`]
+              : []),
+            ...(blocked === undefined ? [] : [`T3: ${blocked}`]),
+          ]
+            .filter((part) => part !== undefined)
+            .join("; ");
           // A precise reason to start nothing is a wait, kept once per basis; anything else ends it.
           yield* outcomeStore.recordWait({
             factoryId,
@@ -3873,6 +3902,27 @@ const make = Effect.gen(function* () {
       },
     });
     const line = integrationLineOf(configuration);
+    // A preparation that failed in its environment is retried only on another execution: the
+    // same one would fail the same way, and its work was never judged.
+    let environment: string | undefined;
+    if (failed.report.failureClass === "environment" && reservationId !== undefined) {
+      const ran = yield* store.getReservation(reservationId);
+      const now = FactoryStore.executionFor(configuration, "triage");
+      const before =
+        Option.isSome(ran) && ran.value.origin === "admitted"
+          ? canonical(ran.value.modelSelection)
+          : undefined;
+      environment = sha256(
+        canonical([now.modelSelection, now.runtimeMode, now.interactionMode]),
+      ).slice(0, 32);
+      if (before === canonical(now.modelSelection)) {
+        return unread(
+          "it ended in its environment and the triage execution is unchanged",
+          "the operator of the triage execution (its provider credential, model or runtime)",
+          "repair or change the factory's triage execution; T3 then prepares the item once on it",
+        );
+      }
+    }
     if (reservationId === undefined) {
       return unread(
         "names no execution whose proposal T3 can read back",
@@ -3969,6 +4019,7 @@ const make = Effect.gen(function* () {
           blocker.outcomes.map((outcome) => [outcome.outcomeId, outcome.state]),
         ]),
         ...(retried.size === 0 ? [] : [[...retried].toSorted(([a], [b]) => a.localeCompare(b))]),
+        ...(environment === undefined ? [] : [["environment", environment]]),
       ]),
     ).slice(0, 32);
     return triageDecisionOf(input, candidate.observation, outcomes, readback);
@@ -4885,7 +4936,7 @@ const make = Effect.gen(function* () {
             stage: {
               type: stage.type,
               // The binding's output root stays last: the store reads it at the end.
-              basis: `${stageBasis(stage)}${resourceBasis(decision.resources)}${noEdit?.basis ?? ""}${bound?.basis ?? ""}`,
+              basis: `${stageBasis(stage)}${resourceBasis(decision.resources)}${choiceBasis(decision)}${noEdit?.basis ?? ""}${bound?.basis ?? ""}`,
             },
             ...(candidate.owner === undefined ? {} : { continues: candidate.owner.reservationId }),
             ...(grant === undefined ? {} : { grant }),

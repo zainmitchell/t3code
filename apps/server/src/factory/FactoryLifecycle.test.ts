@@ -22236,12 +22236,23 @@ it.effect(
       Effect.scoped(
         Effect.gen(function* () {
           yield* configureLifecycleFactory;
-          yield* configureFactory(lifecycleConfiguration({ pools: pool(2) }));
-          // Only builds hold the OCR engine; their reviews do not.
+          yield* configureFactory(
+            lifecycleConfiguration({
+              pools: pool(2),
+              executionChoices: {
+                "ocr-builder": {
+                  modelSelection: rosterSelection,
+                  runtimeMode: "full-access",
+                  interactionMode: "default",
+                },
+              },
+            }),
+          );
+          // Only builds hold the OCR engine, on its execution; their reviews do not.
           yield* usePolicy((input) =>
             Effect.map(stageRequest(input), (decision) =>
               decision !== undefined && "taskKind" in decision && decision.taskKind === "implement"
-                ? { ...decision, resources: ["ocr"] }
+                ? { ...decision, resources: ["ocr"], execution: "ocr-builder" }
                 : decision,
             ),
           );
@@ -22251,7 +22262,10 @@ it.effect(
           if (first.reservation.origin !== "admitted") return assert.fail("expected an admission");
           const [holder, waiter] =
             first.reservation.itemKey === itemKeyFor(7941) ? [7941, 7942] : [7942, 7941];
-          assert.deepStrictEqual(first.reservation.resources, ["ocr"]);
+          assert.deepStrictEqual(
+            [first.reservation.resources, first.reservation.executionChoice],
+            [["ocr"], "ocr-builder"],
+          );
           const waiting = yield* recordOf(waiter);
           assert.strictEqual(waiting?.reasonClass, "resource_held");
           assert.include(
@@ -22267,11 +22281,23 @@ it.effect(
             subject: subjectFor("c0007941", lifecycleBase),
             summary: "Built.",
           });
-          const next = admittedOnly(yield* advance("outcome", 3)).map(stageOf);
-          assert.deepStrictEqual(
-            next.filter((stage) => stage?.[1] === "implement"),
-            [[itemKeyFor(waiter), "implement"]],
+          const next = admittedOnly(yield* advance("outcome", 3));
+          const later = next.filter((admission) => stageOf(admission)?.[1] === "implement");
+          assert.deepStrictEqual(later.map(stageOf), [[itemKeyFor(waiter), "implement"]]);
+          // The holder's own reservation released it; the waiter holds it under another id.
+          const released = Option.getOrThrow(
+            yield* (yield* FactoryStore.FactoryStore).getReservation(
+              first.reservation.reservationId,
+            ),
           );
+          assert.deepStrictEqual(
+            [released.state, released.origin === "admitted" ? released.resources : undefined],
+            ["released", ["ocr"]],
+          );
+          const taken = later[0]!;
+          if (taken.reservation.origin !== "admitted") return assert.fail("expected an admission");
+          assert.notStrictEqual(taken.reservation.reservationId, first.reservation.reservationId);
+          assert.deepStrictEqual(taken.reservation.resources, ["ocr"]);
         }),
       ),
     ),
@@ -22291,6 +22317,22 @@ const routinePreparationPolicy: ProposeFn = (input) => {
       outcome.report.proposal?.basis === input.observation.itemVersion,
   );
   if (proposed) return stageRequest(input);
+  // A person's own choice is asked once, by its question, and never re-asked.
+  const decision = input.outcomes.findLast(
+    (outcome) =>
+      outcome.stage === "triage" &&
+      outcome.state === "verified" &&
+      outcome.report.outcome === "not_actionable" &&
+      outcome.report.failure?.startsWith("decision:") === true,
+  );
+  if (decision !== undefined) {
+    return Effect.succeed({
+      type: "reserve" as const,
+      reason: decision.report.failure!,
+      evidenceDigest: sha256(decision.report.failure!),
+      question: `settlement-currency:${input.observation.itemKey}`,
+    });
+  }
   const stopped = input.outcomes.some(
     (outcome) => outcome.stage === "triage" && outcome.state === "verified",
   );
@@ -22306,7 +22348,7 @@ it.effect(
       Effect.scoped(
         Effect.gen(function* () {
           yield* configureLifecycleFactory;
-          yield* configureFactory(lifecycleConfiguration({ pools: pool(2) }));
+          yield* configureFactory(lifecycleConfiguration({ pools: pool(3) }));
           yield* usePolicy(routinePreparationPolicy);
           // A legacy item parked for an outside coordinator, and an ordinary item.
           yield* seedIssue(7951, {
@@ -22314,12 +22356,14 @@ it.effect(
             labels: ["ready", "needs-main"],
           });
           yield* seedIssue(7952, { body: "Rotate the importer key." });
+          yield* seedIssue(7953, { body: "Settle payouts." });
           const first = admittedOnly(yield* advance("tracker_event", 1));
           const triageOf = (issue: number) =>
             first.find((admission) => stageOf(admission)?.[0] === itemKeyFor(issue))!;
           assert.deepStrictEqual(first.map(stageOf).toSorted(), [
             [itemKeyFor(7951), "triage"],
             [itemKeyFor(7952), "triage"],
+            [itemKeyFor(7953), "triage"],
           ]);
           assert.deepStrictEqual(admittedOnly(yield* advance("restart", 2)), []);
           // One preparation stops on routine coordination, the other on a genuine permission.
@@ -22332,6 +22376,11 @@ it.effect(
             outcome: "not_actionable",
             summary: "Needs the key.",
             failure: "permission: rotating the key needs the owner's production credential",
+          });
+          yield* workStage(triageOf(7953), {
+            outcome: "not_actionable",
+            summary: "A financial choice.",
+            failure: "decision: settle payouts in EUR or GBP; the owner chooses",
           });
           // The routine gap is prepared again by the factory, exactly once; the hold is not.
           const retry = admittedBy(yield* advance("outcome", 3));
@@ -22355,13 +22404,33 @@ it.effect(
           for (const trigger of ["restart", "clock", "tracker_event"] as const) {
             assert.deepStrictEqual(admittedOnly(yield* advance(trigger, 2)), []);
           }
+          // Its build is verified and reviewed at that head, each admitted once.
+          yield* recordCommit("c0007951", [lifecycleBase]);
+          yield* workStage(build, {
+            outcome: "implemented",
+            subject: subjectFor("c0007951", lifecycleBase),
+            summary: "Resumable.",
+          });
+          const review = admittedBy(yield* advance("outcome", 3));
+          assert.deepStrictEqual(stageOf(review), [itemKeyFor(7951), "review"]);
+          assert.deepStrictEqual(admittedOnly(yield* advance("restart", 2)), []);
           assert.deepStrictEqual(yield* itemHistory(7951), [
             "triage",
             "not_actionable",
             "triage",
             "unit_proposed",
             "implement",
+            "implemented",
+            "review",
           ]);
+          // The financial choice is one pending card, never answered by T3 and never asked again.
+          const cards = yield* decisionsOf(7953);
+          assert.deepStrictEqual(
+            cards.map((card) => [card.state, card.resolution]),
+            [["pending", undefined]],
+          );
+          assert.strictEqual((yield* commentsWith(7953, "t3-factory-decision")).length, 1);
+          assert.deepStrictEqual(yield* itemHistory(7953), ["triage", "not_actionable"]);
           // The permission stays a person's: no further work, no question answered for them.
           assert.deepStrictEqual(yield* itemHistory(7952), ["triage", "not_actionable"]);
           assert.isFalse(
@@ -22372,6 +22441,64 @@ it.effect(
             (yield* GitHubFake).issues.get(issueKey(claimRepository, 7951))!.labels,
             "needs-main",
           );
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Prepare/E1: a preparation that failed in its environment is retried once, and only on another execution",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* configureLifecycleFactory;
+          // The policy prepares on every preparation key T3 offers that has not run.
+          yield* usePolicy((input) =>
+            input.stage.type === "implement" &&
+            input.triageDecisionKey !== undefined &&
+            !input.outcomes.some((outcome) => outcome.decisionKey === input.triageDecisionKey)
+              ? triageRequest(input)
+              : Effect.succeed({ type: "none" as const, reason: "prepared" }),
+          );
+          yield* seedIssue(7961, { body: "Index the ledger." });
+          const triage = admittedBy(yield* advance("tracker_event", 1));
+          // The provider fails the run before any report: the work was never judged.
+          const execution = yield* startStage(triage);
+          yield* completeLatestRun(execution.threadId, "failed");
+          yield* advance("outcome", 3);
+          assert.deepStrictEqual(yield* itemHistory(7961), ["triage", "failed"]);
+          const outcomes = yield* FactoryOutcomeStore.FactoryOutcomeStore;
+          if (triage.reservation.origin !== "admitted") return assert.fail("expected an admission");
+          const failed = Option.getOrThrow(
+            yield* outcomes.get(`no-result:${triage.reservation.reservationId}`),
+          );
+          assert.strictEqual(failed.report.failureClass, "environment");
+          // The same execution would fail the same way: no retry, and the wait says what changes it.
+          assert.deepStrictEqual(admittedOnly(yield* advance("clock", 3)), []);
+          assert.include(
+            (yield* recordOf(7961))?.detail ?? "",
+            "it ended in its environment and the triage execution is unchanged",
+          );
+          // An unrelated configuration change retries nothing.
+          yield* configureFactory(lifecycleConfiguration({ pools: pool(2) }));
+          assert.deepStrictEqual(admittedOnly(yield* advance("clock", 3)), []);
+          // Another triage execution is the environment change: one preparation on it.
+          yield* configureFactory(
+            lifecycleConfiguration({
+              pools: pool(2),
+              stageExecution: {
+                triage: {
+                  modelSelection: betaSelection,
+                  runtimeMode: "full-access",
+                  interactionMode: "default",
+                },
+              },
+            }),
+          );
+          const retry = admittedBy(yield* advance("clock", 3));
+          assert.deepStrictEqual(stageOf(retry), [itemKeyFor(7961), "triage"]);
+          assert.deepStrictEqual(admittedOnly(yield* advance("restart", 3)), []);
         }),
       ),
     ),
