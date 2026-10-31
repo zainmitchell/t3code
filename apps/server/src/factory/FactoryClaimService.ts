@@ -17,6 +17,7 @@ import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -1068,7 +1069,6 @@ const make = Effect.gen(function* () {
         }),
       ),
       Effect.forkIn(watcherScope),
-      Effect.asVoid,
     );
 
   /**
@@ -1091,7 +1091,8 @@ const make = Effect.gen(function* () {
         return yield* holdOnPreparationOutcome(reservationId, threadId, runId);
       }
     }
-    yield* awaitPreparation(
+    let watcher: Fiber.Fiber<void> | undefined;
+    const outcome = yield* awaitPreparation(
       threadId,
       runId,
       preparation
@@ -1108,11 +1109,19 @@ const make = Effect.gen(function* () {
               // Another preparation already holds the command: this owner's obligation stays
               // open, since nothing here can account for that one.
               onNone: () => Effect.void,
-              onSome: (handle) => watchPreparation(runId, handle, generation?.generationId),
+              onSome: (handle) =>
+                Effect.map(watchPreparation(runId, handle, generation?.generationId), (fiber) => {
+                  watcher = fiber;
+                }),
             }),
           ),
         ),
     );
+    // A preparation ends right after recording its run's failure or cancellation; settling what
+    // it entered first keeps the claim's hold and custody reads from seeing it still open.
+    if (watcher !== undefined && (outcome === "failed" || outcome === "cancelled")) {
+      yield* Fiber.await(watcher);
+    }
     return yield* holdOnPreparationOutcome(reservationId, threadId, runId);
   });
 

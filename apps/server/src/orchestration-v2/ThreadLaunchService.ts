@@ -956,19 +956,12 @@ const make = Effect.gen(function* () {
         }),
       ),
       Effect.onError((cause) =>
-        // Nothing runs after the failure, so the owner may settle what the preparation entered
-        // before the failure is announced. The entry stays reserved until `ensuring`, so no
-        // second preparation of the still-preparing run can start meanwhile.
-        Deferred.succeed(entry.ended, evidenceOf(entry, fiberOutcome)).pipe(
-          Effect.andThen(
-            failPreparedRun(
-              input,
-              threadId,
-              runId,
-              Cause.hasInterruptsOnly(cause) ? "Worktree setup cancelled." : Cause.squash(cause),
-              entry.ownerId,
-            ),
-          ),
+        failPreparedRun(
+          input,
+          threadId,
+          runId,
+          Cause.hasInterruptsOnly(cause) ? "Worktree setup cancelled." : Cause.squash(cause),
+          entry.ownerId,
         ),
       ),
       Effect.ignoreCause,
