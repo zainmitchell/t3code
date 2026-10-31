@@ -1243,6 +1243,22 @@ const layerFactoryWorkspace = Layer.effect(
   ),
 );
 
+const scriptedProviderInstanceSettings = {
+  [ProviderInstanceId.make("roster-reporting")]: { driver, enabled: true },
+  [ProviderInstanceId.make("contained-claude")]: {
+    driver: ProviderDriverKind.make("claudeAgent"),
+    enabled: true,
+  },
+  [ProviderInstanceId.make("contained-codex")]: {
+    driver: ProviderDriverKind.make("codex"),
+    enabled: true,
+  },
+  [ProviderInstanceId.make("contained-muse")]: {
+    driver: ProviderDriverKind.make("muse"),
+    enabled: true,
+  },
+};
+
 const layerTestProviderInstanceRegistry = Layer.effect(
   ProviderInstanceRegistry.ProviderInstanceRegistry,
   Effect.gen(function* () {
@@ -1553,7 +1569,11 @@ const makeLayerRuntime = (continueAfterRestart: boolean) =>
     Layer.provide(Layer.provide(CheckpointStore.layer, layerVcsDriverRegistryTest)),
     Layer.provide(layerServerConfig),
     Layer.provide(
-      ServerSettings.layerTest({ continueThreadsAfterServerUpdate: continueAfterRestart }),
+      ServerSettings.layerTest({
+        continueThreadsAfterServerUpdate: continueAfterRestart,
+        // Only the default codex and claudeAgent instances are enabled unconfigured.
+        providerInstances: scriptedProviderInstanceSettings,
+      }),
     ),
     Layer.provide(layerPlatformTest),
   );
