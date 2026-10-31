@@ -17102,14 +17102,22 @@ it.effect(
 
           // A document that does not decode installs nothing.
           for (const invalid of ["{", JSON.stringify({ factoryId, enabled: false })]) {
-            const refused = yield* Effect.flip(factory.installConfiguration(invalid));
+            const refused = yield* Effect.flip(factory.installConfiguration(invalid, 0));
             assert.strictEqual(refused._tag, "FactoryConfigurationInvalid");
           }
           assert.isNull((yield* factory.readState({ factoryId })).configuration);
 
-          const installed = yield* factory.installConfiguration(document(false));
+          const installed = yield* factory.installConfiguration(document(false), 0);
           assert.isFalse(installed.enabled);
           assert.isFalse((yield* factory.readState({ factoryId })).configuration?.enabled);
+          // A second writer that read before the pause landed cannot start it again over it.
+          const stale = yield* Effect.flip(factory.installConfiguration(document(true), 0));
+          assert.strictEqual(
+            stale.message,
+            `${factoryId} is at revision 1, not 0: nothing installed`,
+          );
+          const paused = (yield* factory.readState({ factoryId })).configuration;
+          assert.deepStrictEqual([paused?.revision, paused?.enabled], [1, false]);
 
           // Legacy carriers on an issue the paused factory would otherwise start.
           yield* seedIssue(7871);
@@ -17154,7 +17162,7 @@ it.effect(
           assert.lengthOf(yield* factory.observeClaims({ factoryId }), 0);
 
           // Started, the factory takes the item natively.
-          assert.isTrue((yield* factory.installConfiguration(document(true))).enabled);
+          assert.isTrue((yield* factory.installConfiguration(document(true), 1)).enabled);
           const admitted = admittedBy(yield* advance("tracker_event", 1));
           assert.deepStrictEqual(stageOf(admitted), [itemKeyFor(7871), "implement"]);
           // Its claim is written on the issue the disposed carriers are still on: a disposed carrier

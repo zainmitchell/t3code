@@ -317,6 +317,16 @@ export class FactoryConfigurationInvalid extends Schema.TaggedError<FactoryConfi
   }
 }
 
+/** An install that names a revision it replaces which is no longer the latest; nothing installed. */
+export class FactoryConfigurationStale extends Schema.TaggedError<FactoryConfigurationStale>()(
+  "FactoryConfigurationStale",
+  { factoryId: Schema.String, revision: Schema.Number, expectRevision: Schema.Number },
+) {
+  override get message(): string {
+    return `${this.factoryId} is at revision ${this.revision}, not ${this.expectRevision}: nothing installed`;
+  }
+}
+
 const decodeConfigurationDocument = Schema.decodeUnknownEffect(
   Schema.fromJsonString(FactoryStore.FactoryConfigurationInput),
 );
@@ -852,12 +862,16 @@ export class FactoryLifecycle extends Context.Service<
     readonly configure: (
       input: FactoryConfigurationInput,
     ) => Effect.Effect<FactoryStore.FactoryConfiguration, FactoryLifecycleError>;
-    /** The owner installs a factory's configuration from its JSON document, validated whole. */
+    /**
+     * The owner installs a factory's configuration from its JSON document, validated whole, only
+     * while `expectRevision` (0 for a new factory) is still its latest, checked in the same write.
+     */
     readonly installConfiguration: (
       document: string,
+      expectRevision: number,
     ) => Effect.Effect<
       FactoryStore.FactoryConfiguration,
-      FactoryConfigurationInvalid | FactoryLifecycleError
+      FactoryConfigurationInvalid | FactoryConfigurationStale | FactoryLifecycleError
     >;
     /**
      * The owner moves future work from one provider instance to another, given the providers this
@@ -2459,11 +2473,29 @@ const make = Effect.gen(function* () {
 
   const installConfiguration = Effect.fn("FactoryLifecycle.installConfiguration")(function* (
     document: string,
+    expectRevision: number,
   ) {
     const input = yield* decodeConfigurationDocument(document).pipe(
       Effect.mapError((cause) => new FactoryConfigurationInvalid({ reason: cause.message })),
     );
-    return yield* configure(input);
+    const written = yield* store.configureAtRevision(input, expectRevision).pipe(
+      Effect.mapError(
+        (cause) =>
+          new FactoryLifecycleError({
+            operation: "configure",
+            factoryId: input.factoryId,
+            cause,
+          }),
+      ),
+    );
+    if (written.type === "conflict") {
+      return yield* new FactoryConfigurationStale({
+        factoryId: input.factoryId,
+        revision: written.revision,
+        expectRevision,
+      });
+    }
+    return written.configuration;
   });
 
   const switchProvider = makeSwitchProvider(store);

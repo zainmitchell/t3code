@@ -379,6 +379,8 @@ const installCommand = Command.make("install", {
         },
         (client) =>
           Effect.gen(function* () {
+            // The server refuses a stale revision in the install's own write. This read only
+            // still refuses one on a server older than that check, which drops the field.
             const revision = currentRevision(
               yield* client[WS_METHODS.factoryOverview]({}),
               factoryId,
@@ -389,7 +391,10 @@ const installCommand = Command.make("install", {
                 reason: `${factoryId} is at revision ${revision}, not ${flags.expectRevision}: nothing installed`,
               });
             }
-            return yield* client[WS_METHODS.factoryConfigure]({ configuration: document.text });
+            return yield* client[WS_METHODS.factoryConfigure]({
+              configuration: document.text,
+              expectRevision: flags.expectRevision,
+            });
           }),
       );
     }).pipe(Effect.flatMap(printJson)),

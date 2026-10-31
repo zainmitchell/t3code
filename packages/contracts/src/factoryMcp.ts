@@ -424,9 +424,13 @@ export const FactoryDisposeClaimResult = Schema.Struct({ disposed: Schema.Boolea
 
 /**
  * The owner installs or replaces a factory's configuration, given as its JSON document. It is
- * validated whole; `enabled` in it pauses or starts the factory.
+ * validated whole; `enabled` in it pauses or starts the factory. `expectRevision` is the revision
+ * it replaces (0 for a new factory): the server refuses it in the same write once another landed.
  */
-export const FactoryConfigureInput = Schema.Struct({ configuration: Bounded(1_000_000) });
+export const FactoryConfigureInput = Schema.Struct({
+  configuration: Bounded(1_000_000),
+  expectRevision: NonNegativeInt,
+});
 export const FactoryConfigureResult = Schema.Struct({
   factoryId: FactoryId,
   enabled: Schema.Boolean,

@@ -1281,9 +1281,12 @@ export const layerWsRpc = (
       const factoryActor = `session:${currentSession.subject}:${currentSession.sessionId}`;
       const isFactoryLifecycleError = Schema.is(FactoryLifecycle.FactoryLifecycleError);
       const isFactoryConfigurationInvalid = Schema.is(FactoryLifecycle.FactoryConfigurationInvalid);
+      const isFactoryConfigurationStale = Schema.is(FactoryLifecycle.FactoryConfigurationStale);
       // Clients get fixed text and typed attributes only; a cause can hold tokens or host paths.
       const factoryOwnerMessage = (error: unknown) =>
-        isFactoryLifecycleError(error) || isFactoryConfigurationInvalid(error)
+        isFactoryLifecycleError(error) ||
+        isFactoryConfigurationInvalid(error) ||
+        isFactoryConfigurationStale(error)
           ? error.message
           : "An unexpected error occurred.";
       const factoryOwnerFailure =
@@ -2297,7 +2300,7 @@ export const layerWsRpc = (
             factoryOwnerFailure(WS_METHODS.factoryHistoricalTermination, input.factoryId),
           ),
         [WS_METHODS.factoryConfigure]: (input) =>
-          factoryLifecycle.installConfiguration(input.configuration).pipe(
+          factoryLifecycle.installConfiguration(input.configuration, input.expectRevision).pipe(
             Effect.map((configuration) => ({
               factoryId: configuration.factoryId,
               enabled: configuration.enabled,

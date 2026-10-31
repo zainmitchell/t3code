@@ -173,7 +173,9 @@ describe("factory owner authorization", () => {
           answer: "approve",
         }),
       );
-      yield* Effect.exit(client[WS_METHODS.factoryConfigure]({ configuration: "{}" }));
+      yield* Effect.exit(
+        client[WS_METHODS.factoryConfigure]({ configuration: "{}", expectRevision: 0 }),
+      );
       expect(handled).toEqual(allowed);
     }).pipe(Effect.scoped),
   );
