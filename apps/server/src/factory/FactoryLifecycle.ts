@@ -4198,6 +4198,59 @@ const make = Effect.gen(function* () {
    * be verified on the item's current triage inputs, the build must start exactly at its base, and
    * that base must read back now on the line T3 integrates onto. What cannot be read is not ready.
    */
+  /**
+   * Why a no-edit unit may not run again at a rework, if it may not. Only an execution-binding
+   * repair runs it again: a verified correction declaring that action, answering this item's own
+   * failure of exactly this unit (requirement, item version and execution), on its candidate.
+   */
+  const noEditRepairProblem = Effect.fnUntraced(function* (
+    candidate: Candidate,
+    stage: Extract<FactoryStage, { readonly type: "rework" }>,
+    requirement: NoEditRequirement,
+    execution: string | undefined,
+  ) {
+    const correction = yield* outcomeStore.get(stage.specOutcomeId);
+    if (
+      Option.isNone(correction) ||
+      correction.value.state !== "verified" ||
+      correction.value.report.outcome !== "correction_spec" ||
+      !/^action class:\s*execution_binding_repair$/i.test(
+        (correction.value.report.summary ?? "").split("\n")[0]!.trim(),
+      )
+    ) {
+      return "its correction is not a verified execution_binding_repair";
+    }
+    const head = correction.value.report.subject?.headCommit;
+    if (head !== undefined && head !== requirement.candidate) {
+      return `its correction names head ${head}, not the candidate ${requirement.candidate}`;
+    }
+    const answered = candidate.events.find(
+      (event) =>
+        event.type === "outcome" &&
+        event.kind === "failed" &&
+        event.failureDigest !== undefined &&
+        event.failureDigest === correction.value.corrects,
+    );
+    const failed =
+      answered?.type === "outcome" ? yield* outcomeStore.get(answered.outcomeId) : Option.none();
+    const reservationId = Option.isSome(failed) ? failed.value.origin.reservationId : undefined;
+    const earlier =
+      reservationId === undefined ? Option.none() : yield* store.getReservation(reservationId);
+    if (Option.isNone(earlier) || earlier.value.origin !== "admitted") {
+      return "its correction answers no failure of this item's own stage";
+    }
+    if (earlier.value.stageBasis?.includes(noEditBasis(requirement)) !== true) {
+      return "it is not the no-edit unit whose failure its correction answers";
+    }
+    if (earlier.value.itemVersion !== candidate.observation.itemVersion) {
+      return "the item changed since the no-edit unit failed";
+    }
+    if (execution === undefined || earlier.value.executionChoice !== execution) {
+      return `it does not run on the execution the no-edit unit failed on (${earlier.value.executionChoice ?? "none named"})`;
+    }
+    return undefined;
+  });
+
   const preparedStale = Effect.fnUntraced(function* (
     configuration: FactoryStore.FactoryConfiguration,
     candidate: Candidate,
@@ -5128,22 +5181,28 @@ const make = Effect.gen(function* () {
     if (decision.noEdit !== undefined) {
       const requirement = decision.noEdit;
       const workspace = decision.workspaceStrategy;
+      const repair =
+        stage.type === "rework"
+          ? yield* noEditRepairProblem(candidate, stage, requirement, decision.execution)
+          : undefined;
       const refused =
-        stage.type !== "implement"
+        stage.type !== "implement" && stage.type !== "rework"
           ? `a no-edit unit was proposed at the item's ${stage.type} stage`
-          : workspace?.type !== "worktree" ||
-              workspace.baseRef !== requirement.candidate ||
-              workspace.startFromOrigin === true
-            ? `the no-edit unit would not start exactly at its candidate ${requirement.candidate}`
-            : requirement.execution !== undefined &&
-                requirement.execution !== null &&
-                requirement.execution !== decision.execution
-              ? `the no-edit unit names execution ${requirement.execution}, not the one admitted`
-              : (requirement.itemKey !== undefined && requirement.itemKey !== itemKey) ||
-                  (requirement.itemVersion !== undefined &&
-                    requirement.itemVersion !== candidate.observation.itemVersion)
-                ? "the no-edit unit is bound to another item or item version"
-                : undefined;
+          : repair !== undefined
+            ? `a no-edit unit was proposed at the item's rework stage, but ${repair}`
+            : workspace?.type !== "worktree" ||
+                workspace.baseRef !== requirement.candidate ||
+                workspace.startFromOrigin === true
+              ? `the no-edit unit would not start exactly at its candidate ${requirement.candidate}`
+              : requirement.execution !== undefined &&
+                  requirement.execution !== null &&
+                  requirement.execution !== decision.execution
+                ? `the no-edit unit names execution ${requirement.execution}, not the one admitted`
+                : (requirement.itemKey !== undefined && requirement.itemKey !== itemKey) ||
+                    (requirement.itemVersion !== undefined &&
+                      requirement.itemVersion !== candidate.observation.itemVersion)
+                  ? "the no-edit unit is bound to another item or item version"
+                  : undefined;
       if (refused !== undefined) {
         return {
           disposition: "nothing_proposed",
@@ -5152,7 +5211,7 @@ const make = Effect.gen(function* () {
             what: refused,
             actor: "project policy",
             action:
-              "admit the no-edit unit at its candidate, at its first build, with its execution",
+              "admit the no-edit unit at its candidate with its execution, at its first build or at the rework of an execution_binding_repair of its own failure",
             consequence: "the no-edit unit does not start",
             resume: "an admission that matches its adopted requirement",
           }),
