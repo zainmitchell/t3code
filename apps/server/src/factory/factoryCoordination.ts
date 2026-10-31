@@ -47,10 +47,17 @@ export const landingOrigin = (
     return undefined;
   }
   const { intent, receipt } = operation;
+  // A pull request integration whose base already holds the reviewed head records that head as a
+  // git landing made outside it (`reviewedHeadInBase`), with no pull request merged.
+  const alreadyInBase =
+    intent.kind === "pull_request_merge" &&
+    receipt.kind === "git_integrate" &&
+    receipt.attribution === "external" &&
+    receipt.commit === intent.reviewedHead;
   if (
     (intent.kind !== "git_integrate" && intent.kind !== "pull_request_merge") ||
     (receipt.kind !== "git_integrate" && receipt.kind !== "pull_request_merge") ||
-    receipt.kind !== intent.kind ||
+    (receipt.kind !== intent.kind && !alreadyInBase) ||
     receipt.commit !== integration.mergeCommit ||
     receipt.tree !== integration.tree ||
     receipt.branch !== integration.targetBranch ||

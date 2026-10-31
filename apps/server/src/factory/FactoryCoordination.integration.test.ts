@@ -114,8 +114,57 @@ const integrationOperation = (
     });
   });
 
+/**
+ * A pull request integration whose base already held the reviewed head, as its readback records
+ * it: a git landing of the head itself, made outside the operation.
+ */
+const alreadyInBaseOperation = (
+  operationId: string,
+  itemKey: FactoryItemKey,
+  receipt: Partial<{ commit: string; attribution: "operation" | "external" }> = {},
+) =>
+  Effect.gen(function* () {
+    const operations = yield* FactoryOperationStore.FactoryOperationStore;
+    yield* operations.intend({
+      operationId,
+      factoryId,
+      itemKey,
+      intent: {
+        kind: "pull_request_merge",
+        projectId: ProjectId.make("project-btc"),
+        repository,
+        remote: "origin",
+        base: "main",
+        head: `t3-factory/btc/${operationId}`,
+        reviewedHead: head,
+        method: "merge",
+        marker: `T3-Factory-Operation: ${operationId}`,
+        title: "Integrate",
+        body: "Integrate",
+      },
+    });
+    yield* operations.complete({
+      operationId,
+      completion: {
+        state: "applied",
+        receipt: {
+          kind: "git_integrate",
+          branch: "main",
+          commit: receipt.commit ?? head,
+          parents: [base],
+          tree,
+          attribution: receipt.attribution ?? "external",
+        },
+      },
+    });
+  });
+
 /** A correction child that was built, independently reviewed and landed by `operationId`. */
-const landedChild = (issueNumber: number, operationId: string) =>
+const landedChild = (
+  issueNumber: number,
+  operationId: string,
+  landed: NonNullable<Report["integration"]> = { ...integration, attribution: "operation" },
+) =>
   Effect.gen(function* () {
     const child = keyOf(issueNumber);
     yield* verified(`${issueNumber}-implement`, child, "implement", {
@@ -132,11 +181,7 @@ const landedChild = (issueNumber: number, operationId: string) =>
       `native:${operationId}`,
       child,
       "integrate",
-      {
-        outcome: "integrated",
-        summary: "Landed.",
-        integration: { ...integration, attribution: "operation" },
-      },
+      { outcome: "integrated", summary: "Landed.", integration: landed },
       { type: "native", operationId },
     );
     return child;
@@ -204,14 +249,44 @@ it.effect(
         subject: { repository, headCommit: head },
         summary: "Reviewed.",
       });
+      // A pull request integration whose base already held the reviewed head lands it as is.
+      const inBase = {
+        targetBranch: "main",
+        mergeCommit: head,
+        parents: [base],
+        tree,
+        attribution: "external" as const,
+      };
+      yield* landedChild(151, "integrate:151", inBase);
+      yield* alreadyInBaseOperation("integrate:151", keyOf(151));
+      // Its report claims another tree than the readback recorded.
+      yield* landedChild(152, "integrate:152", { ...inBase, tree: `${tree.slice(0, -3)}999` });
+      yield* alreadyInBaseOperation("integrate:152", keyOf(152));
+      // A git landing attributed to the operation is no pull request's readback of its base.
+      yield* landedChild(153, "integrate:153", { ...inBase, attribution: "operation" });
+      yield* alreadyInBaseOperation("integrate:153", keyOf(153), { attribution: "operation" });
+      // A landed commit other than the reviewed head is no readback of that head in the base.
+      yield* landedChild(154, "integrate:154", { ...inBase, mergeCommit: merge });
+      yield* alreadyInBaseOperation("integrate:154", keyOf(154), { commit: merge });
 
       const facts = yield* FactoryLifecycle.policyBlockers(yield* reads, {
         factoryId,
         repository,
-        issue: blockedBy([145, 146, 147, 148, 149, 150]),
+        issue: blockedBy([145, 146, 147, 148, 149, 150, 151, 152, 153, 154]),
         read: new Map(),
       });
-      assert.deepStrictEqual(originsOf(facts), [["integrate:145"], [], [], [], [], []]);
+      assert.deepStrictEqual(originsOf(facts), [
+        ["integrate:145"],
+        [],
+        [],
+        [],
+        [],
+        [],
+        ["integrate:151"],
+        [],
+        [],
+        [],
+      ]);
 
       // The owner rejects the review the landing rests on: it no longer carries an origin.
       const outcomes = yield* FactoryOutcomeStore.FactoryOutcomeStore;
