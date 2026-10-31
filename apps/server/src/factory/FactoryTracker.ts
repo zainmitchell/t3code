@@ -55,6 +55,10 @@ const finalResponse = (cause: unknown) =>
  * the number is a pull request, GitHub answers not found (as it also does for a repository the
  * account cannot see) or refuses the account, or gives one of the final answers above.
  */
+/** Whether a body the tracker stored is the one sent: it may store CRLF line endings as LF. */
+export const sameTrackerBody = (stored: string, sent: string) =>
+  stored.replaceAll("\r\n", "\n") === sent.replaceAll("\r\n", "\n");
+
 export const unavailableIssue = (
   error: FactoryTrackerError,
 ): "not_an_issue" | "unreadable" | "forbidden" | "gone" | undefined =>
@@ -818,7 +822,7 @@ const make = Effect.gen(function* () {
                     String(issue.user.id) === identity.accountId &&
                     (issue.body ?? "").includes(input.marker) &&
                     issue.title === input.title &&
-                    (issue.body ?? "") === input.body,
+                    sameTrackerBody(issue.body ?? "", input.body),
                 );
                 if (found !== undefined) return Option.some(toCreatedIssue(found));
                 if (decoded.length < 100) return Option.none<CreatedIssue>();

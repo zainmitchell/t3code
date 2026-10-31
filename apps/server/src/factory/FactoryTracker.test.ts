@@ -179,6 +179,31 @@ it.effect(
         Option.map(found, (issue) => issue.number),
         Option.some(1),
       );
+      // GitHub may store a sent body's CRLF line endings as LF; no other difference is its own.
+      const sent = body.replaceAll("\n", "\r\n");
+      const rows: ReadonlyArray<readonly [string, Option.Option<number>]> = [
+        [body, Option.some(1)],
+        [`${body} `, Option.none()],
+        [body.replaceAll("\n", "\r"), Option.none()],
+      ];
+      for (const [stored, expected] of rows) {
+        const read = yield* withSession(
+          () => Effect.succeed([{ id: 11, number: 1, title, body: stored, user: { id: 9001 } }]),
+          (session) =>
+            session.findIssueByMarker({
+              repository: "acme/web",
+              marker,
+              title,
+              body: sent,
+              since: "2026-10-30T00:00:00.000Z",
+            }),
+        );
+        assert.deepStrictEqual(
+          Option.map(read, (issue) => issue.number),
+          expected,
+          JSON.stringify(stored),
+        );
+      }
     }),
 );
 

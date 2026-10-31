@@ -125,9 +125,8 @@ const make = Effect.gen(function* () {
     const issue = yield* session.readIssue(target);
     const ours = (comment: { readonly body: string; readonly authorId: string }) =>
       comment.body.includes(target.marker) && comment.authorId === session.account.accountId;
-    const lines = (text: string) => text.replaceAll("\r\n", "\n");
     const existing = issue.comments.find(
-      (comment) => ours(comment) && lines(comment.body) === lines(target.body),
+      (comment) => ours(comment) && FactoryTracker.sameTrackerBody(comment.body, target.body),
     );
     if (existing !== undefined) {
       return { commentId: existing.id, bodyDigest: sha256(existing.body), issue } as const;
