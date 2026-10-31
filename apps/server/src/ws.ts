@@ -2705,6 +2705,7 @@ export const layerWsRpc = (
             return { keybindings: keybindingsConfig, issues: [] };
           }),
         [WS_METHODS.serverRunStorageCleanup]: () => storageCleanup.runNow,
+        [WS_METHODS.serverPreviewStorageCleanup]: () => storageCleanup.preview,
         [WS_METHODS.serverGetStorageCleanupReport]: () => storageCleanup.reports,
         [WS_METHODS.serverGetDatabaseStorage]: () => databaseStorage.status,
         [WS_METHODS.peerLinksList]: (_input) =>

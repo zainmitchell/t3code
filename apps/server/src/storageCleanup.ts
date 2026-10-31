@@ -74,6 +74,7 @@ const ORPHAN_WORKTREE_GRACE_MS = 60 * 60 * 1_000;
 
 const sentence = (text: string) => text.charAt(0).toUpperCase() + text.slice(1);
 const REPORT_ENTRY_LIMIT = 200;
+const WOULD_REMOVE = "Would remove";
 const isGitCommandError = Schema.is(GitCommandError);
 
 function cleanupFailureReason(error: { readonly message: string }) {
@@ -198,6 +199,8 @@ export class StorageCleanup extends Context.Service<
   StorageCleanup,
   {
     readonly runNow: Effect.Effect<StorageCleanupReport, ServerSettingsError>;
+    /** Report-only sweep: same guards, deletes nothing, does not replace the latest real report. */
+    readonly preview: Effect.Effect<StorageCleanupReport, ServerSettingsError>;
     readonly latestReport: Effect.Effect<StorageCleanupReport | null>;
     readonly reports: Stream.Stream<StorageCleanupReport | null>;
     readonly drain: Effect.Effect<void>;
@@ -704,8 +707,8 @@ const make = Effect.gen(function* () {
     serverSettings: ServerSettings,
     now: number,
     entries: StorageCleanupReportEntry[],
+    dryRun = false,
   ) {
-    if (!anyWorktreePolicy(serverSettings, worktreeCleanupEnabled)) return;
     const roots: Array<string> = [];
     for (const directory of managedWorktreesDirectories(
       serverSettings,
@@ -718,6 +721,15 @@ const make = Effect.gen(function* () {
         Effect.orElseSucceed(() => null),
       );
       if (root !== null && !isFilesystemRoot(root, path)) roots.push(root);
+    }
+    // Orphans stay visible even when every removal rule is off.
+    if (!anyWorktreePolicy(serverSettings, worktreeCleanupEnabled)) {
+      yield* reportOrphanWorktrees(
+        roots,
+        yield* projectStore.list({ includeDeleted: true }),
+        entries,
+      );
+      return;
     }
     const deletedRows = yield* sql<{ payload_json: string; workspaceRoot: string }>`
           SELECT t.payload_json, p.workspace_root AS "workspaceRoot"
@@ -1006,13 +1018,22 @@ const make = Effect.gen(function* () {
         )
           return keep("settings changed since check");
         // Clean only untracked files. Ordinary worktrees retain Git's final tracked-edit check.
-        if (settings.worktreeKeepWhen === "tracked-changes")
+        if (!dryRun && settings.worktreeKeepWhen === "tracked-changes")
           yield* cleanupGit(worktreePath, ["clean", "-ffdx"], "git clean");
         const submodules = yield* submoduleRemoval(worktreePath, settings);
         if (submodules.reason !== null) return keep(submodules.reason);
         if (submodules.force) {
           const changes = yield* localChangesReason(worktreePath, settings);
           if (changes !== null) return keep(changes);
+        }
+        if (dryRun) {
+          entries.push({
+            ...entry,
+            outcome: "kept",
+            reason: `${WOULD_REMOVE}: ${sentence(removalReason)}`,
+            bytes,
+          });
+          return;
         }
         yield* removeLinkedWorktree({
           operation: "StorageCleanup.cleanupGit",
@@ -1057,6 +1078,7 @@ const make = Effect.gen(function* () {
     now: number,
     rotatedLogs: boolean,
     removed: { files: number; bytes: number },
+    dryRun = false,
   ) {
     if (days === null || !(yield* fs.exists(root))) return removed;
     const realRoot = yield* fs.realPath(root);
@@ -1076,7 +1098,7 @@ const make = Effect.gen(function* () {
             const current = (yield* settingsService.getSettings).storageCleanup;
             if ((rotatedLogs ? current.logsAfterDays : current.browserArtifactsAfterDays) !== days)
               return;
-            yield* fs.remove(target);
+            if (!dryRun) yield* fs.remove(target);
             removed.files++;
             removed.bytes += Number(stat.size);
           }
@@ -1090,12 +1112,13 @@ const make = Effect.gen(function* () {
   const reportRef = yield* SubscriptionRef.make<StorageCleanupReport | null>(null);
   const sweep = Effect.fn("StorageCleanup.sweep")(function* (
     trigger: StorageCleanupReport["trigger"],
+    dryRun = false,
   ) {
     const now = yield* Clock.currentTimeMillis;
     const serverSettings = yield* settingsService.getSettings;
     const settings = serverSettings.storageCleanup;
     const entries: StorageCleanupReportEntry[] = [];
-    yield* cleanWorktrees(serverSettings, now, entries).pipe(
+    yield* cleanWorktrees(serverSettings, now, entries, dryRun).pipe(
       Effect.catch((error) =>
         Effect.gen(function* () {
           entries.push({
@@ -1129,12 +1152,24 @@ const make = Effect.gen(function* () {
     ]) {
       if (category.days === null) continue;
       const removed = { files: 0, bytes: 0 };
-      yield* cleanFiles(category.root, category.days, now, category.kind === "logs", removed).pipe(
+      yield* cleanFiles(
+        category.root,
+        category.days,
+        now,
+        category.kind === "logs",
+        removed,
+        dryRun,
+      ).pipe(
         Effect.map(({ files, bytes }) =>
           entries.push({
             kind: category.kind,
-            outcome: files > 0 ? "removed" : "kept",
-            reason: files === 0 ? "No expired files" : `Removed ${files} ${category.label}`,
+            outcome: files > 0 && !dryRun ? "removed" : "kept",
+            reason:
+              files === 0
+                ? "No expired files"
+                : dryRun
+                  ? `${WOULD_REMOVE} ${files} ${category.label}`
+                  : `Removed ${files} ${category.label}`,
             path: null,
             projectPath: null,
             threadId: null,
@@ -1167,10 +1202,11 @@ const make = Effect.gen(function* () {
       counts[entry.outcome]++;
       if (entry.outcome !== "kept") bytesFreed += entry.bytes ?? 0;
     }
+    // A preview's would-be removals sort with removals, so the entry limit never hides them.
     const priority = (entry: StorageCleanupReportEntry) =>
       entry.outcome === "failed"
         ? 0
-        : entry.outcome === "removed"
+        : entry.outcome === "removed" || (dryRun && entry.reason.startsWith(WOULD_REMOVE))
           ? 1
           : entry.kind === "worktree" && entry.threadId === null
             ? 2
@@ -1184,35 +1220,46 @@ const make = Effect.gen(function* () {
       bytesFreed,
       omittedCount: Math.max(0, entries.length - REPORT_ENTRY_LIMIT),
     };
-    yield* SubscriptionRef.set(reportRef, latestReport);
+    // A preview is returned to its caller only; the latest report stays the last real sweep.
+    if (!dryRun) yield* SubscriptionRef.set(reportRef, latestReport);
     return latestReport;
   });
   const automaticSweepQueued = yield* Ref.make(false);
-  const worker = yield* makeDrainableWorker(
-    (completion: Deferred.Deferred<StorageCleanupReport, ServerSettingsError> | undefined) =>
-      (completion === undefined ? Ref.set(automaticSweepQueued, false) : Effect.void).pipe(
-        Effect.andThen(sweep(completion === undefined ? "automatic" : "manual")),
-        Effect.exit,
-        Effect.flatMap((exit) =>
-          completion === undefined
-            ? exit.pipe(
-                Effect.asVoid,
-                Effect.catchCause((cause) =>
-                  Effect.logWarning("storage cleanup failed", { cause }),
-                ),
-              )
-            : Deferred.done(completion, exit).pipe(Effect.asVoid),
+  type SweepRequest =
+    | {
+        readonly completion: Deferred.Deferred<StorageCleanupReport, ServerSettingsError>;
+        readonly dryRun: boolean;
+      }
+    | undefined;
+  const worker = yield* makeDrainableWorker((request: SweepRequest) =>
+    (request === undefined ? Ref.set(automaticSweepQueued, false) : Effect.void).pipe(
+      Effect.andThen(
+        sweep(
+          request === undefined ? "automatic" : request.dryRun ? "preview" : "manual",
+          request?.dryRun ?? false,
         ),
       ),
+      Effect.exit,
+      Effect.flatMap((exit) =>
+        request === undefined
+          ? exit.pipe(
+              Effect.asVoid,
+              Effect.catchCause((cause) => Effect.logWarning("storage cleanup failed", { cause })),
+            )
+          : Deferred.done(request.completion, exit).pipe(Effect.asVoid),
+      ),
+    ),
   );
   const requestSweep = Ref.getAndSet(automaticSweepQueued, true).pipe(
     Effect.flatMap((queued) => (queued ? Effect.void : worker.enqueue(undefined))),
   );
-  const runNow = Effect.gen(function* () {
+  const enqueueSweep = Effect.fn("StorageCleanup.enqueueSweep")(function* (dryRun: boolean) {
     const completion = yield* Deferred.make<StorageCleanupReport, ServerSettingsError>();
-    yield* worker.enqueue(completion);
+    yield* worker.enqueue({ completion, dryRun });
     return yield* Deferred.await(completion);
   });
+  const runNow = enqueueSweep(false);
+  const preview = enqueueSweep(true);
 
   const start = Effect.fn("StorageCleanup.start")(function* () {
     const unsubscribe = yield* terminals.subscribeMetadata((event) =>
@@ -1270,6 +1317,7 @@ const make = Effect.gen(function* () {
   yield* start();
   return StorageCleanup.of({
     runNow,
+    preview,
     latestReport: SubscriptionRef.get(reportRef),
     reports: SubscriptionRef.changes(reportRef),
     drain: worker.drain,

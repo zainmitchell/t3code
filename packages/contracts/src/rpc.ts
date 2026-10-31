@@ -528,6 +528,7 @@ export const WS_METHODS = {
   serverUpsertKeybinding: "server.upsertKeybinding",
   serverRemoveKeybinding: "server.removeKeybinding",
   serverRunStorageCleanup: "server.runStorageCleanup",
+  serverPreviewStorageCleanup: "server.previewStorageCleanup",
   serverGetStorageCleanupReport: "server.getStorageCleanupReport",
   serverGetDatabaseStorage: "server.getDatabaseStorage",
   peerLinksList: "peerLinks.list",
@@ -806,6 +807,11 @@ const WsServerCommitDesktopUpdateRpc = Rpc.make(WS_METHODS.serverCommitDesktopUp
 });
 
 const WsServerRunStorageCleanupRpc = Rpc.make(WS_METHODS.serverRunStorageCleanup, {
+  payload: Schema.Struct({}),
+  success: StorageCleanupReport,
+  error: Schema.Union([ServerSettingsError, EnvironmentAuthorizationError]),
+});
+const WsServerPreviewStorageCleanupRpc = Rpc.make(WS_METHODS.serverPreviewStorageCleanup, {
   payload: Schema.Struct({}),
   success: StorageCleanupReport,
   error: Schema.Union([ServerSettingsError, EnvironmentAuthorizationError]),
@@ -2095,6 +2101,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerUpsertKeybindingRpc,
   WsServerRemoveKeybindingRpc,
   WsServerRunStorageCleanupRpc,
+  WsServerPreviewStorageCleanupRpc,
   WsServerGetStorageCleanupReportRpc,
   WsServerGetDatabaseStorageRpc,
   WsServerUpdateSettingsRpc,

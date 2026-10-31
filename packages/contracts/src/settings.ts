@@ -1117,7 +1117,7 @@ export const StorageCleanupReportEntry = Schema.Struct({
 });
 export type StorageCleanupReportEntry = typeof StorageCleanupReportEntry.Type;
 export const StorageCleanupReport = Schema.Struct({
-  trigger: Schema.Literals(["automatic", "manual"]),
+  trigger: Schema.Literals(["automatic", "manual", "preview"]),
   startedAt: Schema.String,
   finishedAt: Schema.String,
   entries: Schema.Array(StorageCleanupReportEntry),
