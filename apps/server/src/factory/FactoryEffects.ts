@@ -108,7 +108,11 @@ const make = Effect.gen(function* () {
   const wakes = yield* FactoryWakes;
   const outbox = yield* EffectOutbox.EffectOutboxV2;
 
-  /** Our record on the issue, by its marker and our own account, written if it is not there. */
+  /**
+   * Our record on the issue, written if it is not there. Only a comment of our own account that
+   * says exactly what the record says is adopted: one that merely carries the marker may be a
+   * worker's, or another record quoting it.
+   */
   const ensureComment = Effect.fnUntraced(function* (
     session: FactoryTracker.TrackerSession,
     target: {
@@ -121,7 +125,9 @@ const make = Effect.gen(function* () {
     const issue = yield* session.readIssue(target);
     const ours = (comment: { readonly body: string; readonly authorId: string }) =>
       comment.body.includes(target.marker) && comment.authorId === session.account.accountId;
-    const existing = issue.comments.find(ours);
+    const existing = issue.comments.find(
+      (comment) => ours(comment) && comment.body === target.body,
+    );
     if (existing !== undefined) {
       return { commentId: existing.id, bodyDigest: sha256(existing.body), issue } as const;
     }
@@ -138,6 +144,7 @@ const make = Effect.gen(function* () {
       repository: target.repository,
       commentId: written.commentId,
     });
+    // Ours by the id our own create returned, so a body stored differently sends no second one.
     return Option.isSome(readBack) && ours(readBack.value)
       ? ({ commentId: written.commentId, bodyDigest: sha256(readBack.value.body), issue } as const)
       : undefined;

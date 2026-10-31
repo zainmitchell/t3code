@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off - a disposable bare remote built with the git CLI.
 import * as NodeChildProcess from "node:child_process";
+import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
@@ -85,6 +86,12 @@ class Hub extends Context.Service<
       { readonly body: string; parent: number | null; readonly blockedBy: Array<number> }
     >;
     readonly relationWrites: Array<string>;
+    readonly comments: Array<{
+      readonly id: number;
+      readonly issueNumber: number;
+      readonly body: string;
+      readonly authorId: string;
+    }>;
     faults: {
       loseCreateAnswer?: boolean;
       /** A validation refusal of a create nothing was sent for before. */
@@ -178,6 +185,7 @@ const layerHub = Layer.effect(
         writes: [],
         issues: new Map(),
         relationWrites: [],
+        comments: [],
         faults: {},
         markerSearch: undefined,
         markerSearches: 0,
@@ -387,7 +395,7 @@ const layerTracker = Layer.effect(
             body: issue?.body ?? "",
             state: "open" as const,
             labels: [],
-            comments: [],
+            comments: hub.comments.filter((comment) => comment.issueNumber === issueNumber),
             author: { id: "9001", login: "t3-factory" },
             parent: parent === null ? null : { repository, number: parent },
             blockedBy: (issue?.blockedBy ?? []).map((number) => ({
@@ -415,6 +423,18 @@ const layerTracker = Layer.effect(
           blocked.blockedBy.push(issueId / 10);
           return { type: "written" };
         }),
+      // Comments: what a record's find-before-write reads and its create writes.
+      createComment: ({ issueNumber, body }) =>
+        Effect.sync((): FactoryTracker.CreateCommentOutcome => {
+          hub.writes.push("create comment");
+          const id = 300 + hub.comments.length;
+          hub.comments.push({ id, issueNumber, body, authorId: "9001" });
+          return { type: "written", commentId: id };
+        }),
+      readComment: ({ commentId }) =>
+        Effect.sync(() =>
+          Option.fromNullishOr(hub.comments.find((comment) => comment.id === commentId)),
+        ),
     };
     return FactoryTracker.FactoryTracker.of({
       withSession: (_input, use) => use(session as FactoryTracker.TrackerSession),
@@ -1054,5 +1074,66 @@ it.live(
       });
       assert.strictEqual(createsSent(hub), 2);
       assert.strictEqual(hub.pulls.length, 1);
+    }).pipe(Effect.provide(layerTest)),
+);
+
+const intendReport = (outcomeId: string, body: string) =>
+  Effect.flatMap(FactoryOperationStore.FactoryOperationStore, (operations) =>
+    operations.intend({
+      operationId: `report:${outcomeId}`,
+      factoryId,
+      itemKey,
+      intent: {
+        kind: "tracker_comment",
+        repository,
+        issueNumber: 142,
+        purpose: "report",
+        ref: outcomeId,
+        marker: `<!-- t3-factory-report:${outcomeId} -->`,
+        body,
+      },
+    }),
+  );
+
+it.live(
+  "a comment of the factory's account is adopted as a record only when it says exactly what the record says",
+  () =>
+    Effect.gen(function* () {
+      const hub = yield* Hub;
+      yield* configure;
+      const marker = "<!-- t3-factory-report:outcome-1 -->";
+      const body = `${marker}\n\nFactory implement outcome: implemented.\n\nreport sha256: aaaa`;
+      // Another record quoting this marker, or a worker posting it first, says something else.
+      hub.comments.push({
+        id: 1,
+        issueNumber: 142,
+        body: `${marker}\n\nFactory implement outcome: implemented.\n\nAll checks passed.`,
+        authorId: "9001",
+      });
+      yield* intendReport("outcome-1", body);
+      yield* apply("report:outcome-1");
+      const written = yield* recordOf("report:outcome-1");
+      assert.strictEqual(written.state, "applied");
+      const receipt = written.state === "applied" ? written.receipt : undefined;
+      assert.ok(receipt !== undefined && "commentId" in receipt);
+      assert.notStrictEqual(receipt.commentId, 1);
+      assert.strictEqual(
+        hub.comments.find((comment) => comment.id === receipt.commentId)?.body,
+        body,
+      );
+      assert.deepStrictEqual(hub.writes, ["create comment"]);
+
+      // A record that landed before its answer was lost is found again by its exact text.
+      const again = `${marker.replace("outcome-1", "outcome-2")}\n\nFactory review outcome: approved.`;
+      hub.comments.push({ id: 2, issueNumber: 142, body: again, authorId: "9001" });
+      yield* intendReport("outcome-2", again);
+      yield* apply("report:outcome-2");
+      const adopted = yield* recordOf("report:outcome-2");
+      assert.deepStrictEqual(adopted.state === "applied" ? adopted.receipt : adopted, {
+        kind: "tracker_comment",
+        commentId: 2,
+        bodyDigest: NodeCrypto.createHash("sha256").update(again).digest("hex"),
+      });
+      assert.deepStrictEqual(hub.writes, ["create comment"]);
     }).pipe(Effect.provide(layerTest)),
 );
