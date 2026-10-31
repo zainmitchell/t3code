@@ -328,10 +328,12 @@ const snapshotInstanceKey = (provider: ServerProvider): ProviderInstanceId => {
 
 /**
  * Drivers whose caches and one-probe fallback `invalidateCaches` and a forced refresh are known
- * to clear, so their reported account can be had fresh. Others report what they cached.
+ * to clear, so their reported account can be had fresh. Others report what they cached. An
+ * instance of a listed driver without `invalidateCaches` (a managed Codex login) is not observed.
  */
 const FRESH_OBSERVATION: ReadonlySet<ProviderDriverKind> = new Set([
   ProviderDriverKind.make("claudeAgent"),
+  ProviderDriverKind.make("codex"),
 ]);
 
 // Rebuilt instances have new PubSubs; capture their fresh closures instead of a closed source.
