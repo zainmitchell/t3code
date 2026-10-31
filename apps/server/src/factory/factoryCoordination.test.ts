@@ -612,3 +612,282 @@ describe("parent criteria preparation", () => {
     );
   });
 });
+
+// A current-body Root route's shape (BTC #18, #31): adopted clauses record their list item as
+// `source.text` and may anchor acceptance on a heading of the parent's own.
+describe("parent criteria on a current-body Root route", () => {
+  const sha = (text: string) => NodeCrypto.createHash("sha256").update(text).digest("hex");
+  const c1 =
+    "Identify the exact intended accessible target and safe metadata without private-body access.";
+  const c2 =
+    "Complete authorized path/reparse/compatibility checks for the exact release candidate.";
+  const routed = (
+    id: string,
+    text: string,
+    anchor: string,
+    change: Record<string, unknown> = {},
+  ): Record<string, unknown> => ({
+    id,
+    required: true,
+    source: {
+      kind: "github_issue",
+      ref: `https://github.com/${repository}/issues/18#${anchor}`,
+      text,
+    },
+    state: "open",
+    evidence: [],
+    ...change,
+  });
+  const route = (clauses: ReadonlyArray<Record<string, unknown>>) => ({
+    schema: "factory-parent-criteria/1",
+    issue: 18,
+    version: "route-1",
+    bodySha256: "0".repeat(64),
+    clauses,
+  });
+  const proposalFor = (
+    body: string,
+    ids: ReadonlyArray<string>,
+    anchors?: ReadonlySet<string>,
+  ): FactoryCriteriaProposal => ({
+    schema: "factory-parent-criteria-proposal/1",
+    issue: 18,
+    basis: { bodySha256: sha(body), itemVersion: "v18" },
+    clauses: parentAcceptance(body, anchors).items.map((item, at) => ({
+      id: ids[at]!,
+      source: { start: item.start, end: item.end, sha256: item.sha256, excerpt: item.excerpt },
+    })),
+  });
+  const preparedFor = (
+    body: string,
+    clauses: ReadonlyArray<{ readonly id: string } & Record<string, unknown>>,
+    kept: ReadonlyArray<unknown> = [],
+    anchors?: ReadonlySet<string>,
+  ) => ({
+    schema: "factory-parent-criteria/1",
+    issue: 18,
+    version: "auto",
+    bodySha256: sha(body),
+    clauses: [
+      ...parentAcceptance(body, anchors).items.map((item, at) => ({
+        required: true,
+        state: "open",
+        source: {
+          kind: "issue_acceptance",
+          ref: `https://github.com/${repository}/issues/18#${item.anchor}`,
+          start: item.start,
+          end: item.end,
+          sha256: item.sha256,
+          excerpt: item.excerpt,
+        },
+        evidence: [],
+        ...clauses[at],
+      })),
+      ...kept,
+    ],
+  });
+  const problemsOf = (input: {
+    readonly body: string;
+    readonly adopted: unknown;
+    readonly document: unknown;
+    readonly anchors?: ReadonlySet<string>;
+  }) =>
+    preparedCriteriaProblems({
+      document: input.document,
+      issue: 18,
+      repository,
+      body: input.body,
+      comments: [],
+      children: [],
+      adopted: input.adopted,
+      proposal: proposalFor(
+        input.body,
+        parentAcceptance(input.body, input.anchors).items.map((_, at) => `P${at + 1}`),
+        input.anchors,
+      ),
+    });
+  const digestId = (text: string) => `clause-${sha(text).slice(0, 12)}`;
+
+  it("S1: reads acceptance under the headings an adopted required clause names, and no other", () => {
+    const body = `Stage.\n\n## Done when\n- [ ] ${c1}\n- [x] ${c2}\n\n## Boundaries\n- Read-only.\n`;
+    const anchors = new Set(["done-when"]);
+    const adopted = route([
+      routed("C01", `- [ ] ${c1}`, "done-when"),
+      routed("C02", `- [ ] ${c2}`, "done-when"),
+    ]);
+    // A Done when heading is acceptance only where a required adopted clause anchors on it.
+    for (const unnamed of [
+      undefined,
+      route([routed("C01", `- [ ] ${c1}`, "done-when", { required: false })]),
+      route([routed("C01", `- [ ] ${c1}`, "completion-criteria")]),
+      route([
+        {
+          ...routed("C01", `- [ ] ${c1}`, ""),
+          source: { kind: "github_issue", ref: "issue body", text: c1 },
+        },
+      ]),
+    ]) {
+      assert.deepStrictEqual(
+        criteriaProposalProblems({
+          proposal: proposalFor(body, ["C01", "C02"], anchors),
+          issue: 18,
+          body,
+          adopted: unnamed,
+        }),
+        ["the body of #18 states no acceptance list"],
+      );
+    }
+    // Golden: anchors naming a standard heading, or none, read the body as before.
+    const standard = `Stage.\n\n## Completion criteria\n- [ ] ${c1}\n\n## Done when\n- [ ] ${c2}\n`;
+    assert.deepStrictEqual(
+      parentAcceptance(standard, new Set(["completion-criteria"])),
+      parentAcceptance(standard),
+    );
+    const read = parentAcceptance(body, anchors);
+    assert.deepStrictEqual(
+      read.items.map((item) => [item.excerpt, item.checked, item.anchor]),
+      [
+        [c1, false, "done-when"],
+        [c2, true, "done-when"],
+      ],
+    );
+    assert.deepStrictEqual(read.unlisted, []);
+    assert.deepStrictEqual(
+      criteriaProposalProblems({
+        proposal: proposalFor(body, ["C01", "C02"], anchors),
+        issue: 18,
+        body,
+        adopted,
+      }),
+      [],
+    );
+    assert.deepStrictEqual(
+      problemsOf({
+        body,
+        adopted,
+        anchors,
+        document: preparedFor(body, [{ id: "C01" }, { id: "C02" }], [], anchors),
+      }),
+      [],
+    );
+  });
+
+  it("S2: an adopted clause recorded as its list item keeps its id, state, evidence, hold and unit", () => {
+    const body = `Stage.\n\n## Completion criteria\n- [ ] ${c1}\n- [ ] ${c2}\n`;
+    // Golden: a clause adopted by its excerpt matches as before.
+    const byExcerpt = route([
+      { ...routed("C01", "", "completion-criteria"), source: { kind: "k", ref: "r", excerpt: c1 } },
+    ]);
+    assert.deepStrictEqual(
+      problemsOf({
+        body,
+        adopted: byExcerpt,
+        document: preparedFor(body, [{ id: "C01" }, { id: digestId(c2) }]),
+      }),
+      [],
+    );
+    // No match on other text or on a blank item, and one adopted clause never takes two items.
+    const blank = `Stage.\n\n## Completion criteria\n- [ ] \n- [ ] ${c1}\n- [ ] ${c1}\n`;
+    const once = route([
+      routed("W", "- [ ]   ", "completion-criteria"),
+      routed("C01", `- [ ] ${c1}`, "completion-criteria"),
+      routed("C09", "- [ ] another target", "completion-criteria"),
+    ]);
+    assert.include(
+      problemsOf({
+        body: blank,
+        adopted: once,
+        document: preparedFor(blank, [{ id: "W" }, { id: "C01" }, { id: digestId(c1) }]),
+      }).join(),
+      `clause 1 is not ${digestId("")}`,
+    );
+    assert.deepStrictEqual(
+      problemsOf({
+        body: blank,
+        adopted: once,
+        document: preparedFor(blank, [{ id: digestId("") }, { id: "C01" }, { id: digestId(c1) }]),
+      }),
+      [],
+    );
+    // Marker, checkbox and spacing variants of the recorded item all name it.
+    const hold = { actor: "owner", action: "settle the target", resume: "the owner answers" };
+    const unit = { title: "Check the candidate", contract: "Run the checks.", paths: ["a.ts"] };
+    const evidence = [{ itemKey: `github:${repository}#48`, scope: "target binding" }];
+    const adopted = route([
+      routed("C01", `* [X]  ${c1}  `, "completion-criteria", { evidence }),
+      routed("C02", `2. ${c2}`, "completion-criteria", { state: "reserved", reserved: hold, unit }),
+    ]);
+    assert.deepStrictEqual(
+      problemsOf({
+        body,
+        adopted,
+        document: preparedFor(body, [
+          { id: "C01", evidence },
+          { id: "C02", state: "reserved", reserved: hold, unit },
+        ]),
+      }),
+      [],
+    );
+  });
+
+  it("S3: an unmatched optional adopted clause stays byte-exact in adopted order", () => {
+    const body = `Stage.\n\n## Completion criteria\n- [ ] ${c1}\n`;
+    const byExcerpt = {
+      ...routed("C01", "", "completion-criteria"),
+      source: { kind: "k", ref: "r", excerpt: c1 },
+    };
+    const hold = {
+      id: "whole-parent",
+      required: true,
+      source: { kind: "owner_decision", ref: "q" },
+      state: "reserved",
+      reserved: { actor: "owner", action: "approve", resume: "approved" },
+    };
+    const revisedOption = routed("RETAIN-9", "- [x] Superseded replay.", "retained", {
+      required: false,
+      state: "revised",
+      revision: "dropped",
+    });
+    // Golden: holds are kept and a revised option is dropped, as before.
+    assert.deepStrictEqual(
+      problemsOf({
+        body,
+        adopted: route([byExcerpt, revisedOption, hold]),
+        document: preparedFor(body, [{ id: "C01" }], [hold]),
+      }),
+      [],
+    );
+    const retained = routed("RETAIN-136", "- [x] Retained replay output only.", "retained", {
+      required: false,
+      evidence: [{ itemKey: `github:${repository}#136`, scope: "replay output only" }],
+    });
+    const adopted = route([byExcerpt, retained, revisedOption, hold]);
+    const rows: ReadonlyArray<readonly [ReadonlyArray<unknown>, ReadonlyArray<string>]> = [
+      [[retained, hold], []],
+      [
+        [hold],
+        [
+          "the prepared document has 2 clauses; 1 acceptance items, 1 kept holds and 1 kept optional clauses need 3",
+        ],
+      ],
+      // Preparation never adds to it: only its own adopted evidence can prove it.
+      [
+        [{ ...retained, evidence: [{ itemKey: `github:${repository}#18`, scope: c1 }] }, hold],
+        ["the adopted optional clause RETAIN-136 is not kept as adopted"],
+      ],
+      [
+        [hold, retained],
+        [
+          "the adopted optional clause RETAIN-136 is not kept as adopted",
+          "the adopted hold whole-parent is not kept as adopted",
+        ],
+      ],
+    ];
+    for (const [kept, expected] of rows) {
+      assert.deepStrictEqual(
+        problemsOf({ body, adopted, document: preparedFor(body, [{ id: "C01" }], kept) }),
+        expected,
+      );
+    }
+  });
+});

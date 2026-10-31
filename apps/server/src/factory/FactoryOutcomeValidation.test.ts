@@ -170,6 +170,7 @@ const makeFixture = (
     readonly configuration?: FactoryStore.FactoryConfiguration;
     readonly verifyEvidence?: FactoryOutcomeDependencies["verifyEvidence"];
     readonly readArtifact?: FactoryOutcomeDependencies["readArtifact"];
+    readonly adoptedCriteria?: FactoryOutcomeDependencies["adoptedCriteria"];
   } = {},
 ) =>
   Effect.gen(function* () {
@@ -212,6 +213,7 @@ const makeFixture = (
       settleThread: () => Effect.void,
       verifyEvidence: options.verifyEvidence ?? (() => Effect.undefined),
       readArtifact: options.readArtifact ?? (() => Effect.undefined),
+      adoptedCriteria: options.adoptedCriteria ?? (() => Effect.undefined),
       onReported: () => Effect.void,
       ensureOperation: () => Effect.die("no tracker claim is configured"),
       getOperation: () => Effect.succeedNone,
@@ -775,6 +777,83 @@ it.effect("verifies a parent's criteria only as exact quotes of the text its tri
         ["verified", [unit, undefined]],
       );
     }).pipe(Effect.provide(layerTest));
+    // Root's adoption may anchor acceptance on the parent's own heading; unread, it defers.
+    const routedBody = "Stage.\n\n## Done when\n- [ ] the target is identified.\n";
+    // Its span read off the body directly (ASCII), not through the reading under test.
+    const routedText = "the target is identified.";
+    const routedItem = {
+      start: routedBody.indexOf(routedText),
+      end: routedBody.indexOf(routedText) + routedText.length,
+      sha256: NodeCrypto.createHash("sha256").update(routedText).digest("hex"),
+      excerpt: routedText,
+    };
+    const route = {
+      schema: "factory-parent-criteria/1",
+      issue: 131,
+      version: "route-1",
+      bodySha256: "0".repeat(64),
+      clauses: [
+        {
+          id: "C01",
+          required: true,
+          source: {
+            kind: "github_issue",
+            ref: "https://github.com/example/connector/issues/131#done-when",
+            text: "- [ ] the target is identified.",
+          },
+          state: "open",
+          evidence: [],
+        },
+      ],
+    };
+    const adoptions: ReadonlyArray<
+      readonly [Effect.Success<ReturnType<FactoryOutcomeDependencies["adoptedCriteria"]>>, string]
+    > = [
+      [undefined, "the body of #131 states no acceptance list"],
+      [{ unread: "the criteria root is unreadable" }, "reported"],
+      [{ document: route }, "verified"],
+    ];
+    for (const [adoption, expected] of adoptions) {
+      yield* Effect.gen(function* () {
+        const fixture = yield* makeFixture(btc131(), {
+          reservation: triage,
+          adoptedCriteria: () => Effect.succeed(adoption),
+        });
+        const sql = yield* SqlClient.SqlClient;
+        const record = yield* encodeItemEvent({
+          type: "admitted",
+          stage: "triage",
+          reservationId,
+          stageBasis: triage.stageBasis!,
+          issueText: { title: "Parent", body: routedBody },
+        });
+        yield* sql`INSERT INTO factory_item_events (factory_id, item_key, record_json)
+          VALUES (${factoryId}, ${triage.itemKey}, ${record})`;
+        const { outcomeId } = yield* fixture.ops.report({
+          threadId,
+          report: {
+            outcome: "criteria_proposed",
+            summary: "One clause under the route's heading.",
+            criteria: {
+              schema: "factory-parent-criteria-proposal/1",
+              issue: 131,
+              basis: {
+                bodySha256: NodeCrypto.createHash("sha256").update(routedBody).digest("hex"),
+                itemVersion: "version:1",
+              },
+              clauses: [{ id: "C01", source: routedItem }],
+            },
+          },
+        });
+        yield* fixture.ops.reconcile(factoryId);
+        const outcome = Option.getOrThrow(yield* fixture.outcomes.get(outcomeId));
+        assert.strictEqual(
+          outcome.state === "rejected" ? outcome.rejection : outcome.state,
+          expected,
+          JSON.stringify(adoption),
+        );
+      }).pipe(Effect.provide(layerTest));
+    }
     // The payload is required with its outcome, and refused with any other.
     yield* Effect.gen(function* () {
       const fixture = yield* makeFixture(btc131(), { reservation: triage });

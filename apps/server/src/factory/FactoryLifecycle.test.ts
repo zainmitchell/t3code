@@ -13398,6 +13398,7 @@ const preparedCriteriaFor = (
   body: string,
   clauses: ReadonlyArray<{ readonly id: string } & Record<string, unknown>>,
   kept: ReadonlyArray<unknown> = [],
+  anchors?: ReadonlySet<string>,
 ) => {
   const document = {
     schema: "factory-parent-criteria/1",
@@ -13405,7 +13406,7 @@ const preparedCriteriaFor = (
     version: "auto-test",
     bodySha256: sha256(body),
     clauses: [
-      ...parentAcceptance(body).items.map((item, at) => ({
+      ...parentAcceptance(body, anchors).items.map((item, at) => ({
         required: true,
         state: "open",
         source: {
@@ -14161,6 +14162,89 @@ it.effect(
             (yield* fs.readDirectory(criteriaRoot)).filter((name) => name.startsWith("parent-")),
             [],
           );
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Parent/P4: a Root route anchoring acceptance on the parent's own heading is verified, triaged once and prepared under its adopted ids",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          yield* configureLifecycleFactory;
+          const criteriaRoot = yield* fs.realPath(yield* fs.makeTempDirectoryScoped());
+          yield* configureFactory(
+            lifecycleConfiguration({ parents: { close: "project", criteriaRoot } }),
+          );
+          const d1 = "Identify the intended target without private-body access.";
+          const d2 = "Check the exact release candidate against it.";
+          const body = `Stage.\n\n## Done when\n- [ ] ${d1}\n- [x] ${d2}\n`;
+          yield* seedIssue(7731, { body });
+          yield* seedIssue(7732, { parentNumber: 7731, body: "Bind the target." });
+          // BTC #18's route shape: each clause records its list item, anchored on Done when.
+          const routeText = JSON.stringify({
+            schema: "factory-parent-criteria/1",
+            issue: 7731,
+            version: "route-1",
+            bodySha256: sha256(body),
+            clauses: [d1, d2].map((text, at) => ({
+              id: `C0${at + 1}`,
+              required: true,
+              source: {
+                kind: "github_issue",
+                ref: `https://github.com/${claimRepository}/issues/7731#done-when`,
+                text: `- [ ] ${text}`,
+              },
+              state: "open",
+              evidence: [],
+            })),
+          });
+          yield* fs.writeFileString(path.join(criteriaRoot, "7731.json"), routeText);
+          const adopted = { root: criteriaRoot, path: "7731.json", sha256: sha256(routeText) };
+          const anchors = new Set(["done-when"]);
+          const state = {
+            ready: new Set([7731]),
+            prepared: undefined as (Prepared & { readonly adopted?: PinnedFile }) | undefined,
+            retriage: false,
+          };
+          yield* usePolicy(preparingPolicy(7731, state));
+          const triage = admittedBy(yield* advance("clock"));
+          assert.deepStrictEqual(stageOf(triage), [itemKeyFor(7731), "triage"]);
+          yield* workStage(triage, {
+            outcome: "criteria_proposed",
+            summary: "Two clauses under the route's Done when heading.",
+            // Spans read off the body directly (ASCII), not through the reading under test.
+            criteria: {
+              schema: "factory-parent-criteria-proposal/1",
+              issue: 7731,
+              basis: { bodySha256: sha256(body), itemVersion: admittedVersion(triage) },
+              clauses: [d1, d2].map((text, at) => ({
+                id: `D${at + 1}`,
+                source: {
+                  start: body.indexOf(text),
+                  end: body.indexOf(text) + text.length,
+                  sha256: sha256(text),
+                  excerpt: text,
+                },
+              })),
+            },
+          });
+          yield* advance("outcome");
+          // Verified on the adopted heading, so a policy asking again on the same text is not paid for.
+          state.retriage = true;
+          assert.deepStrictEqual(admittedOnly(yield* advance("clock")), []);
+          assert.strictEqual((yield* recordOf(7731))?.reasonClass, "prepared");
+          state.retriage = false;
+          state.prepared = {
+            ...preparedCriteriaFor(7731, body, [{ id: "C01" }, { id: "C02" }], [], anchors),
+            adopted,
+          };
+          yield* advance("clock");
+          yield* parentWaitsOn(7731, "clause C01 is missing: no evidence item");
         }),
       ),
     ),

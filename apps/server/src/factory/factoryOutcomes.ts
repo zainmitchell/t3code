@@ -160,6 +160,15 @@ export interface FactoryOutcomeDependencies {
     artifactRoot: string,
     path: string,
   ) => Effect.Effect<{ readonly text: string; readonly sha256: string } | undefined>;
+  /**
+   * Root's one adopted criteria document for a parent under the factory's criteria root; none
+   * without a root or with no single adoption. `unread` when the root cannot be read now.
+   */
+  readonly adoptedCriteria: (input: {
+    readonly configuration: FactoryStore.FactoryConfiguration;
+    readonly itemKey: FactoryStore.FactoryReservation["itemKey"];
+    readonly issue: number;
+  }) => Effect.Effect<{ readonly document: unknown } | { readonly unread: string } | undefined>;
   /** Asks for the pass that verifies a new report; a lost request leaves it for the next pass. */
   readonly onReported: (item: {
     readonly factoryId: FactoryId;
@@ -433,7 +442,21 @@ export const makeFactoryOutcomes = (deps: FactoryOutcomeDependencies) => {
         if (text === undefined || issue === undefined) {
           return { rejected: "T3 kept no text of the issue this triage read" } as const;
         }
-        const problems = criteriaProposalProblems({ proposal: criteria, issue, body: text.body });
+        const adoption = yield* deps.adoptedCriteria({
+          configuration,
+          itemKey: outcome.itemKey,
+          issue,
+        });
+        // Unread now is not an answer: the report stays reported for a later pass.
+        if (adoption !== undefined && "unread" in adoption) {
+          return yield* reportFailure("unavailable", adoption.unread);
+        }
+        const problems = criteriaProposalProblems({
+          proposal: criteria,
+          issue,
+          body: text.body,
+          adopted: adoption?.document,
+        });
         return problems.length === 0
           ? ({ accepted: true } as const)
           : ({ rejected: problems.slice(0, 5).join("; ").slice(0, 2_000) } as const);

@@ -2464,6 +2464,18 @@ const make = Effect.gen(function* () {
         ? undefined
         : { text: new TextDecoder().decode(bytes.value), sha256: sha256(bytes.value) };
     }),
+    adoptedCriteria: Effect.fnUntraced(function* ({ configuration, itemKey, issue }) {
+      const root = configuration.parents?.criteriaRoot;
+      if (root === undefined) return undefined;
+      const adoptions = yield* adoptionsIn(yield* listCriteria(root), {
+        root,
+        issue,
+        factoryId: configuration.factoryId,
+        itemKey,
+      });
+      if ("unread" in adoptions) return { unread: adoptions.unread };
+      return adoptions.found.length === 1 ? { document: adoptions.found[0]!.document } : undefined;
+    }),
     settleThread: (reservation) =>
       orchestrator.dispatch({
         type: "thread.settle",
@@ -3840,6 +3852,8 @@ const make = Effect.gen(function* () {
       const criteriaRoot = configuration.parents?.criteriaRoot;
       const listing =
         criteriaRoot === undefined ? undefined : yield* Effect.cached(listCriteria(criteriaRoot));
+      // Each parent's one Root adoption, which may name acceptance sections of its own.
+      const adoptedOf = new Map<FactoryItemKey, unknown>();
       for (const candidate of candidates) {
         const outcomes = yield* policyOutcomes(reads, candidate.events);
         const adoption =
@@ -3851,6 +3865,9 @@ const make = Effect.gen(function* () {
                 factoryId,
                 itemKey: candidate.itemKey,
               });
+        if (adoption !== undefined && "found" in adoption && adoption.found.length === 1) {
+          adoptedOf.set(candidate.itemKey, adoption.found[0]!.document);
+        }
         const criteriaEvidence =
           adoption === undefined || "unread" in adoption || adoption.found.length !== 1
             ? []
@@ -3980,10 +3997,13 @@ const make = Effect.gen(function* () {
             );
             continue;
           }
-          const result = yield* act(configuration, candidate, decision, {
-            custodyRead,
-            transfersRead,
-          });
+          const result = yield* act(
+            configuration,
+            candidate,
+            decision,
+            { custodyRead, transfersRead },
+            adoptedOf.get(itemKey),
+          );
           if (result.admission?.type === "admitted") {
             custodyRead.push(result.admission.reservation.reservationId);
           }
@@ -4892,6 +4912,7 @@ const make = Effect.gen(function* () {
     candidate: Candidate,
     decision: FactoryPolicyDecision,
     fence: Omit<CollectedBasis, "issueText">,
+    adopted: unknown,
   ): Effect.fn.Return<
     {
       readonly disposition: FactoryItemDisposition;
@@ -5128,6 +5149,7 @@ const make = Effect.gen(function* () {
           issue: subject.issueNumber,
           body: candidate.issue.body,
           comments: candidate.issue.comments,
+          adopted,
         }).length === 0
       ) {
         return {

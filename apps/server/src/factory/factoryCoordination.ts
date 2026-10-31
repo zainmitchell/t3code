@@ -447,13 +447,24 @@ export interface AcceptanceItem {
   readonly anchor: string;
 }
 
+/** A heading's anchor: the fragment a clause's `source.ref` names it by. */
+const headingAnchor = (title: string) =>
+  strip(
+    title
+      .replace(/:+$/, "")
+      .toLowerCase()
+      .replace(/[^a-z0-9 -]/g, ""),
+  ).replaceAll(" ", "-");
+
+const NO_ANCHORS: ReadonlySet<string> = new Set();
+
 /**
  * The current acceptance of an issue body: each top-level list item under an Acceptance,
- * Acceptance checks, Acceptance criteria or Completion criteria heading, with its exact span.
- * `<details>` and fenced text are never read; text after a first item that belongs to none is
- * `unlisted`.
+ * Acceptance checks, Acceptance criteria or Completion criteria heading, or a heading whose anchor
+ * is in `anchors`, with its exact span. `<details>` and fenced text are never read; text after a
+ * first item that belongs to none is `unlisted`.
  */
-export const parentAcceptance = (body: string) => {
+export const parentAcceptance = (body: string, anchors: ReadonlySet<string> = NO_ANCHORS) => {
   interface Section {
     readonly anchor: string;
     readonly items: Array<{ start: number; end: number; checked: boolean }>;
@@ -518,13 +529,8 @@ export const parentAcceptance = (body: string) => {
       if (current !== undefined) closeItem();
       current = undefined;
       const title = strip(heading[2]!);
-      if (ACCEPTANCE_TITLE.test(title)) {
-        const anchor = strip(
-          title
-            .replace(/:+$/, "")
-            .toLowerCase()
-            .replace(/[^a-z0-9 -]/g, ""),
-        ).replaceAll(" ", "-");
+      const anchor = headingAnchor(title);
+      if (ACCEPTANCE_TITLE.test(title) || anchors.has(anchor)) {
         current = { anchor, items: [], unlisted: [] };
         sections.push(current);
       }
@@ -639,17 +645,41 @@ export const adoptedClauses = (document: unknown, issue: number) => {
   return new Set(clauses.map((clause) => clause.id)).size === clauses.length ? clauses : undefined;
 };
 
+/**
+ * The heading anchors Root's adoption names as acceptance: the `source.ref` fragment of each
+ * required clause, so a parent's acceptance may sit under its own headings. None without a usable
+ * adopted document.
+ */
+export const adoptedAnchors = (adopted: unknown, issue: number): ReadonlySet<string> =>
+  new Set(
+    (adopted === undefined ? [] : (adoptedClauses(adopted, issue) ?? [])).flatMap((clause) => {
+      const ref = isRecord(clause.source) ? clause.source.ref : undefined;
+      if (clause.required !== true || typeof ref !== "string" || !ref.includes("#")) return [];
+      const fragment = ref.slice(ref.indexOf("#") + 1);
+      return fragment === "" ? [] : [fragment];
+    }),
+  );
+
 interface Evidence {
   readonly itemKey: string;
   readonly scope: string;
 }
 const evidenceOf = (clause: RawClause) => (clause.evidence ?? []) as ReadonlyArray<Evidence>;
 
+/** An adopted clause's recorded list item as acceptance text: its marker and checkbox dropped. */
+const listedText = (text: string) => normalized(text.replace(ITEM, ""));
+
+const isHold = (clause: RawClause) => (clause.state ?? "open") === "reserved";
+
+/** An unmatched adopted clause preparation keeps byte-exact: a reserved hold or an open option. */
+const keptUnmatched = (clause: RawClause) =>
+  isHold(clause) || (clause.required === false && (clause.state ?? "open") === "open");
+
 /**
  * Each current acceptance item as the prepared clause it must become: the adopted clause's id,
  * state and annotations for the same text, else its label or text digest; and the evidence it may
- * cite, which is the adopted evidence for that text and the members whose own acceptance quotes
- * it verbatim. With the adopted reserved clauses no longer in the body, which stay.
+ * cite, adopted for that text or a member quoting it verbatim. Unmatched adopted holds and open
+ * optional clauses stay byte-exact in adopted order.
  */
 const derivedClauses = (input: {
   readonly items: ReadonlyArray<AcceptanceItem>;
@@ -658,9 +688,13 @@ const derivedClauses = (input: {
 }) => {
   const known = input.adopted.map((clause) => {
     const texts = new Set(evidenceOf(clause).map((evidence) => normalized(evidence.scope)));
-    const excerpt = isRecord(clause.source) ? clause.source.excerpt : undefined;
-    if (typeof excerpt === "string") texts.add(normalized(excerpt));
-    return { clause, texts };
+    const source = isRecord(clause.source) ? clause.source : {};
+    if (typeof source.excerpt === "string") texts.add(normalized(source.excerpt));
+    // Only evidence and excerpt count as text recorded for the reserved-by-id rule below.
+    const recorded = texts.size > 0;
+    const listed = typeof source.text === "string" ? listedText(source.text) : "";
+    if (listed !== "") texts.add(listed);
+    return { clause, texts, recorded };
   });
   const carriers = input.children.flatMap((child) =>
     child.body === undefined
@@ -679,11 +713,11 @@ const derivedClauses = (input: {
     const text = normalized(item.excerpt);
     const label = labelOf(item.excerpt) ?? `clause-${sha256(text).slice(0, 12)}`;
     const index = known.findIndex(
-      ({ clause, texts }, at) =>
+      ({ clause, texts, recorded }, at) =>
         !used.has(at) &&
         (texts.has(text) ||
           // An adopted reservation recorded without its text still holds the clause bearing its id.
-          (texts.size === 0 && clause.id === label && (clause.state ?? "open") === "reserved")),
+          (!recorded && clause.id === label && (clause.state ?? "open") === "reserved")),
     );
     const adopted = index < 0 ? undefined : known[index]!.clause;
     if (index >= 0) used.add(index);
@@ -695,9 +729,7 @@ const derivedClauses = (input: {
     }
     return { item, id: adopted?.id ?? label, adopted, evidence };
   });
-  const kept = input.adopted.filter(
-    (clause, at) => !used.has(at) && (clause.state ?? "open") === "reserved",
-  );
+  const kept = input.adopted.filter((clause, at) => !used.has(at) && keptUnmatched(clause));
   const taken = new Map<string, number>();
   for (const clause of derived) taken.set(clause.id, (taken.get(clause.id) ?? 0) + 1);
   const keptIds = new Set(kept.map((clause) => clause.id));
@@ -742,13 +774,15 @@ export const criteriaProposalProblems = (input: {
   readonly issue: number;
   readonly body: string;
   readonly comments?: ReadonlyArray<IssueComment>;
+  /** Root's adopted criteria for the parent, whose required clauses may name more sections. */
+  readonly adopted?: unknown;
 }): ReadonlyArray<string> => {
   const { proposal, issue, body } = input;
   if (proposal.issue !== issue) return [`the proposal is for #${proposal.issue}, not #${issue}`];
   if (proposal.basis.bodySha256 !== sha256(body)) {
     return [`the proposal names body ${proposal.basis.bodySha256}, not ${sha256(body)}`];
   }
-  const accepted = parentAcceptance(body);
+  const accepted = parentAcceptance(body, adoptedAnchors(input.adopted, issue));
   if (accepted.items.length === 0) return [`the body of #${issue} states no acceptance list`];
   if (accepted.unlisted.length > 0) {
     return [`#${issue}'s acceptance has text outside its list items`];
@@ -855,12 +889,14 @@ export const preparedCriteriaProblems = (input: {
   ) {
     return [`the prepared document is not factory-parent-criteria/1 for #${issue}'s current body`];
   }
-  const accepted = parentAcceptance(input.body).items;
+  const accepted = parentAcceptance(input.body, adoptedAnchors(input.adopted, issue)).items;
   const { derived, kept } = derivedClauses({ items: accepted, adopted, children: input.children });
   const clauses = document.clauses as ReadonlyArray<unknown>;
   if (clauses.length !== derived.length + kept.length) {
+    const holds = kept.filter(isHold).length;
+    const options = kept.length - holds;
     return [
-      `the prepared document has ${clauses.length} clauses; ${derived.length} acceptance items and ${kept.length} kept holds need ${derived.length + kept.length}`,
+      `the prepared document has ${clauses.length} clauses; ${derived.length} acceptance items${options === 0 ? " and" : ","} ${holds} kept holds${options === 0 ? "" : ` and ${options} kept optional clauses`} need ${derived.length + kept.length}`,
     ];
   }
   const comments = new Map(input.comments.map((comment) => [String(comment.id), comment]));
@@ -945,9 +981,11 @@ export const preparedCriteriaProblems = (input: {
       }
     }
   });
-  kept.forEach((hold, at) => {
-    if (!sameJson(clauses[derived.length + at], hold)) {
-      problems.push(`the adopted hold ${hold.id} is not kept as adopted`);
+  kept.forEach((clause, at) => {
+    if (!sameJson(clauses[derived.length + at], clause)) {
+      problems.push(
+        `the adopted ${isHold(clause) ? "hold" : "optional clause"} ${clause.id} is not kept as adopted`,
+      );
     }
   });
   return problems;
