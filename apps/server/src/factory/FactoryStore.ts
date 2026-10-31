@@ -454,7 +454,7 @@ const WorkspaceObligationFields = {
   openedAt: Schema.String,
   /** The serving process that opened it; see `FactoryStore.servingId`. */
   openedIn: Schema.optional(Schema.String),
-  /** Owners a routine recovery replaced, with the containers proved ended before it did. */
+  /** Owners a recovery or a disposition replaced, with the containers proved ended before it did. */
   priorOwners: Schema.optional(
     Schema.Array(
       Schema.Struct({
@@ -467,10 +467,10 @@ const WorkspaceObligationFields = {
 };
 
 /**
- * A claimed run's workspace work. Open from the transaction that authorizes it, before any
- * workspace I/O. Settled only by its own owner, and only for the scope that owner's preparation
- * proved: no external process boundary was ever entered, or every process it started was a
- * member of its run's container, whose own facts then say whether they ended.
+ * A claimed run's workspace work, open from the transaction that authorizes it, before any I/O.
+ * Its own owner settles it for the scope its preparation proved: no external process boundary
+ * entered, or every process a member of its run's container. A never-started disposition settles
+ * one whose owner was lost, as contained, once every container of its run ended.
  */
 export const WorkspaceObligation = Schema.Union([
   Schema.Struct({ ...WorkspaceObligationFields, state: Schema.Literal("open") }),

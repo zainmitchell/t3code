@@ -51,6 +51,7 @@ import * as CommandJobFence from "../commandJobs/CommandJobFence.ts";
 import * as CommandJobs from "../commandJobs/CommandJobs.ts";
 import * as EffectOutbox from "../orchestration-v2/EffectOutbox.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
+import { PreparationOwnerId } from "../orchestration-v2/preparationOwner.ts";
 import {
   type HelperInvocationRefusal,
   isEligible,
@@ -6468,6 +6469,30 @@ const make = Effect.gen(function* () {
             };
             if (!(yield* outcomeOps.disposeAttested(reservation, attestation))) {
               return { disposed: false, refusals: ["existing_outcome_or_owed_work"], ...read };
+            }
+            // The refusals passed an open obligation only once its owner was lost and every
+            // container of its run ended: the disposition takes it over and settles it.
+            const disposer = PreparationOwnerId.make(`owner-disposition:${read.evidenceDigest}`);
+            for (const run of facts.runs) {
+              if (typeof run.obligation !== "object" || run.obligation.state !== "open") continue;
+              const ended = run.generations.map((generation) => generation.generationId);
+              const settled =
+                (yield* store.reownWorkspaceObligation({
+                  runId: run.runId,
+                  fromOwnerId: run.obligation.ownerId,
+                  toOwnerId: disposer,
+                  endedGenerations: ended,
+                })) &&
+                (yield* store.settleWorkspaceObligation({
+                  runId: run.runId,
+                  ownerId: disposer,
+                  scope: { type: "contained", generationId: ended.at(-1)! },
+                }));
+              if (!settled) {
+                return yield* Effect.die(
+                  new Error("Disposition obligation changed during transaction"),
+                );
+              }
             }
             const attested = yield* store.attestNeverStarted({
               reservationId: reservation.reservationId,

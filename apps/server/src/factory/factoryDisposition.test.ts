@@ -85,6 +85,20 @@ const [failedOpen] = sessionNeverOpened.runs;
 describe("neverStartedRefusals", () => {
   it("admits only a stage nothing proves never started", () => {
     assert.deepStrictEqual(neverStartedRefusals(neverStarted), []);
+    // An open obligation whose owner was lost: nothing prepares here and its container ended.
+    assert.deepStrictEqual(
+      neverStartedRefusals({
+        ...neverStarted,
+        runs: [
+          {
+            ...run!,
+            status: "cancelled",
+            obligation: { state: "open", ownerId, openedIn: null, preparing: false },
+          },
+        ],
+      }),
+      [],
+    );
   });
 
   it.each<[string, NeverStartedEvidence]>([
@@ -101,7 +115,37 @@ describe("neverStartedRefusals", () => {
       "workspace_obligation_open",
       {
         ...neverStarted,
-        runs: [{ ...run!, obligation: { state: "open", ownerId, openedIn: null } }],
+        runs: [
+          { ...run!, obligation: { state: "open", ownerId, openedIn: null, preparing: true } },
+        ],
+      },
+    ],
+    [
+      "workspace_obligation_open",
+      {
+        ...neverStarted,
+        runs: [
+          {
+            ...run!,
+            obligation: { state: "open", ownerId, openedIn: null, preparing: false },
+            generations: [],
+          },
+        ],
+      },
+    ],
+    [
+      "workspace_obligation_open",
+      {
+        ...neverStarted,
+        runs: [
+          {
+            ...run!,
+            obligation: { state: "open", ownerId, openedIn: null, preparing: false },
+            generations: [
+              { generationId: GenerationId.make("generation:1"), state: "ended", providerJoins: 1 },
+            ],
+          },
+        ],
       },
     ],
     ["workspace_obligation_open", { ...neverStarted, runs: [{ ...run!, obligation: "missing" }] }],

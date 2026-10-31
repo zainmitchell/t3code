@@ -9,6 +9,7 @@ import * as EffectOutbox from "../orchestration-v2/EffectOutbox.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import { START_REFUSAL_SIGNALS, type FactoryCustody } from "./factoryCustody.ts";
 import * as FactoryExecutionGenerations from "./FactoryExecutionGenerations.ts";
+import * as FactoryRunPreparation from "./FactoryRunPreparation.ts";
 import {
   bootBoundaryRefusals,
   type HistoricalProvenance,
@@ -60,6 +61,7 @@ export const readNeverStartedEvidence = Effect.fn("factoryDisposition.readNeverS
     const outbox = yield* EffectOutbox.EffectOutboxV2;
     const store = yield* FactoryStore.FactoryStore;
     const generations = yield* FactoryExecutionGenerations.FactoryExecutionGenerations;
+    const preparation = yield* FactoryRunPreparation.FactoryRunPreparation;
     const { threadId } = reservation.execution;
     const projection = yield* projections.getThreadProjection(threadId);
     const launches = (yield* outbox.listLaunchesForThread(threadId)).flatMap((effect) =>
@@ -74,6 +76,9 @@ export const readNeverStartedEvidence = Effect.fn("factoryDisposition.readNeverS
         run.workspacePreparation === undefined
           ? undefined
           : Option.getOrUndefined(yield* store.workspaceObligation(run.id));
+      const preparing =
+        obligation?.state === "open" &&
+        Option.isSome(yield* preparation.currentOwner(obligation.commandId));
       const signals = new Map(
         BEFORE_TURN_SIGNALS.map((signal) => [
           IdAllocator.derive.runSignalTurnItem({ runId: run.id, signal }),
@@ -101,6 +106,7 @@ export const readNeverStartedEvidence = Effect.fn("factoryDisposition.readNeverS
                   state: obligation.state,
                   ownerId: obligation.ownerId,
                   openedIn: obligation.openedIn ?? null,
+                  ...(obligation.state === "open" ? { preparing } : {}),
                 },
         generations: (yield* generations.generations(run.id)).map((generation) => ({
           generationId: generation.generationId,
@@ -154,6 +160,20 @@ const endedBeforeTurn = (evidence: NeverStartedEvidence, runId: string) => {
   );
 };
 
+/**
+ * An open obligation whose owner is lost: nothing prepares under it here, and every container of
+ * its run ended with no provider joined, so all its preparation started ran in one and is gone.
+ * Never-started disposal settles it as contained, since recovery never will.
+ */
+const ownerLostContained = (run: NeverStartedEvidence["runs"][number]) =>
+  typeof run.obligation === "object" &&
+  run.obligation.state === "open" &&
+  run.obligation.preparing === false &&
+  run.generations.length > 0 &&
+  run.generations.every(
+    (generation) => generation.state === "ended" && generation.providerJoins === 0,
+  );
+
 /** Why the evidence cannot carry an owner's never-started attestation; empty when it can. */
 export const neverStartedRefusals = (evidence: NeverStartedEvidence): ReadonlyArray<string> => [
   ...(evidence.runs.length === 0 ||
@@ -179,7 +199,8 @@ export const neverStartedRefusals = (evidence: NeverStartedEvidence): ReadonlyAr
   ...(evidence.runs.some(
     (run) =>
       run.obligation !== "none" &&
-      (run.obligation === "missing" || run.obligation.state !== "settled"),
+      (run.obligation === "missing" ||
+        (run.obligation.state !== "settled" && !ownerLostContained(run))),
   )
     ? ["workspace_obligation_open"]
     : []),

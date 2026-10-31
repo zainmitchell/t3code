@@ -10174,6 +10174,84 @@ it.effect(
     ),
 );
 
+it.effect(
+  "Owner/D8: a stage whose owner was lost inside its worktree create, then cancelled by a runtime stop, is disposed with its obligation settled as contained",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          // Recovery never repeats a worktree begun but unrecorded, so without the owner's
+          // disposition the stage stays held with its obligation open.
+          const { execution, run } = yield* reviewInWorktree(7492);
+          const reservationId = FactoryReservationId.make(`reservation:${execution.commandId}`);
+          const preparation = yield* PreparationFake;
+          const reached = yield* Deferred.make<void>();
+          preparation.duringWorktreeCreate = holdForever(reached);
+          const drain = yield* Effect.forkScoped(runEffects);
+          yield* Deferred.await(reached);
+          // The process dies here, so its owner never settles anything: no write of it lands.
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`CREATE TRIGGER lost_owner_never_settles BEFORE UPDATE OF state ON factory_workspace_obligations
+            WHEN NEW.state = 'settled' BEGIN SELECT RAISE(ABORT, 'the owner is gone'); END`;
+          yield* Fiber.interrupt(drain);
+          const recovery = yield* ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService;
+          yield* recovery.recover;
+          preparation.owner = "fresh";
+          preparation.duringWorktreeCreate = undefined;
+          yield* fromEarlierProcess(reservationId, run.id, "process:lost");
+          const generations = yield* FactoryExecutionGenerations.FactoryExecutionGenerations;
+          assert.isTrue(yield* generations.closeIfQuiet(run.id));
+          const [generation] = yield* generations.generations(run.id);
+          yield* runEffects;
+          yield* recovery.reconcile("shutdown");
+          yield* recovery.recover;
+          yield* advance("restart", 2);
+          yield* sql`DROP TRIGGER lost_owner_never_settles`;
+          yield* advance("operation", 2);
+          assert.deepStrictEqual(yield* runStatuses(execution.threadId), ["cancelled"]);
+          assert.strictEqual(preparation.worktrees.length, 1);
+          const lost = Option.getOrThrow(yield* workspaceObligationOf(run.id));
+          assert.strictEqual(lost.state, "open");
+          assert.deepStrictEqual(yield* custodyOfReservation(execution), {
+            state: "unknown",
+            reasons: ["process_containment_unsupported"],
+          });
+          const read = yield* disposeNeverStarted(reservationId);
+          assert.deepStrictEqual([read.disposed, read.refusals], [false, []]);
+          assert.include(read.evidence, '"preparing":false');
+          const attested = yield* disposeNeverStarted(reservationId, read.evidenceDigest);
+          assert.isTrue(attested.disposed);
+          const settled = Option.getOrThrow(yield* workspaceObligationOf(run.id));
+          assert.strictEqual(
+            settled.state === "settled" && settled.scope === "contained"
+              ? settled.generationId
+              : settled.state,
+            generation!.generationId,
+          );
+          assert.deepStrictEqual(
+            settled.priorOwners?.map((prior) => [prior.ownerId, prior.endedGenerations]),
+            [[lost.ownerId, [generation!.generationId]]],
+          );
+          const released = yield* reservationOf(reservationId);
+          assert.deepStrictEqual(
+            [released?.state, released?.releasedReason],
+            ["released", "owner_disposition"],
+          );
+          const [failed, ...more] =
+            yield* (yield* FactoryOutcomeStore.FactoryOutcomeStore).listForOrigin(reservationId);
+          assert.deepStrictEqual([failed?.report.outcome, more], ["failed", []]);
+          // The item is reviewed again on a new execution; the lost run is never prepared again.
+          const retried = (yield* advance("owner_decision")).filter(
+            (admission) => admission.type === "admitted",
+          );
+          assert.deepStrictEqual(retried.map(stageOf), [[itemKeyFor(7492), "review"]]);
+          assert.notStrictEqual(admittedExecution(retried[0]!).threadId, execution.threadId);
+          assert.deepStrictEqual(yield* runStatuses(execution.threadId), ["cancelled"]);
+        }),
+      ),
+    ),
+);
+
 it.effect("Independent control: provider start after attestation must keep custody held", () =>
   runIsolated(
     Effect.gen(function* () {
