@@ -1519,6 +1519,11 @@ export interface VerificationBindingInput {
   readonly workspace: OrchestrationV2ThreadLaunchWorkspaceStrategy | undefined;
   /** The item version the verification runs for; a unit prepared for another proves nothing. */
   readonly itemVersion: string;
+  /**
+   * A binding derived from a template is recorded whole for its worker to read. Admission writes
+   * the record if it is absent; a first use only names it, for its caller to check after the digest.
+   */
+  readonly record: "write" | "name";
 }
 
 /**
@@ -1819,12 +1824,59 @@ export const deriveVerificationBinding = Effect.fnUntraced(function* (
       policyRevision: configuration.policyRevision,
     }),
   );
+  // A pinned binding is already a file its worker reads; one derived from a template is written
+  // beside its output root, named by its digest so no other binding ever overwrites it.
+  let recorded: { readonly path: string; readonly sha256: string } | undefined;
+  if (doc.schema === "factory-verification-template/1") {
+    const text = canonical({
+      schema: "factory-verification-binding/1",
+      issue,
+      failedOutcomeId: failed.outcomeId,
+      prerequisite,
+      landed,
+      source: { repository: candidate.subject.repository, commit: landed.commit },
+      worker: { execution },
+      auth: { identity },
+      inputs: doc.inputs,
+      consumer: doc.consumer,
+      policyRevision: configuration.policyRevision,
+      ownership: doc.ownership,
+      outputRoot,
+    });
+    const file = path.join(
+      path.resolve(verification.outputBase),
+      `${path.basename(outputRoot)}.binding-${bindingDigest.slice(0, 16)}.json`,
+    );
+    const digest = sha256(text);
+    const unrecorded = (what: string) =>
+      wait(
+        `the binding T3 recorded at ${file} ${what}`,
+        "Root coordinator",
+        "restore the recorded binding exactly as T3 wrote it, or remove it before the next admission",
+        "the recorded bytes read back",
+      );
+    if (input.record === "write") {
+      const existing = yield* fs.readFile(file).pipe(Effect.option);
+      if (Option.isSome(existing)) {
+        if (sha256(existing.value) !== digest) return unrecorded(`is not sha256 ${digest}`);
+      } else if (Option.isNone(yield* fs.writeFileString(file, text).pipe(Effect.option))) {
+        return unrecorded("could not be written");
+      }
+    }
+    recorded = { path: file, sha256: digest };
+  }
   return {
     digest: bindingDigest,
     landed,
+    ...(recorded === undefined ? {} : { recorded }),
     basis: bindingBasis(bindingDigest, outputRoot),
     note: [
       `T3 bound this verification (binding ${bindingDigest.slice(0, 16)}): it reruns failure ${failed.outcomeId} on ${landed.commit} (tree ${landed.tree}), the landing of ${landed.itemKey} by operation ${landed.operationId}.`,
+      ...(recorded === undefined
+        ? []
+        : [
+            `The recorded factory-verification-binding/1 is ${recorded.path} (sha256 ${recorded.sha256}); read it and check it before acting.`,
+          ]),
       `Write only under ${outputRoot}; T3 reserved it for this attempt alone. Change no product file.`,
       bindingMarker({ binding: pointer, execution, baseRef: landed.commit }),
     ].join("\n"),
@@ -5197,6 +5249,7 @@ const make = Effect.gen(function* () {
           execution: decision.execution,
           workspace: decision.workspaceStrategy,
           itemVersion: candidate.observation.itemVersion,
+          record: "write",
         },
       );
       if ("wait" in checked) {

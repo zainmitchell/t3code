@@ -53,6 +53,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import type * as PlatformError from "effect/PlatformError";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
@@ -12723,6 +12724,30 @@ it.effect(
               ? admitted.reservation.stageBasis
               : undefined;
           assert.match(basis ?? "", /^rework:.+\|vb:[0-9a-f]{32}\|out:[0-9a-f]{32}$/);
+          // The binding T3 derived is recorded whole where the worker can read and check it: its
+          // brief names the file and its sha256, and the reserved output root stays empty.
+          const brief = (yield* (yield* Orchestrator.OrchestratorV2).getThreadProjection(
+            admittedExecution(admitted).threadId,
+          )).messages
+            .map((message) => message.text)
+            .join("\n");
+          const [, recordPath, recordSha256] =
+            /The recorded factory-verification-binding\/1 is (.+) \(sha256 ([0-9a-f]{64})\); read it/.exec(
+              brief,
+            ) ?? [];
+          assert.strictEqual(path.dirname(recordPath ?? ""), outputs);
+          const recordText = yield* fs.readFileString(recordPath!);
+          assert.strictEqual(sha256(recordText), recordSha256);
+          assert.deepInclude(JSON.parse(recordText), {
+            schema: "factory-verification-binding/1",
+            issue: 7501,
+            failedOutcomeId,
+            outputRoot,
+            source: { repository: claimRepository, commit: landed.mergeCommit },
+            worker: { execution: "verifier" },
+            auth: { identity: "verifier@example.invalid" },
+          });
+          assert.isFalse(yield* fs.exists(outputRoot));
           for (const trigger of ["clock", "restart", "owner_decision"] as const) {
             assert.deepStrictEqual(admissionsOnly(yield* advance(trigger)), []);
           }
@@ -12751,6 +12776,24 @@ const startRefusalOf = (admission: FactoryLifecycle.FactoryAdmissionResult) =>
 type LaunchFault = (
   proof: Effect.Success<ReturnType<typeof setUpBoundProof>>,
 ) => Effect.Effect<void, never, LaunchFake | PreparationFake | GitHubFake>;
+
+/** While the proof prepares, something changes the binding record T3 wrote for its worker. */
+const onBindingRecord =
+  (
+    change: (
+      proof: Effect.Success<ReturnType<typeof setUpBoundProof>>,
+      file: string,
+    ) => Effect.Effect<void, PlatformError.PlatformError>,
+  ): LaunchFault =>
+  (proof) =>
+    Effect.map(PreparationFake, (preparation) => {
+      preparation.beforeRelease = Effect.gen(function* () {
+        const [name] = (yield* proof.fs.readDirectory(proof.outputs)).filter((entry) =>
+          entry.includes(".binding-"),
+        );
+        yield* change(proof, proof.path.join(proof.outputs, name!));
+      }).pipe(Effect.orDie);
+    });
 
 /**
  * Between admission and first use, one thing a bound verification rests on changes, or what the
@@ -12821,6 +12864,18 @@ const launchFaults: ReadonlyArray<readonly [string, number, LaunchFault, string]
           .pipe(Effect.orDie);
       }),
     "binding_refused",
+  ],
+  [
+    "the recorded binding changed while preparing",
+    7553,
+    onBindingRecord((proof, file) => proof.fs.writeFileString(file, "{}")),
+    "binding_record_changed",
+  ],
+  [
+    "the recorded binding removed while preparing",
+    7556,
+    onBindingRecord((proof, file) => proof.fs.remove(file)),
+    "binding_record_missing",
   ],
   [
     "an issue edited while preparing",

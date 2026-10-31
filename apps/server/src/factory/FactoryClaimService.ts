@@ -678,10 +678,17 @@ const make = Effect.gen(function* () {
         execution: proposal.value.execution,
         workspace: { type: "worktree", baseRef: proposal.value.baseRef, startFromOrigin: false },
         itemVersion: reservation.itemVersion,
+        record: "name",
       },
     );
     if ("wait" in derived) return `binding_refused: ${derived.wait}`;
     if (derived.digest.slice(0, 32) !== admittedDigest) return "binding_changed";
+    // The record its brief tells the worker to read and check is still exactly what T3 wrote.
+    if (derived.recorded !== undefined) {
+      const record = yield* fs.readFile(derived.recorded.path).pipe(Effect.option);
+      if (Option.isNone(record)) return "binding_record_missing";
+      if (sha256(record.value) !== derived.recorded.sha256) return "binding_record_changed";
+    }
     const selected = configuration.value.executionChoices?.[proposal.value.execution];
     const adopted = configuration.value.verification.identities[proposal.value.execution];
     if (
