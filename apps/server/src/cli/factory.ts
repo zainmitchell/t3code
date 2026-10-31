@@ -236,10 +236,21 @@ export const runAudited = Effect.fn("factoryCli.runAudited")(function* <C, A, E,
       const destination = yield* input.destination;
       return yield* input.connect(destination.origin, destination.token).pipe(
         Effect.flatMap(use),
-        Effect.tap((result) => audit({ actor: destination.actor, outcome: "succeeded", result })),
         Effect.tapError((error) =>
           audit({ actor: destination.actor, outcome: "failed", error: String(error) }).pipe(
             Effect.ignore,
+          ),
+        ),
+        // The request already applied: a lost audit line must not read as the request failing.
+        Effect.tap((result) =>
+          audit({ actor: destination.actor, outcome: "succeeded", result }).pipe(
+            Effect.mapError(
+              (cause) =>
+                new FactoryCliError({
+                  operation: call.operation,
+                  reason: `applied, but its audit line was not written (${String(cause)}); read the factory's state for its result`,
+                }),
+            ),
           ),
         ),
       );

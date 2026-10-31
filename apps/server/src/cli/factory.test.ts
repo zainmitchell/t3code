@@ -566,6 +566,17 @@ it.effect(
         ],
       );
       assert.notInclude(yield* auditText(stateDir), SESSION_TOKEN);
+
+      // A request that applied is not reported as failed when its audit line cannot be written.
+      const auditPath = path.join(stateDir, "factory-admin-audit.jsonl");
+      yield* fs.remove(auditPath);
+      yield* fs.makeDirectory(auditPath);
+      auth.revoked.length = 0;
+      const unaudited = yield* Effect.flip(run(Effect.succeed("applied")));
+      assert.include(
+        unaudited.message,
+        "factory state: applied, but its audit line was not written",
+      );
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
