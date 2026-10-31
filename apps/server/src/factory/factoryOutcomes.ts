@@ -38,6 +38,8 @@ import type * as FactoryStore from "./FactoryStore.ts";
 
 const sha256 = (text: string) => NodeCrypto.createHash("sha256").update(text).digest("hex");
 
+const SHA256_HEX = /^[0-9a-f]{64}$/i;
+
 /** A stage basis without the `|`-led suffixes that bind a decision's resources or bindings. */
 const coreBasis = (basis: string) => basis.split("|")[0]!;
 
@@ -258,6 +260,17 @@ export const makeFactoryOutcomes = (deps: FactoryOutcomeDependencies) => {
         return yield* reportFailure(
           "subject_missing",
           `A ${kind} report names exactly what it produced or examined.`,
+        );
+      }
+      // Once verified, an artifact is carried into later briefs only by its exact digest, so a
+      // mistyped one would strand the item; refused here, the worker can resend in the same turn.
+      const malformed = (input.report.artifacts ?? []).find(
+        (artifact) => !SHA256_HEX.test(artifact.sha256),
+      );
+      if (malformed !== undefined) {
+        return yield* reportFailure(
+          "subject_missing",
+          `Artifact ${malformed.path} names sha256 "${malformed.sha256}", which is not 64 hex digits: report the sha256 of its exact bytes.`,
         );
       }
       if (kind !== "criteria_proposed" && input.report.criteria !== undefined) {

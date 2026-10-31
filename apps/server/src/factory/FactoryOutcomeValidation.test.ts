@@ -468,6 +468,53 @@ it.effect("verifies a present ancestor base and settles the quiet stage", () =>
   }).pipe(Effect.provide(layerTest)),
 );
 
+// A review whose LINT.log digest lost three characters in transcription was verified anyway,
+// and no later brief could carry the artifact.
+it.effect("refuses an artifact digest that is not a sha256, so the worker resends it", () =>
+  Effect.gen(function* () {
+    const review: FactoryStore.FactoryReservation = {
+      ...admitted,
+      decisionKey: FactoryDecisionKey.make("decision:review"),
+      taskKind: "review",
+      stageBasis: `review:${head}`,
+    };
+    const fixture = yield* makeFixture(btc131(), { reservation: review });
+    fixture.quiesce();
+    const reportWith = (lintSha256: string) =>
+      fixture.ops.report({
+        threadId,
+        report: {
+          outcome: "review_failed",
+          summary: "Two blocking findings.",
+          failure: "Adversarial fixture runs fail.",
+          subject: { repository: "example/connector", headCommit: head },
+          artifacts: [
+            {
+              path: "C:/artifacts/issue-113/review/REVIEW.md",
+              sha256: "e820a4d0cf1337a613aa525da8b981d6bf032a69940b5371ddaa53a71a851b3a",
+            },
+            { path: "C:/artifacts/issue-113/review/LINT.log", sha256: lintSha256 },
+          ],
+        },
+      });
+
+    const refused = yield* Effect.flip(
+      reportWith("e0296418a07e11c1855fceb8edb60fd8ffd51fd290350e4f7decfb018fa8a"),
+    );
+    assert.strictEqual(refused.code, "subject_missing");
+    assert.include(refused.message, "C:/artifacts/issue-113/review/LINT.log");
+    assert.deepStrictEqual(yield* fixture.outcomes.listForOrigin(reservationId), []);
+    assert.strictEqual(fixture.reservation().state, "held");
+
+    const { outcomeId } = yield* reportWith(
+      "E0296418A07E11C1855FCEB8EDB60FD8FFD51FD290350E4F7D47FECFB018FA8A",
+    );
+    yield* fixture.ops.reconcile(factoryId);
+    assert.strictEqual(Option.getOrThrow(yield* fixture.outcomes.get(outcomeId)).state, "verified");
+    assert.strictEqual(fixture.reservation().state, "released");
+  }).pipe(Effect.provide(layerTest)),
+);
+
 const triage: FactoryStore.FactoryReservation = {
   ...admitted,
   decisionKey: FactoryDecisionKey.make("decision:triage"),
