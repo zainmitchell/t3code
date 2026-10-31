@@ -7961,10 +7961,11 @@ it.effect(
   () =>
     runIsolated(
       Effect.gen(function* () {
-        const { execution, run } = yield* finishedWorkspaceExecution(7201, {
-          type: "worktree",
-          baseRef: "main",
-        });
+        const { execution, run } = yield* finishedWorkspaceExecution(
+          7201,
+          { type: "worktree", baseRef: "main" },
+          { awaitStart: true },
+        );
         const obligation = Option.getOrUndefined(yield* workspaceObligationOf(run.id));
         assert.strictEqual(obligation?.state, "settled");
         assert.strictEqual(
