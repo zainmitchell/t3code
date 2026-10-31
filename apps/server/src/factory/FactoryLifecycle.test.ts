@@ -22949,12 +22949,16 @@ interface NoEditRepairCase {
   readonly issue: number;
   readonly firstNoEdit?: false;
   readonly actionClass?: string;
-  readonly correctionHead?: string;
+  /** The correction's whole summary, in place of its action class line. */
+  readonly correction?: string;
+  readonly correctionHead?: string | null;
   readonly rework?: (requirement: NoEditRequirement) => NoEditRequirement;
   readonly reworkExecution?: string;
   /** Absent, the rework is admitted; else the wait names this. */
   readonly refused?: string;
 }
+
+const noSourceChange = "No source change; review the same head again on its evidence";
 
 const noEditRepairCases: ReadonlyArray<readonly [string, NoEditRepairCase]> = [
   ["an execution_binding_repair of its own unit runs once more", { issue: 7911 }],
@@ -23001,6 +23005,38 @@ const noEditRepairCases: ReadonlyArray<readonly [string, NoEditRepairCase]> = [
       issue: 7917,
       firstNoEdit: false,
       refused: "it is not the no-edit unit whose failure its correction answers",
+    },
+  ],
+  // A project's correction may open with its decision marker, then a harness class and no source change.
+  [
+    "a harness correction changing no source, after a marker comment, runs once more",
+    {
+      issue: 7950,
+      correction: `<!-- btc-decision key=0e6947bc8f5ad6b9 action=correction_spec -->\nfailure class: harness\nfailed check: none (no check ran)\n\n${noSourceChange}\n\nRun the unchanged checks again.`,
+      correctionHead: null,
+    },
+  ],
+  [
+    "an execution_binding_repair after a marker comment runs once more",
+    {
+      issue: 7955,
+      correction: `<!-- btc-decision key=k action=correction_spec -->\nAction class: execution_binding_repair\nfailure class: harness\nRepair only the run binding.`,
+    },
+  ],
+  [
+    "a product correction is not one, whatever it says of the source",
+    {
+      issue: 7956,
+      correction: `failure class: product\n${noSourceChange}`,
+      refused: "is not a verified execution_binding_repair",
+    },
+  ],
+  [
+    "a correction naming a second failure class is not a harness repair",
+    {
+      issue: 7957,
+      correction: `failure class: harness\nfailure class: environment\n${noSourceChange}`,
+      refused: "is not a verified execution_binding_repair",
     },
   ],
 ];
@@ -23070,12 +23106,18 @@ it.effect.each(noEditRepairCases)("NoEdit/N2: at a rework, %s", ([, repair]) =>
         assert.deepStrictEqual(stageOf(correct), [itemKeyFor(repair.issue), "correct"]);
         yield* workStage(correct, {
           outcome: "correction_spec",
-          summary: `Action class: ${repair.actionClass ?? "execution_binding_repair"}\nfailure class: harness\nRepair only the run binding on the unchanged candidate.`,
-          subject: {
-            repository: claimRepository,
-            baseCommit: candidate,
-            headCommit: repair.correctionHead ?? candidate,
-          },
+          summary:
+            repair.correction ??
+            `Action class: ${repair.actionClass ?? "execution_binding_repair"}\nfailure class: harness\nRepair only the run binding on the unchanged candidate.`,
+          ...(repair.correctionHead === null
+            ? {}
+            : {
+                subject: {
+                  repository: claimRepository,
+                  baseCommit: candidate,
+                  headCommit: repair.correctionHead ?? candidate,
+                },
+              }),
         });
 
         if (repair.refused !== undefined) {

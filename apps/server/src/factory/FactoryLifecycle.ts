@@ -158,6 +158,23 @@ const TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set([
 /** The marker a reserved decision's tracker record carries, found before any write. */
 const decisionMarker = (decisionId: string) => `<!-- t3-factory-decision:${decisionId} -->`;
 
+/**
+ * Whether a correction spec repairs only a no-edit unit's run: its first line past any marker
+ * comment declares an execution_binding_repair, or every failure class it states is harness and
+ * it states that no source changes.
+ */
+const repairsRun = (summary: string) => {
+  const lines = summary.split("\n").map((line) => line.trim());
+  const first = lines.find((line) => line !== "" && !/^<!--.*-->$/.test(line));
+  if (/^action class:\s*execution_binding_repair$/i.test(first ?? "")) return true;
+  const classes = lines.flatMap((line) => /^failure class:\s*(\S+)$/i.exec(line)?.[1] ?? []);
+  return (
+    classes.length > 0 &&
+    classes.every((each) => each.toLowerCase() === "harness") &&
+    lines.includes("No source change; review the same head again on its evidence")
+  );
+};
+
 type DecidedProposal = Exclude<FactoryPolicyDecision, undefined>;
 
 const isReservationRequest = (proposal: DecidedProposal): proposal is FactoryReservation =>
@@ -4304,9 +4321,10 @@ const make = Effect.gen(function* () {
    * that base must read back now on the line T3 integrates onto. What cannot be read is not ready.
    */
   /**
-   * Why a no-edit unit may not run again at a rework, if it may not. Only an execution-binding
-   * repair runs it again: a verified correction declaring that action, answering this item's own
-   * failure of exactly this unit (requirement, item version and execution), on its candidate.
+   * Why a no-edit unit may not run again at a rework, if it may not. Only a repair of its run
+   * runs it again: a verified correction declaring an execution_binding_repair, or a harness
+   * failure needing no source change, answering this item's own failure of exactly this unit
+   * (requirement, item version and execution), on its candidate.
    */
   const noEditRepairProblem = Effect.fnUntraced(function* (
     candidate: Candidate,
@@ -4319,9 +4337,7 @@ const make = Effect.gen(function* () {
       Option.isNone(correction) ||
       correction.value.state !== "verified" ||
       correction.value.report.outcome !== "correction_spec" ||
-      !/^action class:\s*execution_binding_repair$/i.test(
-        (correction.value.report.summary ?? "").split("\n")[0]!.trim(),
-      )
+      !repairsRun(correction.value.report.summary ?? "")
     ) {
       return "its correction is not a verified execution_binding_repair";
     }
