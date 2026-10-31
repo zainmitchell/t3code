@@ -38,7 +38,7 @@ import {
 import { makeKeyedCoalescingWorker } from "@t3tools/shared/KeyedCoalescingWorker";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import { AgentScope } from "@t3tools/shared/AgentScope";
-import { ExecutionJoin } from "@t3tools/shared/ExecutionJoin";
+import { CurrentExecutionJoin, ExecutionJoin } from "@t3tools/shared/ExecutionJoin";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { mergePathEntries } from "@t3tools/shared/shell";
 
@@ -2409,9 +2409,14 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
       env: spawnEnv,
       survivesRestart: true,
     });
-    // A terminal of a thread whose execution is running here belongs to that execution, so its
-    // shell starts inside the run's container; with none running it is the owner's own work.
-    const join = yield* executionJoin.heldForThread(session.threadId);
+    // Work that carries its run's container (a contained preparation's setup script) starts the
+    // shell in that container or not at all: the thread's current run may already be cancelled.
+    // Otherwise a terminal of a thread whose execution is running here belongs to that execution,
+    // so its shell starts inside the run's container; with none running it is the owner's own work.
+    const carried = yield* CurrentExecutionJoin;
+    const join = Option.isSome(carried)
+      ? carried
+      : yield* executionJoin.heldForThread(session.threadId);
     const ticket = Option.isNone(join)
       ? undefined
       : yield* join.value(scoped.command, scoped.args).pipe(

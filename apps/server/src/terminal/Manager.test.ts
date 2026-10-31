@@ -10,6 +10,7 @@ import {
   ProjectId,
   TerminalProviderInstanceNotFoundError,
 } from "@t3tools/contracts";
+import { CurrentExecutionJoin, type JoinFor, JoinRefused } from "@t3tools/shared/ExecutionJoin";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
@@ -732,6 +733,41 @@ it.layer(
       expect(first.writes).toEqual(["pwd\n"]);
       expect(second.writes).toEqual(["ls\n"]);
       expect(ptyAdapter.spawnInputs).toHaveLength(2);
+    }),
+  );
+
+  it.effect("starts a shell for contained work in that work's container, or not at all", () =>
+    Effect.gen(function* () {
+      const { manager, ptyAdapter } = yield* createManager();
+      // The thread has no execution held here (its run was just cancelled, say): only the
+      // container the calling work carries can place the shell.
+      const admitted: Array<number> = [];
+      const carried: JoinFor = (command, args) =>
+        Effect.succeed({
+          command: "join",
+          args: [command, ...args],
+          admit: (pid) =>
+            Effect.sync(() => {
+              admitted.push(pid);
+            }),
+          cancel: Effect.void,
+        });
+      yield* manager
+        .open(openInput({ terminalId: "setup" }))
+        .pipe(Effect.provideService(CurrentExecutionJoin, Option.some(carried)));
+      expect(ptyAdapter.spawnInputs.map((input) => input.shell)).toEqual(["join"]);
+      expect(admitted).toEqual([ptyAdapter.processes[0]!.pid]);
+
+      const refused: JoinFor = () =>
+        Effect.fail(new JoinRefused({ reason: "the run holds no container here" }));
+      yield* manager
+        .open(openInput({ terminalId: "setup-2" }))
+        .pipe(Effect.provideService(CurrentExecutionJoin, Option.some(refused)));
+      expect(ptyAdapter.spawnInputs).toHaveLength(1);
+      const shell = yield* Effect.exit(
+        manager.getShell({ threadId: "thread-1", terminalId: "setup-2" }),
+      );
+      assert.isTrue(Exit.isFailure(shell));
     }),
   );
 
