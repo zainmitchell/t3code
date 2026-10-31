@@ -23,6 +23,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PlatformError from "effect/PlatformError";
+import * as Queue from "effect/Queue";
 import * as Path from "effect/Path";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as Ref from "effect/Ref";
@@ -212,6 +213,23 @@ function openInput(overrides: Partial<TerminalOpenInput> = {}): TerminalOpenInpu
     ...overrides,
   };
 }
+
+// An execution container that admits whatever its work starts, recording the admitted pids.
+const generationJoin =
+  (members: Array<number>): JoinFor =>
+  (command, args) =>
+    Effect.succeed({
+      command: "join",
+      args: [command, ...args],
+      admit: (pid) =>
+        Effect.sync(() => {
+          members.push(pid);
+        }),
+      cancel: Effect.void,
+    });
+
+const refusedJoin: JoinFor = () =>
+  Effect.fail(new JoinRefused({ reason: "the run holds no container here" }));
 
 const historyLogPath = (logsDir: string, threadId = "thread-1") =>
   Effect.service(Path.Path).pipe(
@@ -769,6 +787,128 @@ it.layer(
       );
       assert.isTrue(Exit.isFailure(shell));
     }),
+  );
+
+  it.effect("never hands work that carries a container a shell already running", () =>
+    Effect.gen(function* () {
+      const { manager, ptyAdapter } = yield* createManager();
+      const later: Array<number> = [];
+      yield* manager.open(openInput({ terminalId: "owner" }));
+      yield* manager
+        .open(openInput({ terminalId: "earlier" }))
+        .pipe(Effect.provideService(CurrentExecutionJoin, Option.some(generationJoin([]))));
+      const [owner, earlier] = ptyAdapter.processes;
+
+      for (const terminalId of ["owner", "earlier"]) {
+        for (const join of [generationJoin(later), refusedJoin]) {
+          const reopened = yield* Effect.exit(
+            manager
+              .open(openInput({ terminalId }))
+              .pipe(Effect.provideService(CurrentExecutionJoin, Option.some(join))),
+          );
+          assert.isTrue(Exit.isFailure(reopened), `reused ${terminalId}`);
+        }
+      }
+      expect(ptyAdapter.spawnInputs).toHaveLength(2);
+      expect(later).toEqual([]);
+      expect([owner!.killed, earlier!.killed]).toEqual([false, false]);
+
+      yield* manager.open(openInput({ terminalId: "owner" }));
+      expect(ptyAdapter.spawnInputs).toHaveLength(2);
+    }),
+  );
+
+  it.effect.each([
+    { first: "the owner's", join: "accepted" },
+    { first: "the owner's", join: "refused" },
+    { first: "an earlier generation's", join: "accepted" },
+    { first: "an earlier generation's", join: "refused" },
+  ] as const)(
+    "never types a contained setup into $first running setup shell ($join join)",
+    ({ first, join }) =>
+      Effect.gen(function* () {
+        const { manager, ptyAdapter, baseDir } = yield* createManager(5, {
+          shellResolver: () => "pwsh.exe",
+          env: { SystemRoot: "C:\\Windows" },
+        }).pipe(Effect.provide(layerWithHostPlatform("win32")));
+        const typedInto = yield* Queue.unbounded<string>();
+        const runner = yield* ProjectSetupScriptRunner.make.pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              Layer.succeed(
+                TerminalManager.TerminalManager,
+                TerminalManager.TerminalManager.of({
+                  ...manager,
+                  write: (input) =>
+                    manager
+                      .write(input)
+                      .pipe(Effect.tap(() => Queue.offer(typedInto, input.terminalId))),
+                }),
+              ),
+              Layer.mock(ProjectService.ProjectService)({}),
+              Layer.mock(ProjectionStore.ProjectionStoreV2)({
+                getThreadShell: () => Effect.succeed(null),
+              }),
+              ServerSettings.layerTest(),
+            ),
+          ),
+        );
+        const runSetup = (carried: Option.Option<JoinFor>) =>
+          runner
+            .runForThread({
+              threadId: "thread-1",
+              worktreePath: baseDir,
+              project: {
+                id: ProjectId.make("project-1"),
+                workspaceRoot: baseDir,
+                scripts: [
+                  {
+                    id: "setup",
+                    name: "Setup",
+                    command: "vp i",
+                    icon: "configure",
+                    runOnWorktreeCreate: true,
+                  },
+                ],
+              },
+              observeCompletion: {},
+            })
+            .pipe(Effect.provideService(CurrentExecutionJoin, carried));
+
+        // The setup shell left running: the owner's own run, or the setup of a generation that was
+        // replaced while its shell stayed open.
+        const earlier = yield* runSetup(
+          first === "the owner's" ? Option.none() : Option.some(generationJoin([])),
+        );
+        assert(earlier.status === "started");
+        expect(yield* Queue.take(typedInto)).toBe(earlier.terminalId);
+        const earlierShell = ptyAdapter.processes[0]!;
+        expect(earlierShell.writes).toHaveLength(1);
+
+        const members: Array<number> = [];
+        const contained = yield* runSetup(
+          Option.some(join === "accepted" ? generationJoin(members) : refusedJoin),
+        );
+        assert(contained.status === "started" && contained.completion !== undefined);
+        const typed = yield* Effect.raceFirst(
+          Queue.take(typedInto),
+          contained.completion.pipe(Effect.as(null)),
+        );
+
+        expect(earlierShell.writes).toHaveLength(1);
+        expect(earlierShell.killed).toBe(false);
+        expect(contained.terminalId).not.toBe(earlier.terminalId);
+        if (join === "accepted") {
+          const containedShell = ptyAdapter.processes[1]!;
+          expect(typed).toBe(contained.terminalId);
+          expect(ptyAdapter.spawnInputs.at(-1)?.shell).toBe("join");
+          expect(members).toEqual([containedShell.pid]);
+          expect(containedShell.writes).toHaveLength(1);
+        } else {
+          expect(typed).toBeNull();
+          expect(ptyAdapter.processes).toHaveLength(1);
+        }
+      }),
   );
 
   it.effect("closes only a thread's idle shells, ignoring a helper forked from the shell", () =>

@@ -38,7 +38,7 @@ import {
 import { makeKeyedCoalescingWorker } from "@t3tools/shared/KeyedCoalescingWorker";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import { AgentScope } from "@t3tools/shared/AgentScope";
-import { CurrentExecutionJoin, ExecutionJoin } from "@t3tools/shared/ExecutionJoin";
+import { CurrentExecutionJoin, ExecutionJoin, JoinRefused } from "@t3tools/shared/ExecutionJoin";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { mergePathEntries } from "@t3tools/shared/shell";
 
@@ -2968,6 +2968,17 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     }
 
     const liveSession = existing.value;
+    // Work that carries its run's container runs only in a shell started inside it, and nothing
+    // here records which container a running shell joined: it may be the owner's own, or an
+    // earlier generation's. Such work opens a terminal of its own; this shell is left alone.
+    if (liveSession.process !== null && Option.isSome(yield* CurrentExecutionJoin)) {
+      return yield* Effect.die(
+        new JoinRefused({
+          threadId: input.threadId,
+          reason: `terminal ${terminalId} already runs a shell this work did not start`,
+        }),
+      );
+    }
     const nextRuntimeEnv = normalizedRuntimeEnv(input.env);
     const currentRuntimeEnv = liveSession.runtimeEnv;
     const targetCols = input.cols ?? liveSession.cols;

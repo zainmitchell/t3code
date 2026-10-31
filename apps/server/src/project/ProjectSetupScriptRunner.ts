@@ -6,6 +6,7 @@ import {
   settleProjectScript,
   setupProjectScript,
 } from "@t3tools/shared/projectScripts";
+import { CurrentExecutionJoin } from "@t3tools/shared/ExecutionJoin";
 
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -428,10 +429,12 @@ export const make = Effect.gen(function* () {
     }
 
     // Earlier settle shells may still run foreground programs; do not type resumed settles into them.
-    const terminalId =
-      trigger === "settle"
-        ? `settle-${script.id}-${(yield* crypto.randomUUIDv4().pipe(Effect.orDie)).slice(0, 8)}`
-        : `setup-${script.id}`;
+    // Work that carries its run's container needs a shell started inside it, and an earlier setup
+    // shell (the owner's own, or one an earlier generation started) cannot show it was.
+    const ownTerminal = trigger === "settle" || Option.isSome(yield* CurrentExecutionJoin);
+    const terminalId = ownTerminal
+      ? `${trigger}-${script.id}-${(yield* crypto.randomUUIDv4().pipe(Effect.orDie)).slice(0, 8)}`
+      : `setup-${script.id}`;
     const cwd = input.worktreePath;
     const env = {
       ...projectScriptRuntimeEnv({
