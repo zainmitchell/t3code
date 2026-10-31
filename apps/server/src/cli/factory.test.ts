@@ -15,18 +15,26 @@ import * as NetService from "@t3tools/shared/Net";
 import * as Cause from "effect/Cause";
 import * as Console from "effect/Console";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as Queue from "effect/Queue";
+import * as Schema from "effect/Schema";
 import { Command } from "effect/cli";
+import { Rpc, RpcClient, RpcClientError, RpcGroup, RpcSerialization } from "effect/rpc";
+import * as Socket from "effect/socket/Socket";
+import * as TestClock from "effect/testing/TestClock";
 
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 import { cli } from "../binCli.ts";
 import {
   authorizedByReceipt,
   decisionAnswerPlan,
+  FACTORY_RPC_TRANSPORT,
   FactoryCliError,
   hostAdminDestination,
   pendingDecisions,
@@ -581,6 +589,172 @@ it.effect(
       assert.isTrue(unaudited.message.endsWith('; its result: "applied"'));
       assert.deepStrictEqual(auth.revoked, ["session:host-admin"]);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "Host admin: a reply lost after the request could have reached the host is unknown, never failed",
+  () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const stateDir = yield* fs.makeTempDirectoryScoped({ prefix: "factory-cli-" });
+      const runtimeStatePath = path.join(stateDir, "server-runtime.json");
+      yield* fs.writeFileString(
+        runtimeStatePath,
+        JSON.stringify({
+          version: 1,
+          pid: 1,
+          port: 3773,
+          origin: "http://127.0.0.1:3773",
+          startedAt: "2026-10-31T00:00:00.000Z",
+        }),
+      );
+      const auth = recordingAuth();
+      const run = (reason: RpcClientError.RpcClientError["reason"]) =>
+        Effect.flip(
+          runAudited(
+            {
+              stateDir,
+              call: { operation: "install", request: {} },
+              destination: hostAdminDestination("install", runtimeStatePath),
+              connect: () => Effect.void,
+            },
+            () => Effect.fail(new RpcClientError.RpcClientError({ reason })),
+          ).pipe(Effect.provide(auth.layer)),
+        );
+      const lost = yield* run(new Socket.SocketReadError({ cause: new Error("ping timeout") }));
+      assert.instanceOf(lost, FactoryCliError);
+      assert.include(lost.message, "SocketReadError: An error occurred during Read (ping timeout)");
+      assert.include(lost.message, "it may have applied");
+      // A connection that never opened carried no request: that failure is the server's answer.
+      const unopened = yield* run(
+        new Socket.SocketOpenError({ kind: "Timeout", cause: new Error("no open") }),
+      );
+      assert.instanceOf(unopened, RpcClientError.RpcClientError);
+      assert.deepStrictEqual(
+        (yield* auditLines(stateDir)).map((line) => [line.outcome, line.error]),
+        [
+          ["unknown", "SocketReadError: An error occurred during Read (ping timeout)"],
+          ["failed", String(unopened)],
+        ],
+      );
+      assert.deepStrictEqual(auth.revoked, ["session:host-admin", "session:host-admin"]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+/**
+ * A host as the CLI's own transport meets it: a Pong for each Ping while it is answering, the
+ * call's reply once released, or its connection dropped.
+ */
+const transportHost = Effect.gen(function* () {
+  const frames = yield* Queue.unbounded<string | Socket.SocketError>();
+  const requested = yield* Queue.unbounded<string>();
+  const open = yield* Deferred.make<void>();
+  const requests: Array<string> = [];
+  let connections = 0;
+  let answering = true;
+  // Like a WebSocket, nothing is written before the connection is open.
+  const receive = (chunk: string | Uint8Array | Socket.CloseEvent) =>
+    Effect.andThen(Deferred.await(open), () => {
+      if (typeof chunk !== "string") return Effect.void;
+      const frame = JSON.parse(chunk) as { readonly _tag: string; readonly id?: string };
+      if (frame._tag === "Request") {
+        requests.push(frame.id!);
+        return Queue.offer(requested, frame.id!);
+      }
+      return frame._tag === "Ping" && answering
+        ? Queue.offer(frames, JSON.stringify({ _tag: "Pong" }))
+        : Effect.void;
+    });
+  const socket = Socket.make({
+    reader: Effect.andThen(
+      Effect.sync(() => connections++),
+      Effect.as(Deferred.succeed(open, undefined), {
+        pull: Effect.flatMap(Queue.take(frames), (frame) =>
+          typeof frame === "string" ? Effect.succeed([frame] as const) : Effect.fail(frame),
+        ),
+        upgrade: () => Effect.void,
+      }),
+    ),
+    writer: Effect.succeed({
+      write: receive,
+      writeAll: (chunks) => Effect.forEach(chunks, receive, { discard: true }),
+    }),
+  });
+  const Configure = Rpc.make("Configure", { success: Schema.String });
+  // Built into the caller's scope, as the CLI builds its own connection.
+  const context = yield* Layer.build(
+    Layer.effect(RpcClient.Protocol, RpcClient.makeProtocolSocket(FACTORY_RPC_TRANSPORT)).pipe(
+      Layer.provide(
+        Layer.mergeAll(Layer.succeed(Socket.Socket, socket), RpcSerialization.layerJson),
+      ),
+    ),
+  );
+  const client = yield* RpcClient.make(RpcGroup.make(Configure)).pipe(Effect.provide(context));
+  return {
+    call: Effect.gen(function* () {
+      const fiber = yield* client.Configure().pipe(Effect.forkScoped({ startImmediately: true }));
+      yield* Queue.take(requested);
+      return fiber;
+    }),
+    silent: () => {
+      answering = false;
+    },
+    reply: (requestId: string) =>
+      Queue.offer(
+        frames,
+        JSON.stringify({ _tag: "Exit", requestId, exit: { _tag: "Success", value: "applied" } }),
+      ),
+    drop: (cause: unknown) =>
+      Queue.offer(
+        frames,
+        new Socket.SocketError({ reason: new Socket.SocketReadError({ cause }) }),
+      ),
+    sent: () => ({ connections, requests: requests.length }),
+    lastRequest: () => requests.at(-1)!,
+  };
+});
+
+const isRpcClientError = Schema.is(RpcClientError.RpcClientError);
+
+const readCause = (exit: Exit.Exit<string, unknown>) => {
+  const error = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined;
+  if (!isRpcClientError(error)) return String(error ?? "succeeded");
+  const cause = "cause" in error.reason ? error.reason.cause : undefined;
+  return `${error.reason._tag}: ${cause instanceof Error ? cause.message : String(cause)}`;
+};
+
+it.effect(
+  "Transport: a valid reply after twelve silent seconds arrives; a minute of silence is lost once, never retried",
+  () =>
+    Effect.gen(function* () {
+      // A busy host: no frame for twelve seconds after the request, then its reply.
+      const busy = yield* transportHost;
+      busy.silent();
+      const waiting = yield* busy.call;
+      yield* TestClock.adjust("12 seconds");
+      yield* busy.reply(busy.lastRequest());
+      assert.strictEqual(readCause(yield* Fiber.await(waiting)), "succeeded");
+      assert.deepStrictEqual(busy.sent(), { connections: 1, requests: 1 });
+
+      // A host silent past the bound: its connection is given up, not waited on forever.
+      const gone = yield* transportHost;
+      gone.silent();
+      const abandoned = yield* gone.call;
+      yield* TestClock.adjust("65 seconds");
+      assert.strictEqual(readCause(yield* Fiber.await(abandoned)), "SocketReadError: ping timeout");
+      assert.deepStrictEqual(gone.sent(), { connections: 1, requests: 1 });
+    }).pipe(Effect.scoped),
+);
+
+it.effect("Transport: a dropped connection fails at once with its own cause, never retried", () =>
+  Effect.gen(function* () {
+    const dropped = yield* transportHost;
+    const cut = yield* dropped.call;
+    yield* dropped.drop(new Error("connection reset"));
+    assert.strictEqual(readCause(yield* Fiber.await(cut)), "SocketReadError: connection reset");
+    assert.deepStrictEqual(dropped.sent(), { connections: 1, requests: 1 });
+  }).pipe(Effect.scoped),
 );
 
 it.effect("Host admin: with no running server nothing is issued", () =>

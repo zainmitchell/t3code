@@ -39,6 +39,7 @@ import { Argument, Command, Flag, GlobalFlag } from "effect/cli";
 import { FetchHttpClient } from "effect/http";
 import * as HttpApiClient from "effect/http-api/HttpApiClient";
 import * as RpcClient from "effect/rpc/RpcClient";
+import * as RpcClientError from "effect/rpc/RpcClientError";
 import * as RpcSerialization from "effect/rpc/RpcSerialization";
 import * as Socket from "effect/socket/Socket";
 
@@ -236,11 +237,23 @@ export const runAudited = Effect.fn("factoryCli.runAudited")(function* <C, A, E,
       const destination = yield* input.destination;
       return yield* input.connect(destination.origin, destination.token).pipe(
         Effect.flatMap(use),
-        Effect.tapError((error) =>
-          audit({ actor: destination.actor, outcome: "failed", error: String(error) }).pipe(
-            Effect.ignore,
-          ),
-        ),
+        Effect.tapError((error) => {
+          const lost = lostReply(error);
+          return audit({
+            actor: destination.actor,
+            outcome: lost === undefined ? "failed" : "unknown",
+            error: lost ?? String(error),
+          }).pipe(Effect.ignore);
+        }),
+        Effect.mapError((error) => {
+          const lost = lostReply(error);
+          return lost === undefined
+            ? error
+            : new FactoryCliError({
+                operation: call.operation,
+                reason: `its reply was lost: ${lost}; it may have applied, so read the factory back before running it again`,
+              });
+        }),
         // The request already applied: a lost audit line must not read as the request failing.
         Effect.tap((result) =>
           audit({ actor: destination.actor, outcome: "succeeded", result }).pipe(
@@ -298,6 +311,41 @@ const withHostAdmin = Effect.fn("factoryCli.withHostAdmin")(function* <A, E>(
       );
 });
 
+/**
+ * The factory CLI's one connection, never retried. A busy host or CLI can be silent for seconds,
+ * so the connection is given up only after a minute without a frame, not the library's five.
+ */
+export const FACTORY_RPC_TRANSPORT = {
+  retryTransientErrors: false,
+  retryPolicy: Schedule.recurs(0),
+  pingTimeout: "60 seconds",
+} as const;
+
+const isRpcClientError = Schema.is(RpcClientError.RpcClientError);
+
+/**
+ * Why a call's reply was lost once its request could have reached the host, or undefined. Such a
+ * call may have applied: only reading the factory back says whether it did.
+ */
+const lostReply = (error: unknown) => {
+  if (!isRpcClientError(error)) return undefined;
+  const { reason } = error;
+  if (reason._tag === "SocketOpenError" || reason._tag === "SocketUpgradeError") return undefined;
+  const cause = "cause" in reason ? (reason.cause as unknown) : undefined;
+  // A WebSocket error event carries a message, or at least its type.
+  const detail =
+    cause instanceof Error
+      ? cause.message
+      : typeof cause === "object" && cause !== null
+        ? "message" in cause && typeof cause.message === "string" && cause.message !== ""
+          ? cause.message
+          : "type" in cause
+            ? String(cause.type)
+            : undefined
+        : undefined;
+  return detail === undefined ? error.message : `${error.message} (${detail})`;
+};
+
 /** The running server's owner methods, over its WebSocket, as any client reaches them. */
 const makeClient = Effect.fn("factoryCli.makeClient")(function* (origin: string, token: string) {
   const http = yield* HttpApiClient.make(EnvironmentHttpApi, { baseUrl: origin });
@@ -310,13 +358,7 @@ const makeClient = Effect.fn("factoryCli.makeClient")(function* (origin: string,
   url.searchParams.set("wsTicket", issued.ticket);
   url.searchParams.set(ORCHESTRATION_PROTOCOL_QUERY_PARAM, String(ORCHESTRATION_PROTOCOL_VERSION));
   const context = yield* Layer.build(
-    Layer.effect(
-      RpcClient.Protocol,
-      RpcClient.makeProtocolSocket({
-        retryTransientErrors: false,
-        retryPolicy: Schedule.recurs(0),
-      }),
-    ).pipe(
+    Layer.effect(RpcClient.Protocol, RpcClient.makeProtocolSocket(FACTORY_RPC_TRANSPORT)).pipe(
       Layer.provide(
         Layer.mergeAll(
           Socket.layerWebSocket(url.toString()).pipe(
