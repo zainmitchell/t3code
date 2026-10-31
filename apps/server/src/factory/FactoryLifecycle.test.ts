@@ -7317,13 +7317,30 @@ const custodyOfReservation = (execution: { readonly commandId: CommandId }) =>
 it.effect("Claims/R2-S03: running setup keeps a never-started execution live, not quiescent", () =>
   runIsolated(
     Effect.gen(function* () {
-      const { execution } = yield* preparedWithUnresolvedSetup(6610);
+      const { execution, run } = yield* preparedWithUnresolvedSetup(6610);
+      // The setup's shell started in the run's held container, as the real runner's terminal
+      // does (FactorySetupContainment.integration), so it is counted there while it runs.
+      yield* setContainedMembers(execution.threadId, 1);
       // The server restarts before the provider start was claimed: no provider ever ran.
       yield* (yield* ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService).recover;
       yield* runEffects;
+      // The cancellation ended the preparation, which settled to the container still holding
+      // the setup.
+      const obligation = Option.getOrUndefined(
+        yield* (yield* FactoryStore.FactoryStore).workspaceObligation(run.id),
+      );
+      assert.strictEqual(
+        obligation?.state === "settled" ? obligation.scope : undefined,
+        "contained",
+      );
       assert.deepStrictEqual(yield* custodyOfReservation(execution), {
         state: "live",
-        reasons: ["workspace_preparation"],
+        reasons: ["contained_processes"],
+      });
+      yield* setContainedMembers(execution.threadId, 0);
+      assert.deepStrictEqual(yield* custodyOfReservation(execution), {
+        state: "quiescent",
+        reasons: ["never_started"],
       });
     }),
   ),
