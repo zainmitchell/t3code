@@ -214,12 +214,15 @@ export interface TrackerSession {
     readonly labels: ReadonlyArray<string>;
   }) => Effect.Effect<CreateIssueOutcome>;
   /**
-   * This account's issue created since `since` (less a margin for clock skew) whose body carries
-   * `marker`, if any: how a create whose answer was lost is found before it is repeated.
+   * This account's issue created since `since` (less a margin for clock skew) that carries
+   * `marker` with exactly the intended title and body, if any: how a create whose answer was lost
+   * is found before it is repeated. One that merely carries the marker may be a worker's.
    */
   readonly findIssueByMarker: (input: {
     readonly repository: string;
     readonly marker: string;
+    readonly title: string;
+    readonly body: string;
     readonly since: string;
   }) => Effect.Effect<Option.Option<CreatedIssue>, FactoryTrackerError>;
   /** Makes `issueId` a sub-issue of `parentIssueNumber`; a later read of the child says it is. */
@@ -348,6 +351,7 @@ const CommentFields = Schema.Struct({
 const CreatedIssueFields = Schema.Struct({
   id: Schema.Int,
   number: Schema.Int,
+  title: Schema.optional(Schema.String),
   body: Schema.NullOr(Schema.String),
   user: Schema.optional(Schema.NullOr(Schema.Struct({ id: Schema.Int }))),
   pull_request: Schema.optional(Schema.Unknown),
@@ -790,6 +794,8 @@ const make = Effect.gen(function* () {
             function* (input: {
               readonly repository: string;
               readonly marker: string;
+              readonly title: string;
+              readonly body: string;
               readonly since: string;
             }) {
               // Bounded by `since`: only issues this account could have created for the intent. GitHub
@@ -810,7 +816,9 @@ const make = Effect.gen(function* () {
                     issue.pull_request === undefined &&
                     issue.user?.id !== undefined &&
                     String(issue.user.id) === identity.accountId &&
-                    (issue.body ?? "").includes(input.marker),
+                    (issue.body ?? "").includes(input.marker) &&
+                    issue.title === input.title &&
+                    (issue.body ?? "") === input.body,
                 );
                 if (found !== undefined) return Option.some(toCreatedIssue(found));
                 if (decoded.length < 100) return Option.none<CreatedIssue>();

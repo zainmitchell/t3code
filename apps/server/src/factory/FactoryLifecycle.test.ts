@@ -1030,6 +1030,7 @@ const layerGitHubRestFake = Layer.effect(
               .map(([, issue]) => ({
                 id: issue.created!.id,
                 number: issue.number,
+                title: issue.title,
                 body: issue.body,
                 user: issue.created!.user,
               }));

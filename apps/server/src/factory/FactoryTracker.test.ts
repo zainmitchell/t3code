@@ -149,6 +149,39 @@ it.effect("a deleted comment reads as absent, never as an error", () =>
   }),
 );
 
+it.effect(
+  "a lost issue create is found only as this account's issue with exactly its title and body",
+  () =>
+    Effect.gen(function* () {
+      const marker = "<!-- t3-factory-ticket:op-1 -->";
+      const title = "Correct the parser";
+      const body = `${marker}\n\nCorrect the parser.`;
+      // Newest first: a worker's issue under the factory account that carries the marker, the same
+      // text under another title, and the same issue opened by another account.
+      const listed = [
+        { id: 14, number: 4, title, body: `${marker}\n\nSomething else.`, user: { id: 9001 } },
+        { id: 13, number: 3, title: "Another", body, user: { id: 9001 } },
+        { id: 12, number: 2, title, body, user: { id: 7 } },
+        { id: 11, number: 1, title, body, user: { id: 9001 } },
+      ];
+      const found = yield* withSession(
+        () => Effect.succeed(listed),
+        (session) =>
+          session.findIssueByMarker({
+            repository: "acme/web",
+            marker,
+            title,
+            body,
+            since: "2026-10-30T00:00:00.000Z",
+          }),
+      );
+      assert.deepStrictEqual(
+        Option.map(found, (issue) => issue.number),
+        Option.some(1),
+      );
+    }),
+);
+
 it.effect("a successful create without a readable id is ambiguous", () =>
   Effect.gen(function* () {
     const outcome = yield* withSession(
