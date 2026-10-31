@@ -1,0 +1,2615 @@
+import { modelSelectionsEqual } from "@t3tools/shared/model";
+// @effect-diagnostics nodeBuiltinImport:off - sha256 of small identity strings.
+import { encodeItemEvent } from "./factoryItemEvents.ts";
+import * as NodeCrypto from "node:crypto";
+
+import {
+  CommandId,
+  FactoryClaimCarrierKey,
+  FactoryDecisionKey,
+  FactoryId,
+  FactoryItemKey,
+  FactoryObservationId,
+  FactoryPoolId,
+  FactoryReadGeneration,
+  FactoryReservationId,
+  ModelSelection,
+  NodeId,
+  NonNegativeInt,
+  type OrchestrationV2FactoryAdmission,
+  type OrchestrationV2ThreadCreatedFrom,
+  PositiveInt,
+  ProjectId,
+  ProviderInteractionMode,
+  RunId,
+  RuntimeMode,
+  ScheduledTaskId,
+  ThreadId,
+  TrimmedNonEmptyString,
+} from "@t3tools/contracts";
+import * as Context from "effect/Context";
+import * as DateTime from "effect/DateTime";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
+import * as SqlClient from "effect/sql/SqlClient";
+
+import { PreparationOwnerId } from "../orchestration-v2/preparationOwner.ts";
+import { HostBoot, RESIDUAL_UNCERTAINTIES } from "./factoryHistoricalTermination.ts";
+
+export class FactoryStoreError extends Schema.TaggedError<FactoryStoreError>()(
+  "FactoryStoreError",
+  {
+    operation: Schema.String,
+    factoryId: Schema.optional(Schema.String),
+    cause: Schema.Defect(),
+  },
+) {
+  override get message(): string {
+    return `Factory store ${this.operation} failed.`;
+  }
+}
+
+const Bounded = TrimmedNonEmptyString.check(Schema.isMaxLength(256));
+
+export const FactoryPool = Schema.Struct({
+  poolId: FactoryPoolId,
+  capacityUnits: NonNegativeInt,
+});
+
+/**
+ * The consumer schema of the pinned helper command a packet tells the worker to run. `supplied`
+ * arguments are bound to the native decision; `workerSupplied` ones are report-time obligations.
+ */
+export const FactoryHelperInvocation = Schema.Struct({
+  command: Bounded,
+  required: Schema.Array(Bounded),
+  choices: Schema.Record(Bounded, Schema.Array(Bounded)),
+  supplied: Schema.Record(Bounded, Schema.Literals(["taskKind", "decisionKey"])),
+  workerSupplied: Schema.Array(Bounded),
+});
+export type FactoryHelperInvocation = typeof FactoryHelperInvocation.Type;
+
+/** How the factory claims a tracker item before any provider work. Labels are policy, not provenance. */
+export const FactoryClaimConfig = Schema.Struct({
+  host: Bounded,
+  /** The verified tracker account allowed to write claims. */
+  accountId: Bounded,
+  /**
+   * The label that marks a new item ready, for a project whose readiness is a label. Absent,
+   * readiness is the project policy's. Either way, collection also reads unready issues a claim
+   * may hold, since their work occupies files and resources.
+   */
+  eligibilityLabel: Schema.optional(Bounded),
+  foreignClaimLabels: Schema.Array(Bounded),
+  foreignClaimCommentPatterns: Schema.Array(Bounded),
+  /** What an observed claim nobody can attribute is charged. */
+  observedClaimPool: Schema.Struct({ poolId: FactoryPoolId, units: PositiveInt }),
+  /** Where reconciliation looks for open issues. */
+  repositories: Schema.optional(Schema.Array(Bounded)),
+});
+export type FactoryClaimConfig = typeof FactoryClaimConfig.Type;
+
+const FactoryExecution = Schema.Struct({
+  modelSelection: ModelSelection,
+  runtimeMode: RuntimeMode,
+  interactionMode: ProviderInteractionMode,
+});
+export type FactoryExecution = typeof FactoryExecution.Type;
+
+export const FactoryConfigurationInput = Schema.Struct({
+  factoryId: FactoryId,
+  projectId: ProjectId,
+  policyRevision: Bounded,
+  enabled: Schema.Boolean,
+  pools: Schema.Array(FactoryPool),
+  execution: FactoryExecution,
+  /**
+   * Stages that run other than `execution`, such as an independent review on another model.
+   * Each stage's work, and everything it delegates, runs as configured for that stage.
+   */
+  stageExecution: Schema.optional(
+    Schema.Struct({
+      implement: Schema.optional(FactoryExecution),
+      review: Schema.optional(FactoryExecution),
+      correct: Schema.optional(FactoryExecution),
+      rework: Schema.optional(FactoryExecution),
+      /** Decomposition proposals; a cheap model suffices and is the point. */
+      triage: Schema.optional(FactoryExecution),
+    }),
+  ),
+  /**
+   * Executions a project policy may choose for one decision by name, such as a builder's effort
+   * from the issue's labels. A name the configuration does not hold is refused.
+   */
+  executionChoices: Schema.optional(Schema.Record(Bounded, FactoryExecution)),
+  packet: Schema.Struct({
+    briefSchemaVersion: Bounded,
+    helper: Schema.NullOr(
+      Schema.Struct({
+        path: TrimmedNonEmptyString,
+        sha256: Bounded,
+        invocation: Schema.optional(FactoryHelperInvocation),
+      }),
+    ),
+  }),
+  artifactRoot: TrimmedNonEmptyString,
+  claim: Schema.optional(FactoryClaimConfig),
+  /**
+   * The project's one-shot policy command, pinned by content: it receives one item's immutable
+   * facts on stdin and answers with one decision on stdout. It keeps no state between calls.
+   */
+  policy: Schema.optional(
+    Schema.Struct({
+      executable: TrimmedNonEmptyString,
+      script: TrimmedNonEmptyString,
+      sha256: Bounded,
+    }),
+  ),
+  /** How often the server reconciles the factory on its own; absent, only triggers do. */
+  reconcileEveryMinutes: Schema.optional(PositiveInt),
+  /**
+   * The owner's thread, where the factory asks for the owner's decisions as chat questions that
+   * only the owner's own signed-in client can answer. Absent, decisions wait in Settings.
+   */
+  ownerThreadId: Schema.optional(ThreadId),
+  /**
+   * Where T3 lands reviewed work: directly, merging or fast-forwarding a branch of `remote` (the
+   * project itself when null) under T3's identity; or by pull request, publishing the reviewed head
+   * and merging into `branch` of `repository` at exactly that head once host protection allows.
+   * Absent, nothing integrates.
+   */
+  integration: Schema.optional(
+    Schema.Union([
+      Schema.Struct({
+        branch: Bounded,
+        remote: Schema.NullOr(Bounded),
+        mode: Schema.Literals(["merge", "fast_forward"]),
+        identity: Schema.Struct({ name: Bounded, email: Bounded }),
+      }),
+      Schema.Struct({
+        mode: Schema.Literal("pull_request"),
+        repository: Bounded,
+        remote: Bounded,
+        branch: Bounded,
+        method: Schema.Literals(["merge", "squash", "rebase"]),
+        /**
+         * A commit status the repository's protection requires as its record of independent
+         * acceptance; T3 posts it on the exact reviewed head before merging.
+         */
+        acceptanceStatus: Schema.optional(Schema.Struct({ context: Bounded })),
+      }),
+    ]),
+  ),
+  /** How long one item's tracker read may take before the pass records it unread. */
+  readDeadlineSeconds: Schema.optional(PositiveInt),
+  /**
+   * What a bound verification may run as, read and write, as Root adopted it. A policy's binding
+   * pointer is checked against this; absent, no bound verification starts.
+   */
+  verification: Schema.optional(
+    Schema.Struct({
+      /** The only directory binding templates and their inputs are read from. */
+      templateRoot: TrimmedNonEmptyString,
+      /** Each bound verification writes only to a new directory directly under this one. */
+      outputBase: TrimmedNonEmptyString,
+      consumers: Schema.Array(Schema.Struct({ contract: Bounded, version: Bounded })),
+      /**
+       * The non-secret account each named execution runs as: the label templates name, and what
+       * its provider instance must itself report, fresh and authenticated, before it starts.
+       */
+      identities: Schema.Record(
+        Bounded,
+        Schema.Struct({
+          identity: Bounded,
+          observe: Schema.Struct({
+            type: Schema.optional(Bounded),
+            email: Schema.optional(Bounded),
+            profileId: Schema.optional(Bounded),
+            workspaceId: Schema.optional(Bounded),
+          }),
+        }),
+      ),
+    }),
+  ),
+  /**
+   * Who may close a parent once T3 finds every required clause of its adopted criteria proved:
+   * the project itself, or only after the owner approved. Absent, no parent is closed.
+   */
+  parents: Schema.optional(
+    Schema.Struct({
+      close: Schema.Literals(["project", "owner"]),
+      /** The only directory adopted criteria documents are read from. */
+      criteriaRoot: TrimmedNonEmptyString,
+    }),
+  ),
+});
+export type FactoryConfigurationInput = typeof FactoryConfigurationInput.Type;
+
+/**
+ * Finite owner authority for one exact supervised subject: the item, the stage and the evidence
+ * of the request the owner answered. It is spent only in an admission commit that revalidates all
+ * three, so it never falls through to another item, stage or changed request.
+ */
+export const FactoryGrant = Schema.Struct({
+  grantId: Bounded,
+  factoryId: FactoryId,
+  itemKey: FactoryItemKey,
+  stage: Bounded,
+  evidenceDigest: Bounded,
+  units: PositiveInt,
+  remaining: NonNegativeInt,
+  state: Schema.Literals(["active", "spent", "revoked"]),
+  /** The reserved decision the owner answered with it. */
+  decisionId: Schema.String,
+  issuedBy: Schema.String,
+  issuedAt: Schema.String,
+  /** The reservations that spent it, in order. */
+  spentBy: Schema.Array(Schema.String),
+  revoked: Schema.optional(Schema.Struct({ by: Schema.String, at: Schema.String })),
+});
+export type FactoryGrant = typeof FactoryGrant.Type;
+
+export const FactoryConfiguration = Schema.Struct({
+  ...FactoryConfigurationInput.fields,
+  revision: PositiveInt,
+  createdAt: Schema.String,
+});
+export type FactoryConfiguration = typeof FactoryConfiguration.Type;
+
+const ExecutionBinding = Schema.Struct({
+  commandId: CommandId,
+  threadId: ThreadId,
+  runId: RunId,
+  taskNodeId: NodeId,
+});
+
+const ReservationFields = {
+  reservationId: FactoryReservationId,
+  factoryId: FactoryId,
+  itemKey: FactoryItemKey,
+  poolId: FactoryPoolId,
+  units: PositiveInt,
+  /** A released reservation stays as history and holds nothing. */
+  state: Schema.Literals(["held", "released"]),
+  releasedReason: Schema.optional(
+    Schema.Literals([
+      "claim_not_written",
+      "attested_native_mirror",
+      "outcome_verified",
+      "owner_disposition",
+      "rolled_back",
+    ]),
+  ),
+  createdAt: Schema.String,
+};
+
+/**
+ * The owner's attestation that an admitted stage never started, given on exactly the evidence its
+ * digest names. It proves nothing about the stage's preparation; it is the owner's to give.
+ */
+const NeverStartedAttestation = Schema.Struct({
+  by: Bounded,
+  reason: TrimmedNonEmptyString.check(Schema.isMaxLength(2_000)),
+  evidenceDigest: Bounded,
+  evidence: Schema.optional(Schema.String),
+  attestedAt: Schema.String,
+});
+
+/**
+ * The owner's quarantine of a held stage whose historical execution can never be proved to have
+ * ended: it stays held, owning its item and fencing its thread, but is no longer charged against
+ * its pool. It proves nothing about its processes. `evidence` is what its digest names.
+ */
+const ReservationQuarantine = Schema.Struct({
+  by: Bounded,
+  reason: TrimmedNonEmptyString.check(Schema.isMaxLength(2_000)),
+  evidenceDigest: Bounded,
+  evidence: Schema.String,
+  quarantinedAt: Schema.String,
+});
+export type ReservationQuarantine = typeof ReservationQuarantine.Type;
+
+/** A quarantine the owner ended: the stage is charged again, and still unproved. */
+const EndedQuarantine = Schema.Struct({
+  ...ReservationQuarantine.fields,
+  left: Schema.Struct({
+    by: Bounded,
+    reason: TrimmedNonEmptyString.check(Schema.isMaxLength(2_000)),
+    evidenceDigest: Bounded,
+    leftAt: Schema.String,
+  }),
+});
+
+/**
+ * Coverage of a historical execution's processes by a full restart of their host, in two owner
+ * steps. The capture binds the exact execution and the host boot before the named operation; the
+ * proof records a later boot of the same host with that execution unchanged. Only a proof covers
+ * anything, and only the attempts, launches and containers its capture names.
+ */
+const HistoricalTerminationCapture = Schema.Struct({
+  by: Bounded,
+  reason: TrimmedNonEmptyString.check(Schema.isMaxLength(2_000)),
+  operationRef: Bounded,
+  evidenceDigest: Bounded,
+  evidence: Schema.String,
+  executionDigest: Bounded,
+  servingId: Bounded,
+  host: HostBoot,
+  covers: Schema.Struct({
+    attempts: Schema.Array(Schema.String),
+    launches: Schema.Array(
+      Schema.Struct({ runId: Schema.String, status: Schema.String, attemptCount: Schema.Number }),
+    ),
+    generations: Schema.Array(Schema.String),
+  }),
+  /**
+   * The retained provenance that placed every writer of the execution on `host` for this
+   * operation. A capture without it, from earlier builds, proves nothing however it is verified.
+   */
+  provenance: Schema.optional(Schema.Struct({ digest: Bounded, source: Schema.String })),
+  /**
+   * The owner's decision to accept exactly the uncertainty no retained record settles, over the
+   * canonical scope it was shown. A decision, never provenance: nothing here places a writer.
+   */
+  residual: Schema.optional(
+    Schema.Struct({
+      accepted: Schema.Array(Schema.Literals(RESIDUAL_UNCERTAINTIES)),
+      scopeDigest: Bounded,
+      scope: Schema.String,
+    }),
+  ),
+  capturedAt: Schema.String,
+});
+const HistoricalTerminationProof = Schema.Struct({
+  by: Bounded,
+  reason: TrimmedNonEmptyString.check(Schema.isMaxLength(2_000)),
+  evidenceDigest: Bounded,
+  evidence: Schema.String,
+  servingId: Bounded,
+  host: HostBoot,
+  provedAt: Schema.String,
+});
+const HistoricalTermination = Schema.Struct({
+  capture: HistoricalTerminationCapture,
+  proof: Schema.optional(HistoricalTerminationProof),
+});
+export type HistoricalTermination = typeof HistoricalTermination.Type;
+type HistoricalTerminationCapture = typeof HistoricalTerminationCapture.Type;
+type HistoricalTerminationProof = typeof HistoricalTerminationProof.Type;
+
+/** A factory decision admitted through `factory.execution.start`. */
+const AdmittedReservation = Schema.Struct({
+  origin: Schema.Literal("admitted"),
+  ...ReservationFields,
+  decisionKey: FactoryDecisionKey,
+  taskKind: Bounded,
+  itemVersion: Bounded,
+  policyRevision: Bounded,
+  configRevision: PositiveInt,
+  packetDigest: Bounded,
+  modelSelection: ModelSelection,
+  execution: ExecutionBinding,
+  /** A later lifecycle stage: the reservation whose claim owns the item. */
+  continues: Schema.optional(FactoryReservationId),
+  stageBasis: Schema.optional(Bounded),
+  /** The observation the decision was admitted on, so a later change under it is recorded. */
+  observationId: Schema.optional(FactoryObservationId),
+  /** The finite grant the decision spent, if it was supervised. */
+  grantId: Schema.optional(Bounded),
+  /** The serving process that admitted it; see `FactoryStore.servingId`. */
+  admittedIn: Schema.optional(Bounded),
+  neverStartedAttestation: Schema.optional(NeverStartedAttestation),
+  quarantine: Schema.optional(ReservationQuarantine),
+  quarantineHistory: Schema.optional(Schema.Array(EndedQuarantine)),
+  historicalTermination: Schema.optional(HistoricalTermination),
+  /** The single-capacity resources it holds while held, from its stage basis. */
+  resources: Schema.optional(Schema.Array(Bounded)),
+  /** The configured execution its decision chose by name, when it holds resources or verifies. */
+  executionChoice: Schema.optional(Bounded),
+});
+
+/** A counted descendant of a native execution, admitted under the configuration current then. */
+const InheritedReservation = Schema.Struct({
+  origin: Schema.Literal("inherited"),
+  ...ReservationFields,
+  parentReservationId: FactoryReservationId,
+  decisionKey: FactoryDecisionKey,
+  configRevision: PositiveInt,
+  modelSelection: ModelSelection,
+  execution: ExecutionBinding,
+});
+
+/** An external claim no native operation produced; its custody is unknown. */
+const ObservedReservation = Schema.Struct({
+  origin: Schema.Literal("observed"),
+  ...ReservationFields,
+  carrierKey: FactoryClaimCarrierKey,
+  /** The read generation the claim was seen in. */
+  generation: FactoryReadGeneration,
+});
+
+/**
+ * A legacy worker's custody, transferred to the factory: one per worker, bound to its thread, so
+ * every live or unknown worker is charged and nothing it starts escapes the factory. Nothing
+ * contained that work, so its custody stays unknown until the owner disposes of it. An item whose
+ * legacy work names no worker holds one for the item.
+ */
+const TransferredReservation = Schema.Struct({
+  origin: Schema.Literal("transferred"),
+  ...ReservationFields,
+  transferId: Bounded,
+  job: Bounded,
+  workId: Schema.optional(Bounded),
+  threadId: Schema.optional(ThreadId),
+});
+
+const WorkspaceObligationFields = {
+  runId: RunId,
+  reservationId: FactoryReservationId,
+  threadId: ThreadId,
+  commandId: CommandId,
+  ownerId: PreparationOwnerId,
+  openedAt: Schema.String,
+  /** The serving process that opened it; see `FactoryStore.servingId`. */
+  openedIn: Schema.optional(Schema.String),
+  /** Owners a recovery or a disposition replaced, with the containers proved ended before it did. */
+  priorOwners: Schema.optional(
+    Schema.Array(
+      Schema.Struct({
+        ownerId: PreparationOwnerId,
+        endedGenerations: Schema.Array(Schema.String),
+        recoveredAt: Schema.String,
+      }),
+    ),
+  ),
+};
+
+/**
+ * A claimed run's workspace work, open from the transaction that authorizes it, before any I/O.
+ * Its own owner settles it for the scope its preparation proved: no external process boundary
+ * entered, or every process a member of its run's container. A never-started disposition settles
+ * one whose owner was lost, as contained, once every container of its run ended.
+ */
+export const WorkspaceObligation = Schema.Union([
+  Schema.Struct({ ...WorkspaceObligationFields, state: Schema.Literal("open") }),
+  Schema.Struct({
+    ...WorkspaceObligationFields,
+    state: Schema.Literal("settled"),
+    scope: Schema.Literal("no_external_work"),
+    settledAt: Schema.String,
+  }),
+  Schema.Struct({
+    ...WorkspaceObligationFields,
+    state: Schema.Literal("settled"),
+    scope: Schema.Literal("contained"),
+    generationId: Schema.String,
+    settledAt: Schema.String,
+  }),
+]);
+export type WorkspaceObligation = typeof WorkspaceObligation.Type;
+
+export const FactoryReservation = Schema.Union([
+  AdmittedReservation,
+  InheritedReservation,
+  ObservedReservation,
+  TransferredReservation,
+]);
+export type FactoryReservation = typeof FactoryReservation.Type;
+/** A reservation for work T3 itself started, with its execution. */
+export type NativeReservation = Extract<
+  FactoryReservation,
+  { readonly origin: "admitted" | "inherited" }
+>;
+
+/** The custody a collection pass weighed, which each consequential act of the pass commits beside. */
+export interface CustodyFence {
+  readonly factoryId: FactoryId;
+  readonly custodyRead: ReadonlyArray<FactoryReservationId>;
+  readonly transfersRead: ReadonlyArray<{ readonly transferId: string; readonly state: string }>;
+  /** The configuration revision an act's authority was read from; a later one refuses it. */
+  readonly configurationRevision?: number;
+}
+
+/**
+ * Whether custody moved since a pass weighed it: another reservation held, other than a direct
+ * descendant of one weighed, or a transfer begun or in another state. Run it inside the commit.
+ */
+export const custodyMoved = Effect.fnUntraced(function* (
+  sql: SqlClient.SqlClient,
+  fence: CustodyFence,
+) {
+  const read = new Set<string>(fence.custodyRead);
+  const holding = yield* sql<{
+    readonly reservation_id: string;
+    readonly parent_reservation_id: string | null;
+  }>`
+    SELECT reservation_id, parent_reservation_id FROM factory_reservations
+    WHERE factory_id = ${fence.factoryId} AND state = 'held'
+  `;
+  const unread = holding.some(
+    (row) =>
+      !read.has(row.reservation_id) &&
+      (row.parent_reservation_id === null || !read.has(row.parent_reservation_id)),
+  );
+  if (unread) return true;
+  if (fence.configurationRevision !== undefined) {
+    const [latest] = yield* sql<{ readonly revision: number }>`
+      SELECT MAX(revision) AS revision FROM factory_configurations
+      WHERE factory_id = ${fence.factoryId}
+    `;
+    if (latest?.revision !== fence.configurationRevision) return true;
+  }
+  // A transfer makes a legacy writer known whether or not it holds a reservation, and a rollback
+  // hands it back still writing.
+  const weighed = new Set(
+    fence.transfersRead.map((transfer) => `${transfer.transferId}\n${transfer.state}`),
+  );
+  const transfers = yield* sql<{ readonly transfer_id: string; readonly state: string }>`
+    SELECT transfer_id, state FROM factory_transfers WHERE factory_id = ${fence.factoryId}
+  `;
+  return transfers.some((row) => !weighed.has(`${row.transfer_id}\n${row.state}`));
+});
+
+export const isNativeReservation = (
+  reservation: FactoryReservation,
+): reservation is NativeReservation =>
+  reservation.origin === "admitted" || reservation.origin === "inherited";
+
+export const FactoryReservationRefusal = Schema.Literals([
+  "configuration_changed",
+  "factory_paused",
+  "unknown_pool",
+  "decision_already_admitted",
+  "item_owned",
+  "capacity_exhausted",
+  "deadline_expired",
+  "incomplete_basis",
+  "stale_basis",
+  "unbound_destination",
+  "selection_not_configured",
+  "selection_pinned",
+  "origin_conflict",
+  "claim_not_ready",
+  "grant_unavailable",
+  /** The work comes from a transferred legacy worker, whose custody is not T3's to extend. */
+  "legacy_custody",
+  /** Custody was taken after the decision was made, so the decision did not weigh it. */
+  "custody_changed",
+  /** Another admitted decision already reserved this verification output directory. */
+  "output_root_reserved",
+  /** Another held reservation holds a single-capacity resource the decision names. */
+  "resource_held",
+]);
+export type FactoryReservationRefusal = typeof FactoryReservationRefusal.Type;
+
+export interface ReserveExecutionInput {
+  readonly commandId: CommandId;
+  readonly executionThreadId: ThreadId;
+  readonly runId: RunId;
+  readonly taskNodeId: NodeId;
+  readonly modelSelection: ModelSelection;
+  readonly origin:
+    | { readonly type: "admission"; readonly admission: OrchestrationV2FactoryAdmission }
+    | {
+        readonly type: "descendant";
+        /** Trusted origin threads in order: lineage parent, then sender. */
+        readonly ownerThreadIds: ReadonlyArray<ThreadId>;
+        readonly scheduledTaskId: ScheduledTaskId | null;
+        /** False when the thread already ran before this start. */
+        readonly firstRun: boolean;
+        /** A restart continuation: it resumes a run counted before the restart. */
+        readonly resumes?: boolean;
+      };
+}
+
+/**
+ * Every agent execution in the environment as its shared ceiling counts them, each once: held
+ * factory custody in any factory or pool (a descendant only while its own run is unfinished, an
+ * observed carrier once and not beside the native or transferred custody it mirrors), and the
+ * unfinished run of any thread no held reservation covers. Units for factory custody, one per run.
+ */
+export interface AgentOccupancy {
+  /** The environment's ceiling; null when none is set and each factory's pools limit it. */
+  readonly ceiling: number | null;
+  readonly revision: number;
+  readonly occupied: number;
+  readonly counted: {
+    readonly admitted: number;
+    readonly descendants: number;
+    readonly observed: number;
+    readonly transferred: number;
+    readonly otherRuns: number;
+  };
+  /** Threads counted under `otherRuns`, for an owner to find what holds the ceiling. */
+  readonly otherRunThreads: ReadonlyArray<string>;
+}
+
+export type ReserveExecutionResult =
+  | { readonly type: "reserved"; readonly reservation: NativeReservation }
+  /** A continuation of the thread's own execution, or work with no factory origin. */
+  | { readonly type: "none" }
+  | { readonly type: "refused"; readonly refusal: FactoryReservationRefusal };
+
+const ObservedClaim = Schema.Struct({
+  /** Stable identity of the external claim record, e.g. the tracker event that applied a label. */
+  carrierKey: FactoryClaimCarrierKey,
+  poolId: FactoryPoolId,
+  units: PositiveInt,
+});
+
+const EvidenceEntry = Schema.Struct({ carrierId: Bounded, bodyDigest: Bounded, version: Bounded });
+
+/** One collection read of an item, recorded natively so admission can fence on it. */
+export const ItemObservationInput = Schema.Struct({
+  factoryId: FactoryId,
+  itemKey: FactoryItemKey,
+  itemVersion: Bounded,
+  /** Allocated by `beginCollection` before the read started. */
+  generation: FactoryReadGeneration,
+  /** False when the read could not see everything the decision depends on. */
+  complete: Schema.Boolean,
+  evidence: Schema.Array(EvidenceEntry),
+  sources: Schema.Array(Schema.Struct({ sourceKey: Bounded, version: Bounded })),
+  claims: Schema.Array(ObservedClaim),
+  /** The tracker item this read observed; a claim is written to it and nowhere else. */
+  subject: Schema.optional(
+    Schema.Struct({
+      tracker: Schema.Literal("github"),
+      repository: Bounded,
+      issueNumber: PositiveInt,
+    }),
+  ),
+});
+export type ItemObservationInput = typeof ItemObservationInput.Type;
+
+export const ItemObservation = Schema.Struct({
+  ...ItemObservationInput.fields,
+  observationId: FactoryObservationId,
+  /** Digest of everything but the generation: two reads with equal digests saw the same item. */
+  basisDigest: Bounded,
+  observedAt: Schema.String,
+});
+export type ItemObservation = typeof ItemObservation.Type;
+
+export type ItemObservationResult =
+  | { readonly type: "recorded"; readonly observation: ItemObservation }
+  /**
+   * This generation already recorded different evidence for the item. The conflict and its claims
+   * are kept, and no basis read at or before this generation admits; reread under a new one.
+   */
+  | { readonly type: "conflict"; readonly recorded: ItemObservation }
+  /** A later generation already observed the item, so this delayed read is not kept. */
+  | { readonly type: "superseded"; readonly current: ItemObservation }
+  | { readonly type: "unknown_generation" };
+
+const sha256 = (text: string) => NodeCrypto.createHash("sha256").update(text).digest("hex");
+const byTuple = (left: ReadonlyArray<string>, right: ReadonlyArray<string>) =>
+  left.join("\u0000") < right.join("\u0000")
+    ? -1
+    : left.join("\u0000") > right.join("\u0000")
+      ? 1
+      : 0;
+
+/** The one canonical ordering of a decision's evidence, shared by every digest over it. */
+/** The one grant an owner's answer to a grant request can issue. */
+export const grantIdOf = (decisionId: string) => `grant:${decisionId}`;
+
+export const canonicalEvidence = (evidence: ReadonlyArray<typeof EvidenceEntry.Type>) =>
+  evidence.map((entry) => [entry.carrierId, entry.bodyDigest, entry.version]).toSorted(byTuple);
+
+/**
+ * Two reads with equal digests saw the same item. `ownCarrier` leaves out exactly the carrier
+ * this factory's own claim wrote, so its expected self-mutation does not read as a change.
+ */
+export const basisDigestOf = (
+  input: Omit<ItemObservationInput, "factoryId" | "itemKey" | "generation" | "complete">,
+  ownCarrier?: string,
+) =>
+  sha256(
+    JSON.stringify([
+      input.itemVersion,
+      canonicalEvidence(input.evidence),
+      input.sources.map((source) => [source.sourceKey, source.version]).toSorted(byTuple),
+      input.claims
+        .filter((claim) => claim.carrierKey !== ownCarrier)
+        .map((claim) => [claim.carrierKey])
+        .toSorted(byTuple),
+      ...(input.subject === undefined
+        ? []
+        : [[input.subject.tracker, input.subject.repository, input.subject.issueNumber]]),
+    ]),
+  );
+
+const sameSelection = Schema.toEquivalence(ModelSelection);
+
+const hasDistinctOptionIds = (selection: ModelSelection) => {
+  const ids = (selection.options ?? []).map((option) => option.id);
+  return new Set(ids).size === ids.length;
+};
+
+/**
+ * Whether a starting request runs on an execution's pinned selection. Option order does not
+ * matter when every id is distinct; a repeated id is read by its first entry, so then only the
+ * exact list is the same selection.
+ */
+/** Every model a decision or its delegates may run on under this configuration. */
+const configuredSelections = (
+  configuration: Pick<
+    FactoryConfigurationInput,
+    "execution" | "stageExecution" | "executionChoices"
+  >,
+) => [
+  configuration.execution.modelSelection,
+  ...Object.values(configuration.stageExecution ?? {}).flatMap((execution) =>
+    execution === undefined ? [] : [execution.modelSelection],
+  ),
+  ...Object.values(configuration.executionChoices ?? {}).map(
+    (execution) => execution.modelSelection,
+  ),
+];
+
+/** How a decision for `taskKind` runs under this configuration. */
+export const executionFor = (
+  configuration: Pick<FactoryConfigurationInput, "execution" | "stageExecution">,
+  taskKind: string,
+): FactoryExecution =>
+  (taskKind === "implement" ||
+  taskKind === "review" ||
+  taskKind === "correct" ||
+  taskKind === "rework" ||
+  taskKind === "triage"
+    ? configuration.stageExecution?.[taskKind]
+    : undefined) ?? configuration.execution;
+
+export const samePinnedSelection = (pinned: ModelSelection, requested: ModelSelection) =>
+  sameSelection(pinned, requested) ||
+  (hasDistinctOptionIds(pinned) &&
+    hasDistinctOptionIds(requested) &&
+    modelSelectionsEqual(pinned, requested));
+
+export class FactoryStore extends Context.Service<
+  FactoryStore,
+  {
+    readonly configure: (
+      input: FactoryConfigurationInput,
+    ) => Effect.Effect<FactoryConfiguration, FactoryStoreError>;
+    /**
+     * Installs `input` only while `expectRevision` is still the factory's latest, checked in the
+     * same transaction, so a writer that landed after the caller read is never overwritten.
+     */
+    readonly configureAtRevision: (
+      input: FactoryConfigurationInput,
+      expectRevision: number,
+    ) => Effect.Effect<
+      | { readonly type: "configured"; readonly configuration: FactoryConfiguration }
+      | { readonly type: "conflict"; readonly revision: number },
+      FactoryStoreError
+    >;
+    readonly getConfiguration: (
+      factoryId: FactoryId,
+    ) => Effect.Effect<Option.Option<FactoryConfiguration>, FactoryStoreError>;
+    /** Every factory's current configuration. */
+    readonly listConfigurations: () => Effect.Effect<
+      ReadonlyArray<FactoryConfiguration>,
+      FactoryStoreError
+    >;
+    /** Allocates the next read generation; call before a collection reads anything. */
+    readonly beginCollection: (
+      factoryId: FactoryId,
+    ) => Effect.Effect<FactoryReadGeneration, FactoryStoreError>;
+    /** Records a collection read and the claims it saw. */
+    readonly recordItemObservation: (
+      input: ItemObservationInput,
+    ) => Effect.Effect<ItemObservationResult, FactoryStoreError>;
+    readonly getObservation: (input: {
+      readonly factoryId: FactoryId;
+      readonly observationId: FactoryObservationId;
+    }) => Effect.Effect<Option.Option<ItemObservation>, FactoryStoreError>;
+    /** The environment's agent ceiling and every execution it counts now. */
+    readonly agentOccupancy: () => Effect.Effect<AgentOccupancy, FactoryStoreError>;
+    /**
+     * Sets the environment's agent ceiling, or clears it with null, only while `expectRevision`
+     * is still its revision. While one is set it alone limits every factory's starts; no pool
+     * subdivides it.
+     */
+    readonly setAgentCeiling: (input: {
+      readonly agents: number | null;
+      readonly expectRevision: number;
+      readonly by: string;
+    }) => Effect.Effect<
+      { readonly applied: boolean; readonly occupancy: AgentOccupancy },
+      FactoryStoreError
+    >;
+    /** Decides and records a reservation. The caller must hold the write transaction. */
+    readonly reserveExecution: (
+      input: ReserveExecutionInput,
+    ) => Effect.Effect<ReserveExecutionResult, FactoryStoreError>;
+    /**
+     * Records that T3's own claim effect produced `carrierKey` for this native reservation. Only
+     * such a claim is that reservation's mirror; the effect calls this after reading it back.
+     */
+    readonly recordClaimOperation: (input: {
+      readonly reservationId: FactoryReservationId;
+      readonly carrierKey: FactoryClaimCarrierKey;
+    }) => Effect.Effect<boolean, FactoryStoreError>;
+    readonly listReservations: (
+      factoryId: FactoryId,
+    ) => Effect.Effect<ReadonlyArray<FactoryReservation>, FactoryStoreError>;
+    readonly findAdmission: (input: {
+      readonly factoryId: FactoryId;
+      readonly decisionKey: FactoryDecisionKey;
+    }) => Effect.Effect<Option.Option<FactoryReservation>, FactoryStoreError>;
+    /**
+     * Records that a schedule a factory execution creates or edits belongs to that execution.
+     * Callers that also write the schedule run both in one transaction.
+     */
+    readonly recordScheduleOrigin: (input: {
+      readonly scheduledTaskId: ScheduledTaskId;
+      readonly callerThreadId: ThreadId;
+    }) => Effect.Effect<Option.Option<FactoryReservation>, FactoryStoreError>;
+    readonly scheduleOrigin: (
+      scheduledTaskId: ScheduledTaskId,
+    ) => Effect.Effect<Option.Option<FactoryReservation>, FactoryStoreError>;
+    /**
+     * Records the factory execution a thread was created for, when its creator belongs to one, so
+     * the thread's first start is charged however it comes. The caller must hold the write
+     * transaction that creates the thread.
+     */
+    readonly recordThreadOrigin: (input: {
+      readonly threadId: ThreadId;
+      readonly createdFrom: OrchestrationV2ThreadCreatedFrom;
+    }) => Effect.Effect<void, FactoryStoreError>;
+    /**
+     * This serving process, fresh at each start. The server holds the store's exclusive owner
+     * lock for its whole life and prepares an admitted run only under its obligation's owner, so
+     * nothing else can have prepared a run whose admission and obligation carry this id. A record
+     * from any earlier process, older or downgraded builds included, proves nothing of the kind.
+     */
+    readonly servingId: string;
+    /** The reservation whose execution owns this thread, if any. */
+    readonly bindingForThread: (
+      threadId: ThreadId,
+    ) => Effect.Effect<Option.Option<FactoryReservation>, FactoryStoreError>;
+    /** Whether work under this reservation may start, as far as its tracker claim goes. */
+    readonly isClaimReady: (
+      reservation: NativeReservation,
+    ) => Effect.Effect<boolean, FactoryStoreError>;
+    /**
+     * Releases a reservation the caller has proved holds nothing. The caller must hold the write
+     * transaction that proved it.
+     */
+    readonly releaseReservation: (
+      reservationId: FactoryReservationId,
+      reason:
+        | "claim_not_written"
+        | "attested_native_mirror"
+        | "outcome_verified"
+        | "owner_disposition",
+    ) => Effect.Effect<boolean, FactoryStoreError>;
+    /** Every observation of the item recorded after the given one, oldest first. */
+    readonly observationsAfter: (input: {
+      readonly factoryId: FactoryId;
+      readonly observationId: FactoryObservationId;
+    }) => Effect.Effect<ReadonlyArray<ItemObservation>, FactoryStoreError>;
+    readonly getReservation: (
+      reservationId: FactoryReservationId,
+    ) => Effect.Effect<Option.Option<FactoryReservation>, FactoryStoreError>;
+    /**
+     * Releases the observed reservation an attested native claim carrier was charged as, so one
+     * claim is never charged twice. The caller holds the transaction that attested it.
+     */
+    readonly releaseObservedCarrier: (input: {
+      readonly factoryId: FactoryId;
+      readonly carrierKey: FactoryClaimCarrierKey;
+    }) => Effect.Effect<void, FactoryStoreError>;
+    /**
+     * The owner disposes of an observed claim nobody could attribute, once its writer is fenced
+     * and its work is known to be gone: its reservation is released, and that exact carrier is
+     * not charged or counted as a claim again. False when it is not a held observed reservation.
+     */
+    readonly disposeObservedReservation: (input: {
+      readonly reservationId: FactoryReservationId;
+      readonly by: string;
+      readonly reason: string;
+    }) => Effect.Effect<boolean, FactoryStoreError>;
+    /**
+     * Records the owner's never-started attestation on a held admitted reservation, once, and only
+     * while its stored record is still `expected`: the record the evidence was read with.
+     */
+    readonly attestNeverStarted: (input: {
+      readonly reservationId: FactoryReservationId;
+      readonly expected: FactoryReservation;
+      readonly by: string;
+      readonly reason: string;
+      readonly evidenceDigest: string;
+      readonly evidence: string;
+    }) => Effect.Effect<boolean, FactoryStoreError>;
+    /**
+     * Enters or ends the owner's quarantine of a held admitted reservation, only while its stored
+     * record is still `expected`: the record the evidence was read with.
+     */
+    readonly recordQuarantine: (input: {
+      readonly reservationId: FactoryReservationId;
+      readonly expected: FactoryReservation;
+      readonly change:
+        | {
+            readonly type: "enter";
+            readonly quarantine: Omit<ReservationQuarantine, "quarantinedAt">;
+          }
+        | {
+            readonly type: "leave";
+            readonly by: string;
+            readonly reason: string;
+            readonly evidenceDigest: string;
+          };
+    }) => Effect.Effect<boolean, FactoryStoreError>;
+    /**
+     * Records a held admitted reservation's restart capture, replacing an unproved one, or the
+     * proof of its capture, only while its stored record is still `expected`. A proof is final.
+     */
+    readonly recordHistoricalTermination: (input: {
+      readonly reservationId: FactoryReservationId;
+      readonly expected: FactoryReservation;
+      readonly change:
+        | {
+            readonly type: "capture";
+            readonly capture: Omit<HistoricalTerminationCapture, "capturedAt">;
+          }
+        | { readonly type: "prove"; readonly proof: Omit<HistoricalTerminationProof, "provedAt"> };
+    }) => Effect.Effect<boolean, FactoryStoreError>;
+    readonly disposedCarriers: (
+      factoryId: FactoryId,
+    ) => Effect.Effect<ReadonlySet<string>, FactoryStoreError>;
+    /**
+     * Holds one transferred legacy worker's unknown custody once, against capacity, bound to its
+     * thread so nothing it starts escapes the factory; or the item's, when no worker is named.
+     */
+    readonly holdTransferredCustody: (input: {
+      readonly factoryId: FactoryId;
+      readonly itemKey: FactoryItemKey;
+      readonly transferId: string;
+      readonly job: string;
+      readonly poolId: FactoryPoolId;
+      readonly units: number;
+      readonly worker?: { readonly workId: string; readonly threadId: ThreadId | null };
+      readonly historical?: boolean;
+    }) => Effect.Effect<FactoryReservation, FactoryStoreError>;
+    /** Gives a rolled-back transfer's held custody back to its legacy writer. */
+    readonly releaseTransferredCustody: (input: {
+      readonly factoryId: FactoryId;
+      readonly transferId: string;
+    }) => Effect.Effect<void, FactoryStoreError>;
+    /** Issues the owner's finite grant for one exact subject; one per answered decision. */
+    readonly issueGrant: (input: {
+      readonly factoryId: FactoryId;
+      readonly itemKey: FactoryItemKey;
+      readonly stage: string;
+      readonly evidenceDigest: string;
+      readonly units: number;
+      readonly decisionId: string;
+      readonly by: string;
+    }) => Effect.Effect<FactoryGrant, FactoryStoreError>;
+    readonly listGrants: (
+      factoryId: FactoryId,
+    ) => Effect.Effect<ReadonlyArray<FactoryGrant>, FactoryStoreError>;
+    /** Revokes what remains of a grant; false when it is not active. */
+    readonly revokeGrant: (input: {
+      readonly grantId: string;
+      readonly by: string;
+    }) => Effect.Effect<boolean, FactoryStoreError>;
+    /** Records a run's open workspace obligation. The caller holds the authorizing transaction. */
+    readonly openWorkspaceObligation: (input: {
+      readonly runId: RunId;
+      readonly reservationId: FactoryReservationId;
+      readonly threadId: ThreadId;
+      readonly commandId: CommandId;
+      readonly ownerId: PreparationOwnerId;
+    }) => Effect.Effect<void, FactoryStoreError>;
+    /** Settles the run's open obligation for its own owner only; false when that did not hold. */
+    readonly settleWorkspaceObligation: (input: {
+      readonly runId: RunId;
+      readonly ownerId: PreparationOwnerId;
+      readonly scope:
+        | { readonly type: "no_external_work" }
+        | { readonly type: "contained"; readonly generationId: string };
+    }) => Effect.Effect<boolean, FactoryStoreError>;
+    /** A run's obligation; unreadable rows fail rather than read as absent. */
+    readonly workspaceObligation: (
+      runId: RunId,
+    ) => Effect.Effect<Option.Option<WorkspaceObligation>, FactoryStoreError>;
+    /** The reservation's open obligations, oldest first. */
+    readonly openWorkspaceObligations: (
+      reservationId: FactoryReservationId,
+    ) => Effect.Effect<ReadonlyArray<WorkspaceObligation>, FactoryStoreError>;
+    /**
+     * Gives an open obligation a new owner, recording the one it replaces and the containers
+     * proved ended; false when it is not open under `fromOwnerId`. The caller holds the
+     * recovery transaction.
+     */
+    readonly reownWorkspaceObligation: (input: {
+      readonly runId: RunId;
+      readonly fromOwnerId: PreparationOwnerId;
+      readonly toOwnerId: PreparationOwnerId;
+      readonly endedGenerations: ReadonlyArray<string>;
+    }) => Effect.Effect<boolean, FactoryStoreError>;
+  }
+>()("t3/factory/FactoryStore") {}
+
+const WorkspaceObligationJson = Schema.fromJsonString(WorkspaceObligation);
+const encodeWorkspaceObligation = Schema.encodeEffect(WorkspaceObligationJson, {
+  onExcessProperty: "error",
+});
+const decodeWorkspaceObligation = Schema.decodeUnknownEffect(WorkspaceObligationJson, {
+  onExcessProperty: "error",
+});
+
+const ConfigurationJson = Schema.fromJsonString(FactoryConfiguration);
+const ReservationJson = Schema.fromJsonString(FactoryReservation);
+const ObservationJson = Schema.fromJsonString(ItemObservation);
+const encodeConfiguration = Schema.encodeEffect(ConfigurationJson);
+const decodeConfiguration = Schema.decodeUnknownEffect(ConfigurationJson);
+const GrantJson = Schema.fromJsonString(FactoryGrant);
+const encodeGrant = Schema.encodeEffect(GrantJson, { onExcessProperty: "error" });
+const decodeGrant = Schema.decodeUnknownEffect(GrantJson);
+const encodeDisposition = Schema.encodeEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      carrierKey: Schema.String,
+      reservationId: Schema.String,
+      by: Schema.String,
+      reason: Schema.String,
+      disposedAt: Schema.String,
+    }),
+  ),
+);
+const encodeReservation = Schema.encodeEffect(ReservationJson);
+const decodeReservation = Schema.decodeUnknownEffect(ReservationJson);
+const encodeObservation = Schema.encodeEffect(ObservationJson);
+const decodeObservation = Schema.decodeUnknownEffect(ObservationJson);
+const encodeObservationInput = Schema.encodeEffect(Schema.fromJsonString(ItemObservationInput));
+const makeReservationId = Schema.decodeSync(FactoryReservationId);
+const makeObservationId = Schema.decodeSync(FactoryObservationId);
+const makeReadGeneration = Schema.decodeSync(FactoryReadGeneration);
+
+const make = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  const servingId = yield* Effect.sync(() => NodeCrypto.randomUUID());
+
+  const fail =
+    (operation: string, factoryId?: FactoryId) =>
+    (cause: unknown): FactoryStoreError =>
+      new FactoryStoreError({
+        operation,
+        ...(factoryId === undefined ? {} : { factoryId }),
+        cause,
+      });
+
+  // The queries and helpers below run inside one store operation, which owns the span.
+  const decodeOptional = <A, E>(
+    decode: (json: string) => Effect.Effect<A, E>,
+    rows: ReadonlyArray<{ readonly record_json: string }>,
+  ) =>
+    rows[0] === undefined
+      ? Effect.succeed(Option.none<A>())
+      : decode(rows[0].record_json).pipe(Effect.asSome);
+
+  const latestConfiguration = (factoryId: FactoryId) =>
+    sql<{ readonly config_json: string }>`
+      SELECT config_json FROM factory_configurations
+      WHERE factory_id = ${factoryId}
+      ORDER BY revision DESC
+      LIMIT 1
+    `.pipe(
+      Effect.flatMap((rows) =>
+        decodeOptional(
+          decodeConfiguration,
+          rows.map((row) => ({ record_json: row.config_json })),
+        ),
+      ),
+    );
+
+  const listConfigurations = () =>
+    sql<{ readonly config_json: string }>`
+      SELECT config_json FROM factory_configurations AS configuration
+      WHERE revision = (
+        SELECT MAX(revision) FROM factory_configurations
+        WHERE factory_id = configuration.factory_id
+      )
+      ORDER BY factory_id
+    `.pipe(
+      Effect.flatMap((rows) => Effect.forEach(rows, (row) => decodeConfiguration(row.config_json))),
+    );
+
+  const reservationById = (reservationId: FactoryReservationId) =>
+    sql<{ readonly record_json: string }>`
+      SELECT record_json FROM factory_reservations WHERE reservation_id = ${reservationId}
+    `.pipe(Effect.flatMap((rows) => decodeOptional(decodeReservation, rows)));
+
+  const bindingForThread = (threadId: ThreadId) =>
+    sql<{ readonly reservation_id: FactoryReservationId }>`
+      SELECT reservation_id FROM factory_thread_bindings WHERE thread_id = ${threadId}
+    `.pipe(
+      Effect.flatMap((rows) =>
+        rows[0] === undefined
+          ? Effect.succeed(Option.none<FactoryReservation>())
+          : reservationById(rows[0].reservation_id),
+      ),
+    );
+
+  const stagedOrigin = (threadId: ThreadId) =>
+    sql<{ readonly reservation_id: FactoryReservationId }>`
+      SELECT reservation_id FROM factory_thread_origins WHERE thread_id = ${threadId}
+    `.pipe(
+      Effect.flatMap((rows) =>
+        rows[0] === undefined
+          ? Effect.succeed(Option.none<FactoryReservation>())
+          : reservationById(rows[0].reservation_id),
+      ),
+    );
+
+  /** The execution a thread belongs to: the one it runs, else the one it was created for. */
+  const originReservationFor = (threadId: ThreadId) =>
+    bindingForThread(threadId).pipe(
+      Effect.filterOrElse(Option.isSome, () => stagedOrigin(threadId)),
+    );
+
+  const scheduleOrigin = (scheduledTaskId: ScheduledTaskId) =>
+    sql<{ readonly reservation_id: FactoryReservationId }>`
+      SELECT reservation_id FROM factory_schedule_origins
+      WHERE scheduled_task_id = ${scheduledTaskId}
+    `.pipe(
+      Effect.flatMap((rows) =>
+        rows[0] === undefined
+          ? Effect.succeed(Option.none<FactoryReservation>())
+          : reservationById(rows[0].reservation_id),
+      ),
+    );
+
+  // A quarantined stage still owns its item, but no longer counts against its pool.
+  const occupiedUnits = (factoryId: FactoryId, poolId: FactoryPoolId) =>
+    sql<{ readonly units: number }>`
+      SELECT COALESCE(SUM(units), 0) AS units FROM factory_reservations
+      WHERE factory_id = ${factoryId} AND pool_id = ${poolId} AND state = 'held'
+        AND json_extract(record_json, '$.quarantine') IS NULL
+    `.pipe(Effect.map((rows) => rows[0]?.units ?? 0));
+
+  const environmentCeiling = () =>
+    sql<{ readonly agent_ceiling: number | null; readonly revision: number }>`
+      SELECT agent_ceiling, revision FROM factory_environment WHERE singleton = 1
+    `.pipe(
+      Effect.map((rows) => ({
+        ceiling: rows[0]?.agent_ceiling ?? null,
+        revision: rows[0]?.revision ?? 0,
+      })),
+    );
+
+  // The same statuses the recovery index orders by; any other status is a finished run.
+  const unfinishedRunThreads = () =>
+    sql<{ readonly thread_id: string }>`
+      SELECT DISTINCT thread_id FROM orchestration_v2_projection_runs
+      WHERE status IN ('preparing', 'queued', 'starting', 'running', 'waiting')
+    `.pipe(Effect.map((rows) => new Set(rows.map((row) => row.thread_id))));
+
+  const hasUnfinishedRun = (threadId: ThreadId) =>
+    sql`
+      SELECT 1 FROM orchestration_v2_projection_runs
+      WHERE thread_id = ${threadId}
+        AND status IN ('preparing', 'queued', 'starting', 'running', 'waiting')
+      LIMIT 1
+    `.pipe(Effect.map((rows) => rows.length > 0));
+
+  /** See `AgentOccupancy`. Run inside the commit that admits against it. */
+  const agentOccupancy = Effect.fnUntraced(function* () {
+    const { ceiling, revision } = yield* environmentCeiling();
+    const held = yield* sql<{
+      readonly origin: FactoryReservation["origin"];
+      readonly item_key: string;
+      readonly units: number;
+      readonly carrier_key: string | null;
+      readonly execution_thread_id: string | null;
+      readonly quarantined: number;
+    }>`
+      SELECT origin, item_key, units, carrier_key, execution_thread_id,
+        json_extract(record_json, '$.quarantine') IS NOT NULL AS quarantined
+      FROM factory_reservations WHERE state = 'held'
+    `;
+    const unfinished = yield* unfinishedRunThreads();
+    // A thread bound to held custody, native or transferred, is counted through it.
+    const covered = new Set(
+      (yield* sql<{ readonly thread_id: string }>`
+        SELECT binding.thread_id FROM factory_thread_bindings AS binding
+        JOIN factory_reservations AS reservation
+          ON reservation.reservation_id = binding.reservation_id
+        WHERE reservation.state = 'held'
+      `).map((row) => row.thread_id),
+    );
+    // A carrier T3's own claim produced, in any factory, is that native execution's mirror.
+    const mirrored = new Set(
+      (yield* sql<{ readonly carrier_key: string }>`
+        SELECT operation.carrier_key FROM factory_claim_operations AS operation
+        JOIN factory_reservations AS reservation
+          ON reservation.reservation_id = operation.reservation_id
+        WHERE reservation.state = 'held'
+          OR json_extract(reservation.record_json, '$.releasedReason') = 'outcome_verified'
+      `).map((row) => row.carrier_key),
+    );
+    const transferredItems = new Set(
+      held.flatMap((row) => (row.origin === "transferred" ? [row.item_key] : [])),
+    );
+    const counted = { admitted: 0, descendants: 0, observed: 0, transferred: 0, otherRuns: 0 };
+    const carriers = new Map<string, number>();
+    for (const row of held) {
+      // The owner's quarantine: still owns its item, no longer charged.
+      if (row.quarantined === 1) continue;
+      if (row.origin === "admitted") counted.admitted += row.units;
+      else if (row.origin === "transferred") counted.transferred += row.units;
+      else if (row.origin === "inherited") {
+        if (row.execution_thread_id !== null && unfinished.has(row.execution_thread_id)) {
+          counted.descendants += row.units;
+        }
+      } else if (
+        row.carrier_key !== null &&
+        !mirrored.has(row.carrier_key) &&
+        !transferredItems.has(row.item_key)
+      ) {
+        // Each factory that read one claim charged it; it is one execution.
+        carriers.set(row.carrier_key, Math.max(carriers.get(row.carrier_key) ?? 0, row.units));
+      }
+    }
+    for (const units of carriers.values()) counted.observed += units;
+    const otherRunThreads = [...unfinished].filter((threadId) => !covered.has(threadId)).toSorted();
+    counted.otherRuns = otherRunThreads.length;
+    return {
+      ceiling,
+      revision,
+      occupied:
+        counted.admitted +
+        counted.descendants +
+        counted.observed +
+        counted.transferred +
+        counted.otherRuns,
+      counted,
+      otherRunThreads,
+    } satisfies AgentOccupancy;
+  });
+
+  /**
+   * Whether `units` more fit: under the environment's ceiling when one is set, else the pool's.
+   * Already at or over the ceiling, nothing new starts; nothing running is stopped.
+   */
+  const capacityFits = Effect.fnUntraced(function* (
+    factoryId: FactoryId,
+    pool: typeof FactoryPool.Type,
+    units: number,
+  ) {
+    const { ceiling } = yield* environmentCeiling();
+    if (ceiling === null) {
+      return (yield* occupiedUnits(factoryId, pool.poolId)) + units <= pool.capacityUnits;
+    }
+    return (yield* agentOccupancy()).occupied + units <= ceiling;
+  });
+
+  /**
+   * Whether a run counted only while it runs may start: no ceiling is set, it joins its thread's
+   * unfinished run (already counted), it resumes a run counted before a restart, or it fits.
+   */
+  const startFits = Effect.fnUntraced(function* (
+    input: ReserveExecutionInput,
+    origin: Extract<ReserveExecutionInput["origin"], { readonly type: "descendant" }>,
+    units: number,
+  ) {
+    const { ceiling } = yield* environmentCeiling();
+    if (
+      ceiling === null ||
+      origin.resumes === true ||
+      (yield* hasUnfinishedRun(input.executionThreadId))
+    ) {
+      return true;
+    }
+    return (yield* agentOccupancy()).occupied + units <= ceiling;
+  });
+
+  /** The admitted decision a native reservation belongs to. */
+  const admittedRootOf = Effect.fnUntraced(function* (reservation: NativeReservation) {
+    let current: FactoryReservation = reservation;
+    while (current.origin === "inherited") {
+      const parent: Option.Option<FactoryReservation> = yield* reservationById(
+        current.parentReservationId,
+      );
+      if (Option.isNone(parent)) return Option.none<FactoryReservation>();
+      current = parent.value;
+    }
+    return Option.some(current);
+  });
+
+  /**
+   * Whether work under this reservation may start: its admitted decision either claims nothing
+   * or holds a verified tracker claim. Anything else, including an unreadable chain, is not ready.
+   */
+  const claimReady = Effect.fnUntraced(function* (reservation: NativeReservation) {
+    const root = yield* admittedRootOf(reservation);
+    if (Option.isNone(root)) return false;
+    // A later stage starts under the claim of the decision that owns its item.
+    const owner =
+      root.value.origin === "admitted" && root.value.continues !== undefined
+        ? root.value.continues
+        : root.value.reservationId;
+    const claims = yield* sql<{ readonly state: string }>`
+      SELECT state FROM factory_claims WHERE reservation_id = ${owner}
+    `;
+    return (
+      claims[0] === undefined ||
+      claims[0].state === "verified" ||
+      claims[0].state === "workspace_authorized"
+    );
+  });
+
+  /** Releases a reservation whose release the caller has proved safe; history is kept. */
+  const releaseReservation = Effect.fnUntraced(function* (
+    reservationId: FactoryReservationId,
+    reason:
+      | "claim_not_written"
+      | "attested_native_mirror"
+      | "outcome_verified"
+      | "owner_disposition"
+      | "rolled_back",
+  ) {
+    const reservation = yield* reservationById(reservationId);
+    if (Option.isNone(reservation) || reservation.value.state !== "held") return false;
+    const released: FactoryReservation = {
+      ...reservation.value,
+      state: "released",
+      releasedReason: reason,
+    };
+    yield* sql`
+      UPDATE factory_reservations
+      SET state = 'released', record_json = ${yield* encodeReservation(released)}
+      WHERE reservation_id = ${reservationId} AND state = 'held'
+    `;
+    return true;
+  });
+
+  const insertReservation = Effect.fnUntraced(function* (reservation: FactoryReservation) {
+    const recordJson = yield* encodeReservation(reservation);
+    const native = isNativeReservation(reservation) ? reservation : undefined;
+    yield* sql`
+      INSERT INTO factory_reservations (
+        reservation_id, factory_id, origin, state, decision_key, item_key, pool_id, units,
+        execution_thread_id, parent_reservation_id, carrier_key, record_json, created_at
+      ) VALUES (
+        ${reservation.reservationId}, ${reservation.factoryId}, ${reservation.origin},
+        ${reservation.state}, ${native?.decisionKey ?? null}, ${reservation.itemKey},
+        ${reservation.poolId}, ${reservation.units}, ${native?.execution.threadId ?? null},
+        ${reservation.origin === "inherited" ? reservation.parentReservationId : null},
+        ${reservation.origin === "observed" ? reservation.carrierKey : null}, ${recordJson},
+        ${reservation.createdAt}
+      )
+    `;
+    if (native !== undefined) {
+      yield* sql`
+        INSERT INTO factory_thread_bindings (thread_id, reservation_id)
+        VALUES (${native.execution.threadId}, ${native.reservationId})
+      `;
+    }
+  });
+
+  const latestRevision = Effect.fnUntraced(function* (factoryId: FactoryId) {
+    const rows = yield* sql<{ readonly revision: number | null }>`
+      SELECT MAX(revision) AS revision FROM factory_configurations
+      WHERE factory_id = ${factoryId}
+    `;
+    return rows[0]?.revision ?? 0;
+  });
+
+  const insertConfiguration = Effect.fnUntraced(function* (
+    input: FactoryConfigurationInput,
+    revision: number,
+  ) {
+    const configuration: FactoryConfiguration = {
+      ...input,
+      revision,
+      createdAt: DateTime.formatIso(yield* DateTime.now),
+    };
+    yield* sql`
+      INSERT INTO factory_configurations (factory_id, revision, project_id, config_json, created_at)
+      VALUES (
+        ${configuration.factoryId}, ${configuration.revision}, ${configuration.projectId},
+        ${yield* encodeConfiguration(configuration)}, ${configuration.createdAt}
+      )
+    `;
+    return configuration;
+  });
+
+  const configure = Effect.fn("FactoryStore.configure")(
+    function* (input: FactoryConfigurationInput) {
+      return yield* sql.withTransaction(
+        Effect.flatMap(latestRevision(input.factoryId), (revision) =>
+          insertConfiguration(input, revision + 1),
+        ),
+      );
+    },
+    (effect, input) => effect.pipe(Effect.mapError(fail("configure", input.factoryId))),
+  );
+
+  const configureAtRevision = Effect.fn("FactoryStore.configureAtRevision")(
+    function* (input: FactoryConfigurationInput, expectRevision: number) {
+      return yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const revision = yield* latestRevision(input.factoryId);
+          if (revision !== expectRevision) return { type: "conflict", revision } as const;
+          const configuration = yield* insertConfiguration(input, revision + 1);
+          return { type: "configured", configuration } as const;
+        }),
+      );
+    },
+    (effect, input) => effect.pipe(Effect.mapError(fail("configure", input.factoryId))),
+  );
+
+  const beginCollection = Effect.fn("FactoryStore.beginCollection")(
+    function* (factoryId: FactoryId) {
+      const rows = yield* sql<{ readonly last_generation: number }>`
+        INSERT INTO factory_read_generations (factory_id, last_generation) VALUES (${factoryId}, 1)
+        ON CONFLICT(factory_id) DO UPDATE SET last_generation = last_generation + 1
+        RETURNING last_generation
+      `;
+      return makeReadGeneration(rows[0]!.last_generation);
+    },
+    (effect, factoryId) => effect.pipe(Effect.mapError(fail("begin-collection", factoryId))),
+  );
+
+  const readGrant = (grantId: string) =>
+    sql<{ readonly record_json: string }>`
+      SELECT record_json FROM factory_grants WHERE grant_id = ${grantId}
+    `.pipe(
+      Effect.flatMap((rows) =>
+        rows[0] === undefined
+          ? Effect.succeed(Option.none<FactoryGrant>())
+          : Effect.asSome(decodeGrant(rows[0].record_json)),
+      ),
+    );
+
+  const writeGrant = (grant: FactoryGrant) =>
+    Effect.flatMap(
+      encodeGrant(grant),
+      (json) => sql`
+        UPDATE factory_grants
+        SET state = ${grant.state}, remaining = ${grant.remaining}, record_json = ${json}
+        WHERE grant_id = ${grant.grantId}
+      `,
+    );
+
+  /** Spends one unit only for the exact subject it was issued for; the caller's commit holds it. */
+  const spendGrant = Effect.fnUntraced(function* (input: {
+    readonly grantId: string;
+    readonly factoryId: FactoryId;
+    readonly itemKey: FactoryItemKey;
+    readonly stage: string;
+    readonly evidenceDigest: string;
+    readonly reservationId: FactoryReservationId;
+  }) {
+    const grant = yield* readGrant(input.grantId);
+    if (
+      Option.isNone(grant) ||
+      grant.value.state !== "active" ||
+      grant.value.remaining < 1 ||
+      grant.value.factoryId !== input.factoryId ||
+      grant.value.itemKey !== input.itemKey ||
+      grant.value.stage !== input.stage ||
+      grant.value.evidenceDigest !== input.evidenceDigest
+    ) {
+      return false;
+    }
+    const remaining = grant.value.remaining - 1;
+    yield* writeGrant({
+      ...grant.value,
+      remaining,
+      state: remaining === 0 ? "spent" : "active",
+      spentBy: [...grant.value.spentBy, input.reservationId],
+    });
+    return true;
+  });
+
+  const reserveAdmission = Effect.fnUntraced(function* (
+    input: ReserveExecutionInput,
+    admission: OrchestrationV2FactoryAdmission,
+  ) {
+    // Rechecked here, on the commit's writer, because collection and preflight ran earlier.
+    if (DateTime.isLessThanOrEqualTo(admission.deadline, yield* DateTime.now)) {
+      return { type: "refused", refusal: "deadline_expired" } as const;
+    }
+    const named = yield* sql<{ readonly generation: number; readonly basis_digest: string }>`
+      SELECT generation, basis_digest FROM factory_item_observations
+      WHERE observation_id = ${admission.observationId}
+        AND factory_id = ${admission.factoryId} AND item_key = ${admission.itemKey}
+    `;
+    if (named[0] === undefined || named[0].basis_digest !== admission.basisDigest) {
+      return { type: "refused", refusal: "stale_basis" } as const;
+    }
+    // Any later read that saw something else retires this basis, even if a still later read
+    // sees the same evidence again.
+    const changedSince = yield* sql`
+      SELECT 1 FROM factory_item_observations
+      WHERE factory_id = ${admission.factoryId} AND item_key = ${admission.itemKey}
+        AND generation > ${named[0].generation} AND basis_digest != ${admission.basisDigest}
+      LIMIT 1
+    `;
+    if (changedSince.length > 0) return { type: "refused", refusal: "stale_basis" } as const;
+    const conflicted = yield* sql`
+      SELECT 1 FROM factory_item_conflicts
+      WHERE factory_id = ${admission.factoryId} AND item_key = ${admission.itemKey}
+        AND generation >= ${named[0].generation}
+      LIMIT 1
+    `;
+    if (conflicted.length > 0) return { type: "refused", refusal: "stale_basis" } as const;
+    const latest = yield* sql<{ readonly complete: number }>`
+      SELECT complete FROM factory_item_observations
+      WHERE factory_id = ${admission.factoryId} AND item_key = ${admission.itemKey}
+      ORDER BY generation DESC
+      LIMIT 1
+    `;
+    if (latest[0]?.complete !== 1) return { type: "refused", refusal: "incomplete_basis" } as const;
+    const configuration = yield* latestConfiguration(admission.factoryId);
+    if (Option.isNone(configuration) || configuration.value.revision !== admission.configRevision) {
+      return { type: "refused", refusal: "configuration_changed" } as const;
+    }
+    if (!configuration.value.enabled) {
+      return { type: "refused", refusal: "factory_paused" } as const;
+    }
+    const pool = configuration.value.pools.find(
+      (candidate) => candidate.poolId === admission.poolId,
+    );
+    if (pool === undefined) return { type: "refused", refusal: "unknown_pool" } as const;
+    const duplicate = yield* sql`
+      SELECT 1 FROM factory_reservations
+      WHERE factory_id = ${admission.factoryId} AND decision_key = ${admission.decisionKey}
+        AND origin = 'admitted'
+    `;
+    if (duplicate.length > 0) {
+      return { type: "refused", refusal: "decision_already_admitted" } as const;
+    }
+    // A verification output directory is any one decision's, ever: released or not, so a later
+    // or changed binding never writes over an earlier attempt's output.
+    const outputRoot = /\|out:([0-9a-f]{32})$/.exec(admission.stageBasis ?? "")?.[1];
+    if (outputRoot !== undefined) {
+      const taken = yield* sql`
+        SELECT 1 FROM factory_reservations
+        WHERE factory_id = ${admission.factoryId} AND origin = 'admitted'
+          AND json_extract(record_json, '$.stageBasis') LIKE ${`%|out:${outputRoot}`}
+        LIMIT 1
+      `;
+      if (taken.length > 0) return { type: "refused", refusal: "output_root_reserved" } as const;
+    }
+    const owner = yield* sql`
+      SELECT 1 FROM factory_reservations
+      WHERE factory_id = ${admission.factoryId} AND item_key = ${admission.itemKey}
+        AND state = 'held' AND origin IN ('admitted', 'observed', 'transferred')
+    `;
+    if (owner.length > 0) return { type: "refused", refusal: "item_owned" } as const;
+    if (
+      admission.custodyRead !== undefined &&
+      (yield* custodyMoved(sql, {
+        factoryId: admission.factoryId,
+        custodyRead: admission.custodyRead,
+        transfersRead: admission.transfersRead ?? [],
+      }))
+    ) {
+      return { type: "refused", refusal: "custody_changed" } as const;
+    }
+    if (!(yield* capacityFits(admission.factoryId, pool, admission.units))) {
+      return { type: "refused", refusal: "capacity_exhausted" } as const;
+    }
+    // Each named resource is held by one reservation at a time, decided in this commit.
+    const resources =
+      /\|res:([a-z0-9_,-]+)/.exec(admission.stageBasis ?? "")?.[1]?.split(",") ?? [];
+    if (resources.length > 0) {
+      const holding = yield* sql<{ readonly resources: string }>`
+        SELECT json_extract(record_json, '$.resources') AS resources FROM factory_reservations
+        WHERE factory_id = ${admission.factoryId} AND state = 'held' AND origin = 'admitted'
+          AND json_extract(record_json, '$.resources') IS NOT NULL
+      `;
+      const held = new Set(holding.flatMap((row) => JSON.parse(row.resources) as Array<string>));
+      if (resources.some((resource) => held.has(resource))) {
+        return { type: "refused", refusal: "resource_held" } as const;
+      }
+    }
+    const choice = /\|exe:([^|]+)/.exec(admission.stageBasis ?? "")?.[1];
+    const executionChoice = choice === undefined ? undefined : decodeURIComponent(choice);
+    const reservationId = makeReservationId(`reservation:${input.commandId}`);
+    if (admission.grant !== undefined) {
+      const spent = yield* spendGrant({
+        grantId: admission.grant.grantId,
+        factoryId: admission.factoryId,
+        itemKey: admission.itemKey,
+        stage: admission.grant.stage,
+        evidenceDigest: admission.grant.evidenceDigest,
+        reservationId,
+      });
+      if (!spent) return { type: "refused", refusal: "grant_unavailable" } as const;
+    }
+    const reservation: NativeReservation = {
+      origin: "admitted",
+      reservationId,
+      factoryId: admission.factoryId,
+      itemKey: admission.itemKey,
+      poolId: admission.poolId,
+      units: admission.units,
+      state: "held",
+      createdAt: DateTime.formatIso(yield* DateTime.now),
+      decisionKey: admission.decisionKey,
+      taskKind: admission.taskKind,
+      admittedIn: servingId,
+      itemVersion: admission.itemVersion,
+      policyRevision: admission.policyRevision,
+      configRevision: admission.configRevision,
+      packetDigest: admission.packetDigest,
+      modelSelection: input.modelSelection,
+      execution: {
+        commandId: input.commandId,
+        threadId: input.executionThreadId,
+        runId: input.runId,
+        taskNodeId: input.taskNodeId,
+      },
+      ...(admission.continues === undefined ? {} : { continues: admission.continues }),
+      ...(admission.stageBasis === undefined ? {} : { stageBasis: admission.stageBasis }),
+      observationId: admission.observationId,
+      ...(admission.grant === undefined ? {} : { grantId: admission.grant.grantId }),
+      ...(resources.length === 0 ? {} : { resources }),
+      ...(executionChoice === undefined ? {} : { executionChoice }),
+    };
+    yield* insertReservation(reservation);
+    // The same commit records the admission in the item's lifecycle order.
+    const admittedEvent = yield* encodeItemEvent({
+      type: "admitted",
+      stage: admission.taskKind,
+      reservationId: reservation.reservationId,
+      ...(admission.stageBasis === undefined ? {} : { stageBasis: admission.stageBasis }),
+      ...(admission.issueText === undefined ? {} : { issueText: admission.issueText }),
+    });
+    yield* sql`
+      INSERT INTO factory_item_events (factory_id, item_key, record_json)
+      VALUES (${admission.factoryId}, ${admission.itemKey}, ${admittedEvent})
+    `;
+    return { type: "reserved", reservation } as const;
+  });
+
+  const reserveDescendant = Effect.fnUntraced(function* (
+    input: ReserveExecutionInput,
+    origin: Extract<ReserveExecutionInput["origin"], { readonly type: "descendant" }>,
+  ) {
+    // A thread that already owns a reservation is continuing that execution, on the selection
+    // it was admitted with: a later request cannot move it to another account, model or options.
+    const bound = yield* bindingForThread(input.executionThreadId);
+    if (Option.isSome(bound)) {
+      // A transferred legacy worker continues nothing: new work is the factory's to admit.
+      if (bound.value.origin === "transferred") {
+        return { type: "refused", refusal: "legacy_custody" } as const;
+      }
+      if (!isNativeReservation(bound.value)) return { type: "none" } as const;
+      if (!samePinnedSelection(bound.value.modelSelection, input.modelSelection)) {
+        return { type: "refused", refusal: "selection_pinned" } as const;
+      }
+      if (!(yield* claimReady(bound.value))) {
+        return { type: "refused", refusal: "claim_not_ready" } as const;
+      }
+      // A descendant, or a stage whose reservation was released, counts against the ceiling only
+      // while its own run is unfinished, so running it again is a new start under it.
+      if (
+        (bound.value.origin === "inherited" || bound.value.state !== "held") &&
+        !(yield* startFits(input, origin, bound.value.units))
+      ) {
+        return { type: "refused", refusal: "capacity_exhausted" } as const;
+      }
+      return { type: "none" } as const;
+    }
+    // The trusted initiator comes first; context lineage, a sender and a schedule may agree with
+    // it but never override it. Owners from different decisions are refused, not chosen between.
+    const candidates = [yield* stagedOrigin(input.executionThreadId)];
+    for (const ownerThreadId of origin.ownerThreadIds) {
+      candidates.push(yield* originReservationFor(ownerThreadId));
+    }
+    if (origin.scheduledTaskId !== null) {
+      candidates.push(yield* scheduleOrigin(origin.scheduledTaskId));
+    }
+    // Work a transferred legacy worker forks, launches, messages or schedules starts nowhere.
+    if (
+      candidates.some(
+        (candidate) => Option.isSome(candidate) && candidate.value.origin === "transferred",
+      )
+    ) {
+      return { type: "refused", refusal: "legacy_custody" } as const;
+    }
+    const owners = candidates.flatMap((candidate) =>
+      Option.isSome(candidate) && isNativeReservation(candidate.value) ? [candidate.value] : [],
+    );
+    const owner = owners[0];
+    // Work outside every factory, a person's, a launcher's or a schedule's, is one agent too.
+    if (owner === undefined) {
+      return (yield* startFits(input, origin, 1))
+        ? ({ type: "none" } as const)
+        : ({ type: "refused", refusal: "capacity_exhausted" } as const);
+    }
+    if (
+      owners.some(
+        (other) => other.factoryId !== owner.factoryId || other.decisionKey !== owner.decisionKey,
+      )
+    ) {
+      return { type: "refused", refusal: "origin_conflict" } as const;
+    }
+    // Factory work may not borrow a conversation that already ran outside the factory.
+    if (!origin.firstRun) return { type: "refused", refusal: "unbound_destination" } as const;
+    // Descendants of a decision whose tracker claim is not verified start nothing.
+    if (!(yield* claimReady(owner))) {
+      return { type: "refused", refusal: "claim_not_ready" } as const;
+    }
+    const parent = owner;
+    // A new counted execution meets the policy in force now; the parent keeps its own pins.
+    const configuration = yield* latestConfiguration(parent.factoryId);
+    if (Option.isNone(configuration)) {
+      return { type: "refused", refusal: "configuration_changed" } as const;
+    }
+    if (!configuration.value.enabled) {
+      return { type: "refused", refusal: "factory_paused" } as const;
+    }
+    const pool = configuration.value.pools.find((candidate) => candidate.poolId === parent.poolId);
+    if (pool === undefined) return { type: "refused", refusal: "unknown_pool" } as const;
+    // A descendant runs on a model the configuration in force now allows.
+    if (
+      !configuredSelections(configuration.value).some((selection) =>
+        sameSelection(input.modelSelection, selection),
+      )
+    ) {
+      return { type: "refused", refusal: "selection_not_configured" } as const;
+    }
+    if (!(yield* capacityFits(parent.factoryId, pool, parent.units))) {
+      return { type: "refused", refusal: "capacity_exhausted" } as const;
+    }
+    const reservation: NativeReservation = {
+      origin: "inherited",
+      reservationId: makeReservationId(`reservation:${input.commandId}:${input.executionThreadId}`),
+      factoryId: parent.factoryId,
+      itemKey: parent.itemKey,
+      poolId: parent.poolId,
+      units: parent.units,
+      state: "held",
+      createdAt: DateTime.formatIso(yield* DateTime.now),
+      parentReservationId: parent.reservationId,
+      decisionKey: parent.decisionKey,
+      configRevision: configuration.value.revision,
+      modelSelection: input.modelSelection,
+      execution: {
+        commandId: input.commandId,
+        threadId: input.executionThreadId,
+        runId: input.runId,
+        taskNodeId: input.taskNodeId,
+      },
+    };
+    yield* insertReservation(reservation);
+    return { type: "reserved", reservation } as const;
+  });
+
+  const recordThreadOrigin = Effect.fn("FactoryStore.recordThreadOrigin")(
+    function* (input: {
+      readonly threadId: ThreadId;
+      readonly createdFrom: OrchestrationV2ThreadCreatedFrom;
+    }) {
+      const owner =
+        input.createdFrom.type === "thread"
+          ? yield* originReservationFor(input.createdFrom.threadId)
+          : yield* scheduleOrigin(input.createdFrom.scheduledTaskId);
+      if (Option.isNone(owner) || !isNativeReservation(owner.value)) return;
+      yield* sql`
+        INSERT INTO factory_thread_origins (thread_id, reservation_id, recorded_at)
+        VALUES (
+          ${input.threadId}, ${owner.value.reservationId}, ${DateTime.formatIso(yield* DateTime.now)}
+        )
+        ON CONFLICT(thread_id) DO NOTHING
+      `;
+    },
+    (effect) => effect.pipe(Effect.mapError(fail("record-thread-origin"))),
+  );
+
+  const reserveExecution = Effect.fn("FactoryStore.reserveExecution")(
+    function* (input: ReserveExecutionInput) {
+      return input.origin.type === "admission"
+        ? yield* reserveAdmission(input, input.origin.admission)
+        : yield* reserveDescendant(input, input.origin);
+    },
+    (effect) => effect.pipe(Effect.mapError(fail("reserve-execution"))),
+  );
+
+  // Only a carrier T3's own claim operation produced mirrors a native reservation; metadata in
+  // the claim itself proves nothing, so every other claim is charged as an unknown observation.
+  const recordClaim = Effect.fnUntraced(function* (
+    input: ItemObservationInput,
+    claim: typeof ObservedClaim.Type,
+  ) {
+    const operation = yield* sql<{ readonly reservation_id: FactoryReservationId }>`
+      SELECT reservation_id FROM factory_claim_operations
+      WHERE factory_id = ${input.factoryId} AND carrier_key = ${claim.carrierKey}
+    `;
+    if (operation[0] !== undefined) {
+      const produced = yield* reservationById(operation[0].reservation_id);
+      // Its later stages continue under it after a verified, settled outcome released it; any
+      // other release leaves a claim that landed late with no native owner, so it is charged.
+      if (
+        Option.isSome(produced) &&
+        isNativeReservation(produced.value) &&
+        produced.value.itemKey === input.itemKey &&
+        (produced.value.state === "held" || produced.value.releasedReason === "outcome_verified")
+      ) {
+        return;
+      }
+    }
+    const existing = yield* sql`
+      SELECT 1 FROM factory_reservations
+      WHERE factory_id = ${input.factoryId} AND carrier_key = ${claim.carrierKey}
+        AND origin = 'observed' AND state = 'held'
+    `;
+    if (existing.length > 0) return;
+    yield* insertReservation({
+      origin: "observed",
+      // A carrier charged again after an earlier row was released is a new reservation.
+      reservationId: makeReservationId(
+        `reservation:observed:${input.factoryId}:${claim.carrierKey}:${input.generation}`,
+      ),
+      factoryId: input.factoryId,
+      itemKey: input.itemKey,
+      poolId: claim.poolId,
+      units: claim.units,
+      state: "held",
+      createdAt: DateTime.formatIso(yield* DateTime.now),
+      carrierKey: claim.carrierKey,
+      generation: input.generation,
+    });
+  });
+
+  const recordItemObservation = Effect.fn("FactoryStore.recordItemObservation")(
+    function* (read: ItemObservationInput) {
+      return yield* sql.withTransaction(
+        Effect.gen(function* () {
+          // An owner's disposition of a carrier stands: it is no one's claim, so whoever reads the
+          // item next (a collection pass, or a claim's own read before it writes) neither counts it
+          // in the item's basis nor charges it again.
+          const disposed = new Set(
+            (yield* sql<{ readonly carrier_key: string }>`
+              SELECT carrier_key FROM factory_carrier_dispositions WHERE factory_id = ${read.factoryId}
+            `).map((row) => row.carrier_key),
+          );
+          const input = {
+            ...read,
+            claims: read.claims.filter((claim) => !disposed.has(claim.carrierKey)),
+          };
+          const allocated = yield* sql<{ readonly last_generation: number }>`
+            SELECT last_generation FROM factory_read_generations WHERE factory_id = ${input.factoryId}
+          `;
+          if (allocated[0] === undefined || input.generation > allocated[0].last_generation) {
+            return { type: "unknown_generation" } as const;
+          }
+          const basisDigest = basisDigestOf(input);
+          const sameGeneration = yield* sql<{ readonly record_json: string }>`
+            SELECT record_json FROM factory_item_observations
+            WHERE factory_id = ${input.factoryId} AND item_key = ${input.itemKey}
+              AND generation = ${input.generation}
+          `;
+          const recorded = yield* decodeOptional(decodeObservation, sameGeneration);
+          if (Option.isSome(recorded)) {
+            // A generation's read of an item is immutable: a replay returns it. A different
+            // payload under the same token is not kept as an observation, but what it saw stays
+            // binding: the conflict fences earlier bases and its claims are charged.
+            if (
+              recorded.value.basisDigest === basisDigest &&
+              recorded.value.complete === input.complete
+            ) {
+              return { type: "recorded", observation: recorded.value } as const;
+            }
+            yield* sql`
+              INSERT INTO factory_item_conflicts (
+                factory_id, item_key, generation, basis_digest, record_json, observed_at
+              ) VALUES (
+                ${input.factoryId}, ${input.itemKey}, ${input.generation}, ${basisDigest},
+                ${yield* encodeObservationInput(input)}, ${DateTime.formatIso(yield* DateTime.now)}
+              )
+              ON CONFLICT DO NOTHING
+            `;
+            for (const claim of input.claims) yield* recordClaim(input, claim);
+            return { type: "conflict", recorded: recorded.value } as const;
+          }
+          const later = yield* sql<{ readonly record_json: string }>`
+            SELECT record_json FROM factory_item_observations
+            WHERE factory_id = ${input.factoryId} AND item_key = ${input.itemKey}
+              AND generation > ${input.generation}
+            ORDER BY generation DESC
+            LIMIT 1
+          `;
+          const current = yield* decodeOptional(decodeObservation, later);
+          if (Option.isSome(current)) {
+            // The newer observation stays the item's record, but a carrier this read saw is still
+            // positive evidence of someone's claim, so it is charged like any other read's.
+            for (const claim of input.claims) yield* recordClaim(input, claim);
+            return { type: "superseded", current: current.value } as const;
+          }
+          const observedAt = DateTime.formatIso(yield* DateTime.now);
+          const rows = yield* sql<{ readonly observation_id: number }>`
+            INSERT INTO factory_item_observations (
+              factory_id, item_key, generation, complete, basis_digest, record_json, observed_at
+            ) VALUES (
+              ${input.factoryId}, ${input.itemKey}, ${input.generation}, ${input.complete ? 1 : 0},
+              ${basisDigest}, '{}', ${observedAt}
+            )
+            RETURNING observation_id
+          `;
+          const observation: ItemObservation = {
+            ...input,
+            observationId: makeObservationId(rows[0]!.observation_id),
+            basisDigest,
+            observedAt,
+          };
+          yield* sql`
+            UPDATE factory_item_observations
+            SET record_json = ${yield* encodeObservation(observation)}
+            WHERE observation_id = ${observation.observationId}
+          `;
+          for (const claim of input.claims) {
+            yield* recordClaim(input, claim);
+          }
+          return { type: "recorded", observation } as const;
+        }),
+      );
+    },
+    (effect, input) =>
+      effect.pipe(Effect.mapError(fail("record-item-observation", input.factoryId))),
+  );
+
+  const getObservation = Effect.fn("FactoryStore.getObservation")(
+    function* (input: {
+      readonly factoryId: FactoryId;
+      readonly observationId: FactoryObservationId;
+    }) {
+      const rows = yield* sql<{ readonly record_json: string }>`
+        SELECT record_json FROM factory_item_observations
+        WHERE observation_id = ${input.observationId} AND factory_id = ${input.factoryId}
+      `;
+      return yield* decodeOptional(decodeObservation, rows);
+    },
+    (effect, input) => effect.pipe(Effect.mapError(fail("get-observation", input.factoryId))),
+  );
+
+  const observationsAfter = Effect.fn("FactoryStore.observationsAfter")(
+    function* (input: {
+      readonly factoryId: FactoryId;
+      readonly observationId: FactoryObservationId;
+    }) {
+      const rows = yield* sql<{ readonly record_json: string }>`
+        SELECT later.record_json FROM factory_item_observations AS later
+        JOIN factory_item_observations AS named ON named.observation_id = ${input.observationId}
+        WHERE later.factory_id = ${input.factoryId} AND later.item_key = named.item_key
+          AND later.generation > named.generation
+        ORDER BY later.generation ASC
+      `;
+      return yield* Effect.forEach(rows, (row) => decodeObservation(row.record_json));
+    },
+    (effect, input) => effect.pipe(Effect.mapError(fail("observations-after", input.factoryId))),
+  );
+
+  const recordClaimOperation = Effect.fn("FactoryStore.recordClaimOperation")(
+    function* (input: {
+      readonly reservationId: FactoryReservationId;
+      readonly carrierKey: FactoryClaimCarrierKey;
+    }) {
+      return yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const reservation = yield* reservationById(input.reservationId);
+          if (Option.isNone(reservation) || !isNativeReservation(reservation.value)) return false;
+          yield* sql`
+            INSERT INTO factory_claim_operations (factory_id, carrier_key, reservation_id)
+            VALUES (${reservation.value.factoryId}, ${input.carrierKey}, ${input.reservationId})
+            ON CONFLICT(factory_id, carrier_key) DO NOTHING
+          `;
+          return true;
+        }),
+      );
+    },
+    (effect) => effect.pipe(Effect.mapError(fail("record-claim-operation"))),
+  );
+
+  const listReservations = Effect.fn("FactoryStore.listReservations")(
+    function* (factoryId: FactoryId) {
+      const rows = yield* sql<{ readonly record_json: string }>`
+        SELECT record_json FROM factory_reservations
+        WHERE factory_id = ${factoryId}
+        ORDER BY created_at, reservation_id
+      `;
+      return yield* Effect.forEach(rows, (row) => decodeReservation(row.record_json));
+    },
+    (effect, factoryId) => effect.pipe(Effect.mapError(fail("list-reservations", factoryId))),
+  );
+
+  const findAdmission = Effect.fn("FactoryStore.findAdmission")(
+    function* (input: { readonly factoryId: FactoryId; readonly decisionKey: FactoryDecisionKey }) {
+      const rows = yield* sql<{ readonly record_json: string }>`
+        SELECT record_json FROM factory_reservations
+        WHERE factory_id = ${input.factoryId} AND decision_key = ${input.decisionKey}
+          AND origin = 'admitted'
+      `;
+      return yield* decodeOptional(decodeReservation, rows);
+    },
+    (effect, input) => effect.pipe(Effect.mapError(fail("find-admission", input.factoryId))),
+  );
+
+  const recordScheduleOrigin = Effect.fn("FactoryStore.recordScheduleOrigin")(
+    function* (input: {
+      readonly scheduledTaskId: ScheduledTaskId;
+      readonly callerThreadId: ThreadId;
+    }) {
+      return yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const owner = yield* bindingForThread(input.callerThreadId);
+          if (Option.isSome(owner)) {
+            yield* sql`
+              INSERT INTO factory_schedule_origins (scheduled_task_id, reservation_id)
+              VALUES (${input.scheduledTaskId}, ${owner.value.reservationId})
+              ON CONFLICT(scheduled_task_id) DO NOTHING
+            `;
+          }
+          return yield* scheduleOrigin(input.scheduledTaskId);
+        }),
+      );
+    },
+    (effect) => effect.pipe(Effect.mapError(fail("record-schedule-origin"))),
+  );
+
+  return FactoryStore.of({
+    servingId,
+    configure,
+    configureAtRevision,
+    getConfiguration: Effect.fn("FactoryStore.getConfiguration")(function (factoryId) {
+      return latestConfiguration(factoryId).pipe(
+        Effect.mapError(fail("get-configuration", factoryId)),
+      );
+    }),
+    listConfigurations: Effect.fn("FactoryStore.listConfigurations")(function () {
+      return listConfigurations().pipe(Effect.mapError(fail("list-configurations")));
+    }),
+    beginCollection,
+    recordItemObservation,
+    getObservation,
+    // A view: admission counts again inside its own commit, so this takes no writer lock.
+    agentOccupancy: Effect.fn("FactoryStore.agentOccupancy")(function () {
+      return agentOccupancy().pipe(Effect.mapError(fail("agent-occupancy")));
+    }),
+    setAgentCeiling: Effect.fn("FactoryStore.setAgentCeiling")(
+      function* (input: {
+        readonly agents: number | null;
+        readonly expectRevision: number;
+        readonly by: string;
+      }) {
+        return yield* sql.withTransaction(
+          Effect.gen(function* () {
+            const { revision } = yield* environmentCeiling();
+            if (revision !== input.expectRevision) {
+              return { applied: false, occupancy: yield* agentOccupancy() };
+            }
+            yield* sql`
+              INSERT INTO factory_environment (singleton, agent_ceiling, revision, set_by, set_at)
+              VALUES (
+                1, ${input.agents}, ${revision + 1}, ${input.by},
+                ${DateTime.formatIso(yield* DateTime.now)}
+              )
+              ON CONFLICT(singleton) DO UPDATE SET
+                agent_ceiling = excluded.agent_ceiling, revision = excluded.revision,
+                set_by = excluded.set_by, set_at = excluded.set_at
+            `;
+            return { applied: true, occupancy: yield* agentOccupancy() };
+          }),
+        );
+      },
+      Effect.mapError(fail("set-agent-ceiling")),
+    ),
+    reserveExecution,
+    recordClaimOperation,
+    listReservations,
+    findAdmission,
+    recordScheduleOrigin,
+    recordThreadOrigin,
+    scheduleOrigin: Effect.fn("FactoryStore.scheduleOrigin")(function (scheduledTaskId) {
+      return scheduleOrigin(scheduledTaskId).pipe(Effect.mapError(fail("schedule-origin")));
+    }),
+    bindingForThread: Effect.fn("FactoryStore.bindingForThread")(function (threadId) {
+      return bindingForThread(threadId).pipe(Effect.mapError(fail("binding-for-thread")));
+    }),
+    isClaimReady: Effect.fn("FactoryStore.isClaimReady")(function (reservation) {
+      return claimReady(reservation).pipe(Effect.mapError(fail("claim-ready")));
+    }),
+    releaseReservation: Effect.fn("FactoryStore.releaseReservation")(
+      function (reservationId, reason) {
+        return releaseReservation(reservationId, reason).pipe(
+          Effect.mapError(fail("release-reservation")),
+        );
+      },
+    ),
+    observationsAfter,
+    openWorkspaceObligation: Effect.fn("FactoryStore.openWorkspaceObligation")(
+      function* (input: {
+        readonly runId: RunId;
+        readonly reservationId: FactoryReservationId;
+        readonly threadId: ThreadId;
+        readonly commandId: CommandId;
+        readonly ownerId: PreparationOwnerId;
+      }) {
+        const obligation: WorkspaceObligation = {
+          ...input,
+          openedAt: DateTime.formatIso(yield* DateTime.now),
+          openedIn: servingId,
+          state: "open",
+        };
+        yield* sql`
+          INSERT INTO factory_workspace_obligations (
+            run_id, reservation_id, thread_id, owner_id, state, record_json
+          ) VALUES (
+            ${input.runId}, ${input.reservationId}, ${input.threadId}, ${input.ownerId}, 'open',
+            ${yield* encodeWorkspaceObligation(obligation)}
+          )
+        `;
+      },
+      Effect.mapError(fail("open-workspace-obligation")),
+    ),
+    settleWorkspaceObligation: Effect.fn("FactoryStore.settleWorkspaceObligation")(
+      function* (input: {
+        readonly runId: RunId;
+        readonly ownerId: PreparationOwnerId;
+        readonly scope:
+          | { readonly type: "no_external_work" }
+          | { readonly type: "contained"; readonly generationId: string };
+      }) {
+        return yield* sql.withTransaction(
+          Effect.gen(function* () {
+            const rows = yield* sql<{ readonly record_json: string }>`
+              SELECT record_json FROM factory_workspace_obligations
+              WHERE run_id = ${input.runId} AND owner_id = ${input.ownerId} AND state = 'open'
+            `;
+            if (rows[0] === undefined) return false;
+            const open = yield* decodeWorkspaceObligation(rows[0].record_json);
+            const settled: WorkspaceObligation = {
+              runId: open.runId,
+              reservationId: open.reservationId,
+              threadId: open.threadId,
+              commandId: open.commandId,
+              ownerId: open.ownerId,
+              openedAt: open.openedAt,
+              ...(open.openedIn === undefined ? {} : { openedIn: open.openedIn }),
+              ...(open.priorOwners === undefined ? {} : { priorOwners: open.priorOwners }),
+              state: "settled",
+              ...(input.scope.type === "contained"
+                ? { scope: "contained" as const, generationId: input.scope.generationId }
+                : { scope: "no_external_work" as const }),
+              settledAt: DateTime.formatIso(yield* DateTime.now),
+            };
+            const updated = yield* sql`
+              UPDATE factory_workspace_obligations
+              SET state = 'settled', record_json = ${yield* encodeWorkspaceObligation(settled)}
+              WHERE run_id = ${input.runId} AND owner_id = ${input.ownerId} AND state = 'open'
+              RETURNING run_id
+            `;
+            return updated.length === 1;
+          }),
+        );
+      },
+      Effect.mapError(fail("settle-workspace-obligation")),
+    ),
+    workspaceObligation: Effect.fn("FactoryStore.workspaceObligation")(
+      function* (runId: RunId) {
+        const rows = yield* sql<{ readonly record_json: string }>`
+          SELECT record_json FROM factory_workspace_obligations WHERE run_id = ${runId}
+        `;
+        return rows[0] === undefined
+          ? Option.none<WorkspaceObligation>()
+          : Option.some(yield* decodeWorkspaceObligation(rows[0].record_json));
+      },
+      Effect.mapError(fail("workspace-obligation")),
+    ),
+    openWorkspaceObligations: Effect.fn("FactoryStore.openWorkspaceObligations")(
+      function* (reservationId: FactoryReservationId) {
+        const rows = yield* sql<{ readonly record_json: string }>`
+          SELECT record_json FROM factory_workspace_obligations
+          WHERE reservation_id = ${reservationId} AND state = 'open'
+          ORDER BY rowid
+        `;
+        return yield* Effect.forEach(rows, (row) => decodeWorkspaceObligation(row.record_json));
+      },
+      Effect.mapError(fail("open-workspace-obligations")),
+    ),
+    reownWorkspaceObligation: Effect.fn("FactoryStore.reownWorkspaceObligation")(
+      function* (input: {
+        readonly runId: RunId;
+        readonly fromOwnerId: PreparationOwnerId;
+        readonly toOwnerId: PreparationOwnerId;
+        readonly endedGenerations: ReadonlyArray<string>;
+      }) {
+        const rows = yield* sql<{ readonly record_json: string }>`
+          SELECT record_json FROM factory_workspace_obligations
+          WHERE run_id = ${input.runId} AND owner_id = ${input.fromOwnerId} AND state = 'open'
+        `;
+        if (rows[0] === undefined) return false;
+        const open = yield* decodeWorkspaceObligation(rows[0].record_json);
+        const reowned: WorkspaceObligation = {
+          ...open,
+          ownerId: input.toOwnerId,
+          priorOwners: [
+            ...(open.priorOwners ?? []),
+            {
+              ownerId: input.fromOwnerId,
+              endedGenerations: [...input.endedGenerations],
+              recoveredAt: DateTime.formatIso(yield* DateTime.now),
+            },
+          ],
+        };
+        const updated = yield* sql`
+          UPDATE factory_workspace_obligations
+          SET owner_id = ${input.toOwnerId}, record_json = ${yield* encodeWorkspaceObligation(reowned)}
+          WHERE run_id = ${input.runId} AND owner_id = ${input.fromOwnerId} AND state = 'open'
+          RETURNING run_id
+        `;
+        return updated.length === 1;
+      },
+      Effect.mapError(fail("reown-workspace-obligation")),
+    ),
+    releaseObservedCarrier: Effect.fn("FactoryStore.releaseObservedCarrier")(
+      function* (input: {
+        readonly factoryId: FactoryId;
+        readonly carrierKey: FactoryClaimCarrierKey;
+      }) {
+        const rows = yield* sql<{ readonly reservation_id: FactoryReservationId }>`
+          SELECT reservation_id FROM factory_reservations
+          WHERE factory_id = ${input.factoryId} AND carrier_key = ${input.carrierKey}
+            AND origin = 'observed' AND state = 'held'
+        `;
+        for (const row of rows)
+          yield* releaseReservation(row.reservation_id, "attested_native_mirror");
+      },
+      Effect.mapError(fail("release-observed-carrier")),
+    ),
+    disposeObservedReservation: Effect.fn("FactoryStore.disposeObservedReservation")(
+      function* (input: {
+        readonly reservationId: FactoryReservationId;
+        readonly by: string;
+        readonly reason: string;
+      }) {
+        return yield* sql.withTransaction(
+          Effect.gen(function* () {
+            const reservation = yield* reservationById(input.reservationId);
+            if (Option.isNone(reservation) || reservation.value.state !== "held") return false;
+            // Transferred custody holds no carrier: releasing it is the whole disposition.
+            if (reservation.value.origin === "transferred") {
+              return yield* releaseReservation(input.reservationId, "owner_disposition");
+            }
+            if (reservation.value.origin !== "observed") return false;
+            const { factoryId, carrierKey } = reservation.value;
+            yield* releaseReservation(input.reservationId, "owner_disposition");
+            const disposition = yield* encodeDisposition({
+              carrierKey,
+              reservationId: input.reservationId,
+              by: input.by,
+              reason: input.reason,
+              disposedAt: DateTime.formatIso(yield* DateTime.now),
+            });
+            yield* sql`
+              INSERT INTO factory_carrier_dispositions (factory_id, carrier_key, record_json)
+              VALUES (${factoryId}, ${carrierKey}, ${disposition})
+              ON CONFLICT(factory_id, carrier_key) DO NOTHING
+            `;
+            return true;
+          }),
+        );
+      },
+      Effect.mapError(fail("dispose-observed-reservation")),
+    ),
+    attestNeverStarted: Effect.fn("FactoryStore.attestNeverStarted")(
+      function* (input: {
+        readonly reservationId: FactoryReservationId;
+        readonly expected: FactoryReservation;
+        readonly by: string;
+        readonly reason: string;
+        readonly evidenceDigest: string;
+        readonly evidence: string;
+      }) {
+        const { expected } = input;
+        if (
+          expected.origin !== "admitted" ||
+          expected.state !== "held" ||
+          expected.neverStartedAttestation !== undefined
+        ) {
+          return false;
+        }
+        const attested: FactoryReservation = {
+          ...expected,
+          neverStartedAttestation: {
+            by: input.by,
+            reason: input.reason,
+            evidenceDigest: input.evidenceDigest,
+            evidence: input.evidence,
+            attestedAt: DateTime.formatIso(yield* DateTime.now),
+          },
+        };
+        return yield* sql.withTransaction(
+          Effect.gen(function* () {
+            const current = yield* reservationById(input.reservationId);
+            if (
+              Option.isNone(current) ||
+              (yield* encodeReservation(current.value)) !== (yield* encodeReservation(expected))
+            ) {
+              return false;
+            }
+            const updated = yield* sql`
+              UPDATE factory_reservations
+              SET record_json = ${yield* encodeReservation(attested)}
+              WHERE reservation_id = ${input.reservationId} AND state = 'held'
+              RETURNING reservation_id
+            `;
+            return updated.length === 1;
+          }),
+        );
+      },
+      Effect.mapError(fail("attest-never-started")),
+    ),
+    recordQuarantine: Effect.fn("FactoryStore.recordQuarantine")(
+      function* (input: {
+        readonly reservationId: FactoryReservationId;
+        readonly expected: FactoryReservation;
+        readonly change:
+          | {
+              readonly type: "enter";
+              readonly quarantine: Omit<ReservationQuarantine, "quarantinedAt">;
+            }
+          | {
+              readonly type: "leave";
+              readonly by: string;
+              readonly reason: string;
+              readonly evidenceDigest: string;
+            };
+      }) {
+        const { expected, change } = input;
+        if (expected.origin !== "admitted" || expected.state !== "held") return false;
+        const at = DateTime.formatIso(yield* DateTime.now);
+        let next: FactoryReservation;
+        if (change.type === "enter") {
+          if (expected.quarantine !== undefined) return false;
+          next = { ...expected, quarantine: { ...change.quarantine, quarantinedAt: at } };
+        } else {
+          const { quarantine, ...rest } = expected;
+          if (quarantine === undefined) return false;
+          next = {
+            ...rest,
+            quarantineHistory: [
+              ...(expected.quarantineHistory ?? []),
+              {
+                ...quarantine,
+                left: {
+                  by: change.by,
+                  reason: change.reason,
+                  evidenceDigest: change.evidenceDigest,
+                  leftAt: at,
+                },
+              },
+            ],
+          };
+        }
+        return yield* sql.withTransaction(
+          Effect.gen(function* () {
+            const current = yield* reservationById(input.reservationId);
+            if (
+              Option.isNone(current) ||
+              (yield* encodeReservation(current.value)) !== (yield* encodeReservation(expected))
+            ) {
+              return false;
+            }
+            const updated = yield* sql`
+              UPDATE factory_reservations
+              SET record_json = ${yield* encodeReservation(next)}
+              WHERE reservation_id = ${input.reservationId} AND state = 'held'
+              RETURNING reservation_id
+            `;
+            return updated.length === 1;
+          }),
+        );
+      },
+      Effect.mapError(fail("record-quarantine")),
+    ),
+    recordHistoricalTermination: Effect.fn("FactoryStore.recordHistoricalTermination")(
+      function* (input: {
+        readonly reservationId: FactoryReservationId;
+        readonly expected: FactoryReservation;
+        readonly change:
+          | {
+              readonly type: "capture";
+              readonly capture: Omit<HistoricalTerminationCapture, "capturedAt">;
+            }
+          | {
+              readonly type: "prove";
+              readonly proof: Omit<HistoricalTerminationProof, "provedAt">;
+            };
+      }) {
+        const { expected, change } = input;
+        if (expected.origin !== "admitted" || expected.state !== "held") return false;
+        const recorded = expected.historicalTermination;
+        if (recorded?.proof !== undefined) return false;
+        const at = DateTime.formatIso(yield* DateTime.now);
+        let next: FactoryReservation;
+        if (change.type === "capture") {
+          next = {
+            ...expected,
+            historicalTermination: { capture: { ...change.capture, capturedAt: at } },
+          };
+        } else {
+          if (recorded === undefined) return false;
+          next = {
+            ...expected,
+            historicalTermination: { ...recorded, proof: { ...change.proof, provedAt: at } },
+          };
+        }
+        return yield* sql.withTransaction(
+          Effect.gen(function* () {
+            const current = yield* reservationById(input.reservationId);
+            if (
+              Option.isNone(current) ||
+              (yield* encodeReservation(current.value)) !== (yield* encodeReservation(expected))
+            ) {
+              return false;
+            }
+            const updated = yield* sql`
+              UPDATE factory_reservations
+              SET record_json = ${yield* encodeReservation(next)}
+              WHERE reservation_id = ${input.reservationId} AND state = 'held'
+              RETURNING reservation_id
+            `;
+            return updated.length === 1;
+          }),
+        );
+      },
+      Effect.mapError(fail("record-historical-termination")),
+    ),
+    issueGrant: Effect.fn("FactoryStore.issueGrant")(
+      function* (input: {
+        readonly factoryId: FactoryId;
+        readonly itemKey: FactoryItemKey;
+        readonly stage: string;
+        readonly evidenceDigest: string;
+        readonly units: number;
+        readonly decisionId: string;
+        readonly by: string;
+      }) {
+        const grant: FactoryGrant = {
+          grantId: grantIdOf(input.decisionId),
+          factoryId: input.factoryId,
+          itemKey: input.itemKey,
+          stage: input.stage,
+          evidenceDigest: input.evidenceDigest,
+          units: input.units,
+          remaining: input.units,
+          state: "active",
+          decisionId: input.decisionId,
+          issuedBy: input.by,
+          issuedAt: DateTime.formatIso(yield* DateTime.now),
+          spentBy: [],
+        };
+        yield* sql`
+          INSERT INTO factory_grants (grant_id, factory_id, item_key, state, remaining, record_json)
+          VALUES (
+            ${grant.grantId}, ${grant.factoryId}, ${grant.itemKey}, 'active', ${grant.remaining},
+            ${yield* encodeGrant(grant)}
+          )
+          ON CONFLICT(grant_id) DO NOTHING
+        `;
+        return Option.getOrThrow(yield* readGrant(grant.grantId));
+      },
+      Effect.mapError(fail("issue-grant")),
+    ),
+    listGrants: Effect.fn("FactoryStore.listGrants")(
+      function* (factoryId: FactoryId) {
+        const rows = yield* sql<{ readonly record_json: string }>`
+          SELECT record_json FROM factory_grants WHERE factory_id = ${factoryId} ORDER BY rowid
+        `;
+        return yield* Effect.forEach(rows, (row) => decodeGrant(row.record_json));
+      },
+      Effect.mapError(fail("list-grants")),
+    ),
+    revokeGrant: Effect.fn("FactoryStore.revokeGrant")(
+      function* (input: { readonly grantId: string; readonly by: string }) {
+        return yield* sql.withTransaction(
+          Effect.gen(function* () {
+            const grant = yield* readGrant(input.grantId);
+            if (Option.isNone(grant) || grant.value.state !== "active") return false;
+            yield* writeGrant({
+              ...grant.value,
+              state: "revoked",
+              revoked: { by: input.by, at: DateTime.formatIso(yield* DateTime.now) },
+            });
+            return true;
+          }),
+        );
+      },
+      Effect.mapError(fail("revoke-grant")),
+    ),
+    holdTransferredCustody: Effect.fn("FactoryStore.holdTransferredCustody")(
+      function* (input: {
+        readonly factoryId: FactoryId;
+        readonly itemKey: FactoryItemKey;
+        readonly transferId: string;
+        readonly job: string;
+        readonly poolId: FactoryPoolId;
+        readonly units: number;
+        readonly worker?: { readonly workId: string; readonly threadId: ThreadId | null };
+        /** The owner already accounted for this worker: released at once, still bound. */
+        readonly historical?: boolean;
+      }) {
+        return yield* sql.withTransaction(
+          Effect.gen(function* () {
+            const reservationId = FactoryReservationId.make(
+              `reservation:transferred:${input.transferId}:${input.worker?.workId ?? input.itemKey}`,
+            );
+            const existing = yield* reservationById(reservationId);
+            if (Option.isSome(existing)) return existing.value;
+            const threadId = input.worker?.threadId ?? null;
+            const held: FactoryReservation = {
+              origin: "transferred",
+              reservationId,
+              factoryId: input.factoryId,
+              itemKey: input.itemKey,
+              poolId: input.poolId,
+              units: input.units,
+              state: "held",
+              createdAt: DateTime.formatIso(yield* DateTime.now),
+              transferId: input.transferId,
+              job: input.job,
+              ...(input.worker === undefined ? {} : { workId: input.worker.workId }),
+              ...(threadId === null ? {} : { threadId }),
+            };
+            yield* insertReservation(held);
+            if (threadId !== null) {
+              yield* sql`
+                INSERT INTO factory_thread_bindings (thread_id, reservation_id)
+                VALUES (${threadId}, ${reservationId})
+                ON CONFLICT(thread_id) DO UPDATE SET reservation_id = excluded.reservation_id
+              `;
+            }
+            if (input.historical === true) {
+              yield* releaseReservation(reservationId, "owner_disposition");
+            }
+            return Option.getOrThrow(yield* reservationById(reservationId));
+          }),
+        );
+      },
+      Effect.mapError(fail("hold-transferred-custody")),
+    ),
+    releaseTransferredCustody: Effect.fn("FactoryStore.releaseTransferredCustody")(
+      function* (input: { readonly factoryId: FactoryId; readonly transferId: string }) {
+        for (const reservation of yield* listReservations(input.factoryId)) {
+          if (reservation.origin !== "transferred" || reservation.transferId !== input.transferId) {
+            continue;
+          }
+          yield* releaseReservation(reservation.reservationId, "rolled_back");
+          // The legacy writer owns its workers again, starts included.
+          yield* sql`
+            DELETE FROM factory_thread_bindings WHERE reservation_id = ${reservation.reservationId}
+          `;
+        }
+      },
+      Effect.mapError(fail("release-transferred-custody")),
+    ),
+    disposedCarriers: Effect.fn("FactoryStore.disposedCarriers")(
+      function* (factoryId: FactoryId) {
+        const rows = yield* sql<{ readonly carrier_key: string }>`
+          SELECT carrier_key FROM factory_carrier_dispositions WHERE factory_id = ${factoryId}
+        `;
+        return new Set(rows.map((row) => row.carrier_key));
+      },
+      Effect.mapError(fail("disposed-carriers")),
+    ),
+    getReservation: Effect.fn("FactoryStore.getReservation")(function (reservationId) {
+      return reservationById(reservationId).pipe(Effect.mapError(fail("get-reservation")));
+    }),
+  });
+});
+
+export const layer = Layer.effect(FactoryStore, make);

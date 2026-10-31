@@ -84,6 +84,7 @@ export const RPC_REQUIRED_SCOPES = {
   [WS_METHODS.serverUpsertKeybinding]: AuthSettingsWriteScope,
   [WS_METHODS.serverRemoveKeybinding]: AuthSettingsWriteScope,
   [WS_METHODS.serverGetStorageCleanupReport]: AuthOrchestrationReadScope,
+  [WS_METHODS.serverPreviewStorageCleanup]: AuthOrchestrationReadScope,
   [WS_METHODS.serverGetDatabaseStorage]: AuthOrchestrationReadScope,
   [WS_METHODS.peerLinksList]: AuthAccessReadScope,
   [WS_METHODS.serverUpdateSettings]: AuthSettingsWriteScope,
@@ -112,6 +113,24 @@ export const RPC_REQUIRED_SCOPES = {
   [WS_METHODS.serverReportClientActivity]: AuthOrchestrationReadScope,
   [WS_METHODS.scheduledTasksSubscribe]: AuthOrchestrationReadScope,
   [WS_METHODS.secretsAnswerRequest]: AuthOrchestrationOperateScope,
+  [WS_METHODS.factoryOverview]: AuthOrchestrationReadScope,
+  // Owner authority: answering a gate, entering an issue, rejecting a result, revoking a grant.
+  [WS_METHODS.factoryDecide]: AuthOrchestrationOperateScope,
+  [WS_METHODS.factoryEnter]: AuthOrchestrationOperateScope,
+  [WS_METHODS.factoryRejectOutcome]: AuthOrchestrationOperateScope,
+  [WS_METHODS.factoryRevokeGrant]: AuthOrchestrationOperateScope,
+  [WS_METHODS.factoryRecoverRun]: AuthOrchestrationOperateScope,
+  // Taking over legacy work: recording, transferring and disposing of other writers' claims.
+  [WS_METHODS.factoryObserveClaims]: AuthOrchestrationOperateScope,
+  [WS_METHODS.factoryTransfer]: AuthOrchestrationOperateScope,
+  [WS_METHODS.factoryRollbackTransfer]: AuthOrchestrationOperateScope,
+  [WS_METHODS.factoryDisposeClaim]: AuthOrchestrationOperateScope,
+  // A configuration names a command the host runs as the factory's policy.
+  [WS_METHODS.factoryConfigure]: AuthSettingsWriteScope,
+  [WS_METHODS.factorySwitchProvider]: AuthSettingsWriteScope,
+  [WS_METHODS.factoryAgentCeiling]: AuthSettingsWriteScope,
+  // It releases custody nothing proves, on the owner's word alone.
+  [WS_METHODS.factoryDisposeNeverStarted]: AuthSettingsWriteScope,
   // Delivery logs hold request bodies, so they need the same scope as the URL.
   [WS_METHODS.scheduledTasksListWebhookDeliveries]: AuthOrchestrationOperateScope,
   [WS_METHODS.scheduledTasksGetWebhookDelivery]: AuthOrchestrationOperateScope,

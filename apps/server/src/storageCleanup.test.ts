@@ -2432,3 +2432,68 @@ it.live("keeps saved usage data when removing a settled checkout", () =>
     }),
   ),
 );
+
+describe("storage cleanup preview", () => {
+  it.live("reports would-remove worktrees and files without deleting anything", () =>
+    runCleanupTest(
+      Effect.gen(function* () {
+        const fixture = yield* cleanupFixture();
+        fixture.enableFiles();
+        const expiredLog = `${fixture.config.logsDir}/server.log.1`;
+        yield* fixture.fs.makeDirectory(fixture.config.logsDir, { recursive: true });
+        yield* fixture.fs.writeFileString(expiredLog, "old\n");
+        yield* fixture.fs.utimes(expiredLog, 1, 1);
+        const report = yield* fixture.service.preview;
+        expect(report.trigger).toBe("preview");
+        expect(report.bytesFreed).toBe(0);
+        expect(report.counts.removed).toBe(0);
+        const worktreeEntry = (entries: typeof report.entries) =>
+          entries.find((entry) => entry.path?.replaceAll("\\", "/").endsWith("/feature"));
+        expect(worktreeEntry(report.entries)).toMatchObject({
+          outcome: "kept",
+          reason: expect.stringContaining("Would remove"),
+        });
+        expect(report.entries.find((entry) => entry.kind === "logs")).toMatchObject({
+          outcome: "kept",
+          reason: expect.stringContaining("Would remove"),
+        });
+        // Would-be removals lead the report, so its entry limit never hides them.
+        expect(report.entries.map((entry) => entry.kind)).toEqual([
+          "worktree",
+          "logs",
+          "browser-artifacts",
+        ]);
+        // Nothing was deleted, and the preview did not replace the latest real report.
+        expect(yield* fixture.fs.exists(fixture.worktree)).toBe(true);
+        expect(yield* fixture.fs.exists(expiredLog)).toBe(true);
+        expect(yield* fixture.service.latestReport).toBeNull();
+        // A real run afterwards still performs the removal.
+        const real = yield* fixture.service.runNow;
+        expect(worktreeEntry(real.entries)).toMatchObject({ outcome: "removed" });
+        expect(yield* fixture.fs.exists(fixture.worktree)).toBe(false);
+      }),
+    ),
+  );
+
+  it.live("reports orphan worktrees even when no worktree rule is enabled", () =>
+    runCleanupTest(
+      Effect.gen(function* () {
+        const fixture = yield* cleanupFixture();
+        fixture.disable();
+        const orphan = `${fixture.config.worktreesDir}/repository/orphan`;
+        yield* fixture.fs.makeDirectory(orphan, { recursive: true });
+        yield* fixture.fs.writeFileString(`${orphan}/file`, "x");
+        yield* fixture.fs.utimes(orphan, 1, 1);
+        const report = yield* fixture.service.runNow;
+        expect(
+          report.entries.some(
+            (entry) =>
+              entry.path?.replaceAll("\\", "/").endsWith("repository/orphan") &&
+              entry.outcome === "kept",
+          ),
+        ).toBe(true);
+        expect(yield* fixture.fs.exists(orphan)).toBe(true);
+      }),
+    ),
+  );
+});

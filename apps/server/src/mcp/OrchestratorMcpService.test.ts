@@ -7,6 +7,7 @@ import {
   NodeId,
   ORCHESTRATOR_MCP_RUNNING_TASK_NEXT,
   type OrchestratorMcpCapabilitiesResult,
+  OrchestratorMcpFailure,
   OrchestratorMcpTarget,
   type OrchestrationV2ThreadShell,
   type ScheduledTask,
@@ -59,12 +60,18 @@ import * as ServerSettings from "../serverSettings.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as RemoteDelegation from "../peer/RemoteDelegation.ts";
 import type { McpInvocationScope } from "./McpInvocationContext.ts";
-import { idleThreadProjection, liveThreadShell } from "./McpToolAccess.testkit.ts";
+import {
+  factoryStoreLayer,
+  idleThreadProjection,
+  liveThreadShell,
+} from "./McpToolAccess.testkit.ts";
+import * as DelegateTaskCheck from "./DelegateTaskCheck.ts";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 import { resolveRuntimeMode } from "./delegatedTaskModes.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
 const decodeTarget = Schema.decodeUnknownEffect(OrchestratorMcpTarget);
+type FactoryStoreService = Layer.Success<ReturnType<typeof factoryStoreLayer>>;
 
 const layerOrchestratorService = OrchestratorMcpService.layer.pipe(
   Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
@@ -1535,6 +1542,136 @@ describe("OrchestratorMcpService provider resolution", () => {
           byDriver.message.includes("No V2 provider adapter is registered for driver forkOnly."),
         );
       }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(layerDependencies))));
+    }),
+  );
+
+  it.effect("a factory thread delegates to no linked environment; other threads still do", () =>
+    Effect.gen(function* () {
+      const reached: Array<unknown> = [];
+      const delegateThere = (factories: Layer.Layer<never> | Layer.Layer<FactoryStoreService>) =>
+        Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          return yield* service
+            .delegateTask(scope, {
+              task: "Build it there.",
+              target: { environmentId: EnvironmentId.make("environment:box") },
+              mode: "async",
+              clientRequestId: "delegate-there",
+            })
+            .pipe(Effect.flip);
+        }).pipe(
+          Effect.provide(
+            layerOrchestratorService.pipe(
+              Layer.provide(
+                Layer.mergeAll(
+                  NodeServices.layer,
+                  Layer.mock(ThreadManagementService.ThreadManagementService)({}),
+                  ServerSettings.layerTest(),
+                  providerRegistryLayer([]),
+                  adapterRegistryLayer([]),
+                  Layer.mock(ProjectService.ProjectService)({}),
+                  Layer.mock(SecretRequests.SecretRequests)({}),
+                  Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+                  Layer.mock(RemoteDelegation.RemoteDelegation)({
+                    delegate: (_scope, input) =>
+                      Effect.sync(() => reached.push(input.target.environmentId)).pipe(
+                        Effect.andThen(
+                          Effect.fail(
+                            new OrchestratorMcpFailure({
+                              code: "orchestration_error",
+                              message: "reached the link",
+                            }),
+                          ),
+                        ),
+                      ),
+                  }),
+                  factories,
+                ),
+              ),
+            ),
+          ),
+        );
+
+      const fromFactory = yield* delegateThere(factoryStoreLayer(new Set([parentThreadId])));
+      assert.equal(fromFactory.code, "capability_denied");
+      // Without the store, factory ownership is unknown, so nothing goes either.
+      const unknown = yield* delegateThere(Layer.empty);
+      assert.equal(unknown.code, "orchestration_error");
+      assert.deepEqual(reached, []);
+
+      const ordinary = yield* delegateThere(factoryStoreLayer(new Set()));
+      assert.equal(ordinary.message, "reached the link");
+      assert.deepEqual(reached, [EnvironmentId.make("environment:box")]);
+    }),
+  );
+
+  it.effect("a configured dispatch check refuses a task before anything is created", () =>
+    Effect.gen(function* () {
+      const checked: Array<DelegateTaskCheck.DelegateTaskCheckRequest> = [];
+      const dispatched: Array<unknown> = [];
+      const layerDependencies = Layer.mergeAll(
+        NodeServices.layer,
+        Layer.mock(ThreadManagementService.ThreadManagementService)({
+          hasReceipt: () => Effect.succeed(false),
+          getThreadRecords: () => Effect.succeed(parentProjection([])),
+          dispatch: (command) =>
+            Effect.sync(() => dispatched.push(command)).pipe(Effect.andThen(Effect.never)),
+        }),
+        ServerSettings.layerTest(),
+        providerRegistryLayer([
+          providerSnapshot({
+            instanceId: codexInstanceId,
+            driver: ProviderDriverKind.make("codex"),
+            model: "gpt-5.4",
+          }),
+        ]),
+        adapterRegistryLayer([codexInstanceId]),
+        Layer.mock(ProjectService.ProjectService)({
+          getById: () => Effect.succeedSome({ title: "Repo", workspaceRoot: "/repo" } as never),
+        }),
+        Layer.mock(SecretRequests.SecretRequests)({}),
+        Layer.mock(RemoteDelegation.RemoteDelegation)({}),
+        Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        Layer.succeed(DelegateTaskCheck.DelegateTaskCheck, {
+          check: (request) =>
+            Effect.sync(() => checked.push(request)).pipe(
+              Effect.andThen(
+                Effect.fail(
+                  new DelegateTaskCheck.DelegateTaskCheckRejected({ category: "refused" }),
+                ),
+              ),
+            ),
+        }),
+      );
+
+      const refused = yield* Effect.gen(function* () {
+        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+        return yield* service
+          .delegateTask(scope, {
+            task: "Summarize the diff.",
+            mode: "async",
+            clientRequestId: "delegate-checked",
+          })
+          .pipe(Effect.flip);
+      }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(layerDependencies))));
+
+      assert.equal(refused.code, "invalid_request");
+      assert.equal(
+        refused.message,
+        "The dispatch check refused this task: The dispatch verifier refused this task.",
+      );
+      assert.deepEqual(checked, [
+        {
+          task: "Summarize the diff.",
+          workspaceRoot: "/repo",
+          checkoutPath: "/repo",
+          isolation: "shared",
+          baseCommit: null,
+          driver: "codex",
+          providerInstanceId: codexInstanceId,
+        },
+      ]);
+      assert.deepEqual(dispatched, []);
     }),
   );
 

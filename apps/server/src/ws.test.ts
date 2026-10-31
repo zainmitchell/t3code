@@ -2,13 +2,26 @@ import * as SecretResolver from "@t3tools/secret-provider-core/server/SecretReso
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
+  type AuthEnvironmentScope,
+  AuthOrchestrationOperateScope,
+  AuthOrchestrationReadScope,
+  AuthSettingsWriteScope,
+  EnvironmentAuthorizationError,
   AuthSessionId,
+  CommandId,
   EnvironmentId,
+  FactoryId,
+  FactoryOwnerError,
+  FactoryReservationId,
+  RuntimeRequestId,
   ProjectId,
   ThreadId,
   ProviderDriverKind,
   ProviderInstanceId,
+  factoryCardRequestId,
+  ORCHESTRATION_V2_WS_METHODS,
   WS_METHODS,
+  WsRpcGroup,
   WsServerRefreshProvidersRpc,
   WsSubscribeServerConfigRpc,
   type OrchestrationV2StoredEvent,
@@ -20,7 +33,9 @@ import {
 } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
 import * as DateTime from "effect/DateTime";
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
@@ -81,6 +96,9 @@ import * as ReviewService from "./review/ReviewService.ts";
 import * as ScheduledTasks from "./scheduledTasks/ScheduledTaskService.ts";
 import * as SecretRequests from "./secrets/SecretRequests.ts";
 import * as GuestShareService from "./guest/GuestShareService.ts";
+import * as FactoryClaimService from "./factory/FactoryClaimService.ts";
+import * as FactoryLifecycle from "./factory/FactoryLifecycle.ts";
+import * as RpcAuthorization from "./auth/RpcAuthorization.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
@@ -532,6 +550,8 @@ const layerUnusedConfigRpcServices = Layer.mergeAll(
   Layer.mock(SecretRequests.SecretRequests)({}),
   Layer.mock(SecretResolver.SecretResolver)({}),
   Layer.mock(GuestShareService.GuestShareService)({}),
+  Layer.mock(FactoryLifecycle.FactoryLifecycle)({}),
+  Layer.mock(FactoryClaimService.FactoryClaimService)({}),
   Layer.mock(ServerLifecycleEvents.ServerLifecycleEvents)({}),
   Layer.mock(ServerRuntimeStartup.ServerRuntimeStartup)({}),
   Layer.mock(ServerSelfUpdate.ServerSelfUpdate)({}),
@@ -887,6 +907,274 @@ it.effect("on-demand clients get provider config without workspace snapshots", (
     ),
     Effect.scoped,
   ),
+);
+
+it.effect("a factory owner answer acts as the authenticated session and never sees a cause", () =>
+  Effect.gen(function* () {
+    const answered: Array<{ readonly by: string }> = [];
+    const responses = yield* Queue.unbounded<unknown>();
+    const tested = [WS_METHODS.factoryDecide, ORCHESTRATION_V2_WS_METHODS.dispatchCommand] as const;
+    const group = WsRpcGroup.omit(
+      ...[...WsRpcGroup.requests.keys()].filter(
+        (tag): tag is Exclude<RpcGroup.Rpcs<typeof WsRpcGroup>["_tag"], (typeof tested)[number]> =>
+          !(tested as ReadonlyArray<string>).includes(tag),
+      ),
+    );
+    const server = yield* RpcServer.makeNoSerialization(group, {
+      ...WS_RPC_SERVER_OPTIONS,
+      onFromServer: (response) =>
+        response._tag === "Exit" ? Queue.offer(responses, response.exit) : Effect.void,
+    }).pipe(
+      Effect.provide(
+        Layer.merge(
+          RpcAuthorization.layer([AuthOrchestrationOperateScope]),
+          layerWsRpc(
+            {
+              sessionId: AuthSessionId.make("owner-session"),
+              subject: "owner",
+              method: "browser-session-cookie",
+              scopes: [],
+            },
+            {},
+            yield* ServerBrowser.ServerBrowser,
+            () => Effect.void,
+          ).pipe(
+            Layer.provide(
+              Layer.mergeAll(
+                layerUnusedConfigRpcServices,
+                Layer.mock(ExternalLauncher.ExternalLauncher)({}),
+                Layer.mock(ProviderRegistry.ProviderRegistry)({}),
+                Layer.mock(UsageLimitSources.UsageLimitSources)({}),
+                Layer.mock(RemoteOpenTargets.RemoteOpenTargets)({}),
+                Layer.mock(DirectEndpoints.DirectEndpoints)({}),
+                Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({ namedProjectsRoot: "" }),
+                Layer.mock(ScratchThreadPromotion.ScratchThreadPromotion)({}),
+                Layer.mock(ServerEnvironment.ServerEnvironment)({}),
+                Layer.mock(EnvironmentAuth.EnvironmentAuth)({}),
+                Layer.mock(FactoryLifecycle.FactoryLifecycle)({
+                  resolveReservedDecision: (input) =>
+                    input.decisionId === "d-leak"
+                      ? Effect.fail(
+                          new FactoryLifecycle.FactoryLifecycleError({
+                            operation: "resolve-decision",
+                            factoryId: input.factoryId,
+                            cause: new Error("token=ghp_LEAKMARKER at C:/Users/secret/home"),
+                          }),
+                        )
+                      : Effect.sync(() => answered.push(input)).pipe(Effect.as(true)),
+                  answerCard: (input) =>
+                    Effect.sync(() => answered.push(input)).pipe(Effect.as({ sequence: 7 })),
+                }),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    // A client that names its own actor is still recorded as the session it authenticated as.
+    const forged = {
+      factoryId: FactoryId.make("alpha"),
+      decisionId: "d1",
+      answer: "approve",
+      by: "someone-else",
+    };
+    yield* server.write(0, {
+      _tag: "Request",
+      id: RpcMessage.RequestId("decide"),
+      tag: WS_METHODS.factoryDecide,
+      payload: forged,
+      headers: Headers.empty,
+    });
+    assert.deepInclude(yield* Queue.take(responses), {
+      _tag: "Success",
+      value: { resolved: true },
+    });
+    yield* server.write(0, {
+      _tag: "Request",
+      id: RpcMessage.RequestId("decide-leak"),
+      tag: WS_METHODS.factoryDecide,
+      payload: { ...forged, decisionId: "d-leak" },
+      headers: Headers.empty,
+    });
+    const failed = yield* Queue.take(responses);
+    assert.isTrue(Exit.isExit(failed) && Exit.isFailure(failed));
+    const failure =
+      Exit.isExit(failed) && Exit.isFailure(failed) ? Cause.squash(failed.cause) : null;
+    assert.instanceOf(failure, FactoryOwnerError);
+    assert.strictEqual(
+      failure.message,
+      "The factory could not complete that: Factory resolve-decision failed for alpha.",
+    );
+    // A decision card in a chat is answered through the factory, not as an ordinary answer.
+    yield* server.write(0, {
+      _tag: "Request",
+      id: RpcMessage.RequestId("card"),
+      tag: ORCHESTRATION_V2_WS_METHODS.dispatchCommand,
+      payload: {
+        type: "runtime-request.respond",
+        commandId: CommandId.make("card-answer"),
+        threadId: ThreadId.make("owner-thread"),
+        requestId: RuntimeRequestId.make(
+          factoryCardRequestId({ factoryId: "alpha", kind: "gate", subjectId: "d1", n: 1 }),
+        ),
+        answers: { decision: "approve" },
+      },
+      headers: Headers.empty,
+    });
+    assert.deepInclude(yield* Queue.take(responses), { _tag: "Success", value: { sequence: 7 } });
+    assert.deepEqual(
+      answered.map((input) => input.by),
+      ["session:owner:owner-session", "session:owner:owner-session"],
+    );
+  }).pipe(
+    Effect.provide(
+      Layer.mergeAll(
+        Layer.fresh(layerConfigSources),
+        Layer.mock(PreviewAutomationBroker.PreviewAutomationBroker)({}),
+        Layer.mock(ServerBrowser.ServerBrowser)({}),
+      ),
+    ),
+    Effect.scoped,
+  ),
+);
+
+it.effect(
+  "a historical termination needs settings:write and acts as the authenticated session, never the payload's actor",
+  () =>
+    Effect.gen(function* () {
+      const asked: Array<{ readonly by: string; readonly acceptResidual?: unknown }> = [];
+      const tested = [WS_METHODS.factoryHistoricalTermination] as const;
+      const group = WsRpcGroup.omit(
+        ...[...WsRpcGroup.requests.keys()].filter(
+          (
+            tag,
+          ): tag is Exclude<RpcGroup.Rpcs<typeof WsRpcGroup>["_tag"], (typeof tested)[number]> =>
+            !(tested as ReadonlyArray<string>).includes(tag),
+        ),
+      );
+      const serve = (scopes: ReadonlyArray<AuthEnvironmentScope>) =>
+        Effect.gen(function* () {
+          const responses = yield* Queue.unbounded<unknown>();
+          const server = yield* RpcServer.makeNoSerialization(group, {
+            ...WS_RPC_SERVER_OPTIONS,
+            onFromServer: (response) =>
+              response._tag === "Exit" ? Queue.offer(responses, response.exit) : Effect.void,
+          }).pipe(
+            Effect.provide(
+              Layer.merge(
+                RpcAuthorization.layer(scopes),
+                layerWsRpc(
+                  {
+                    sessionId: AuthSessionId.make("host-admin-session"),
+                    subject: "host-admin",
+                    method: "bearer-access-token",
+                    scopes: [],
+                  },
+                  {},
+                  yield* ServerBrowser.ServerBrowser,
+                  () => Effect.void,
+                ).pipe(
+                  Layer.provide(
+                    Layer.mergeAll(
+                      layerUnusedConfigRpcServices,
+                      Layer.mock(ExternalLauncher.ExternalLauncher)({}),
+                      Layer.mock(ProviderRegistry.ProviderRegistry)({}),
+                      Layer.mock(UsageLimitSources.UsageLimitSources)({}),
+                      Layer.mock(RemoteOpenTargets.RemoteOpenTargets)({}),
+                      Layer.mock(DirectEndpoints.DirectEndpoints)({}),
+                      Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+                        namedProjectsRoot: "",
+                      }),
+                      Layer.mock(ScratchThreadPromotion.ScratchThreadPromotion)({}),
+                      Layer.mock(ServerEnvironment.ServerEnvironment)({}),
+                      Layer.mock(EnvironmentAuth.EnvironmentAuth)({}),
+                      Layer.mock(FactoryLifecycle.FactoryLifecycle)({
+                        historicalTermination: (input) =>
+                          Effect.sync(() => asked.push(input)).pipe(
+                            Effect.as({
+                              applied: false,
+                              refusals: ["historical_provenance_missing"],
+                              evidence: "{}",
+                              evidenceDigest: "digest",
+                            }),
+                          ),
+                      }),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          );
+          // A client that names its own actor is still recorded as the session it authenticated as.
+          const forged = {
+            factoryId: FactoryId.make("alpha"),
+            reservationId: FactoryReservationId.make("reservation:1"),
+            action: "capture" as const,
+            operationRef: "restart:1",
+            reason: "owner read",
+            acceptResidual: [
+              "provider_executor_locality_unrecorded" as const,
+              "non_t3_side_effects_unrecordable" as const,
+            ],
+            by: "someone-else",
+          };
+          yield* server.write(0, {
+            _tag: "Request",
+            id: RpcMessage.RequestId("historical"),
+            tag: WS_METHODS.factoryHistoricalTermination,
+            payload: forged,
+            headers: Headers.empty,
+          });
+          return yield* Queue.take(responses);
+        });
+
+      // A read-only or operate-only session is refused before the factory is asked.
+      for (const scopes of [
+        [AuthOrchestrationReadScope],
+        [AuthOrchestrationReadScope, AuthOrchestrationOperateScope],
+      ]) {
+        const refused = yield* serve(scopes);
+        assert.isTrue(Exit.isExit(refused) && Exit.isFailure(refused));
+        assert.instanceOf(
+          Exit.isExit(refused) && Exit.isFailure(refused) ? Cause.squash(refused.cause) : null,
+          EnvironmentAuthorizationError,
+        );
+      }
+      assert.deepStrictEqual(asked, []);
+
+      const answered = yield* serve([
+        AuthOrchestrationReadScope,
+        AuthOrchestrationOperateScope,
+        AuthSettingsWriteScope,
+      ]);
+      assert.deepInclude(answered, {
+        _tag: "Success",
+        value: {
+          applied: false,
+          refusals: ["historical_provenance_missing"],
+          evidence: "{}",
+          evidenceDigest: "digest",
+        },
+      });
+      assert.deepStrictEqual(
+        asked.map((input) => [input.by, input.acceptResidual]),
+        [
+          [
+            "session:host-admin:host-admin-session",
+            ["provider_executor_locality_unrecorded", "non_t3_side_effects_unrecordable"],
+          ],
+        ],
+      );
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.fresh(layerConfigSources),
+          Layer.mock(PreviewAutomationBroker.PreviewAutomationBroker)({}),
+          Layer.mock(ServerBrowser.ServerBrowser)({}),
+        ),
+      ),
+      Effect.scoped,
+    ),
 );
 
 // Compaction keeps the oldest and newest event per message, so a cursor older

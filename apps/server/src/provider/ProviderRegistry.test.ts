@@ -13,6 +13,7 @@ import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
@@ -1475,6 +1476,128 @@ it.layer(
         [...previousProvider.models],
       );
     });
+
+    it.effect(
+      "a native Codex login is observed from probes begun after the request; a managed one is not",
+      () =>
+        Effect.gen(function* () {
+          const driver = ProviderDriverKind.make("codex");
+          const nativeId = ProviderInstanceId.make("codex");
+          const managedId = ProviderInstanceId.make("codex_managed");
+          const account = yield* Ref.make<ServerProvider["auth"]>({
+            status: "authenticated",
+            type: "chatgpt",
+            email: "account-a@example.test",
+          });
+          const probes = yield* Ref.make(0);
+          const providerFor = (
+            instanceId: ProviderInstanceId,
+            auth: ServerProvider["auth"],
+          ): ServerProvider => ({
+            instanceId,
+            driver,
+            status: "ready",
+            enabled: true,
+            installed: true,
+            auth,
+            checkedAt: "2026-10-31T00:00:00.000Z",
+            version: "0.156.1",
+            models: [],
+            slashCommands: [],
+            skills: [],
+          });
+          // Each probe reads the account logged in now, as each Codex app-server does.
+          const probe = (instanceId: ProviderInstanceId) =>
+            Ref.update(probes, (count) => count + 1).pipe(
+              Effect.andThen(Ref.get(account)),
+              Effect.map((auth) => providerFor(instanceId, auth)),
+            );
+          const instanceOf = (
+            instanceId: ProviderInstanceId,
+            invalidateCaches: Effect.Effect<void> | undefined,
+          ): ProviderInstance => ({
+            instanceId,
+            driverKind: driver,
+            continuationIdentity: {
+              driverKind: driver,
+              continuationKey: `codex:instance:${instanceId}`,
+            },
+            displayName: undefined,
+            enabled: true,
+            snapshot: {
+              resolveMaintenance: () =>
+                Effect.succeed(
+                  makeManualOnlyProviderMaintenanceCapabilities({
+                    provider: driver,
+                    packageName: null,
+                  }),
+                ),
+              // What was published before: never what an observation reports.
+              getSnapshot: Effect.succeed(
+                providerFor(instanceId, { status: "authenticated", email: "cached@example.test" }),
+              ),
+              refresh: probe(instanceId),
+              streamChanges: Stream.empty,
+              applyUsageLimits: () => Effect.void,
+            },
+            ...(invalidateCaches === undefined ? {} : { invalidateCaches }),
+            orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
+            textGeneration: {} as ProviderInstance["textGeneration"],
+          });
+          const instances = [instanceOf(nativeId, Effect.void), instanceOf(managedId, undefined)];
+          const runtimeServices = yield* Layer.build(
+            ProviderRegistry.layer.pipe(
+              Layer.provideMerge(
+                Layer.succeed(ProviderInstanceRegistry.ProviderInstanceRegistry, {
+                  getInstance: (requestedId) =>
+                    Effect.succeed(
+                      instances.find((instance) => instance.instanceId === requestedId),
+                    ),
+                  listInstances: Effect.succeed(instances),
+                  listUnavailable: Effect.succeed([]),
+                  streamChanges: Stream.empty,
+                  subscribeChanges: Effect.flatMap(PubSub.unbounded<void>(), PubSub.subscribe),
+                }),
+              ),
+              Layer.provideMerge(
+                ServerConfig.layerTest(process.cwd(), {
+                  prefix: "t3-provider-registry-codex-observation-",
+                }),
+              ),
+              Layer.provideMerge(layerUnusedMutator),
+              Layer.provideMerge(NodeServices.layer),
+            ),
+          );
+
+          yield* Effect.gen(function* () {
+            const registry = yield* ProviderRegistry.ProviderRegistry;
+            // Another ChatGPT login in the same home: observation reads it, not what was cached.
+            yield* Ref.set(account, {
+              status: "authenticated",
+              type: "chatgpt",
+              email: "account-b@example.test",
+            });
+            const before = yield* Ref.get(probes);
+            const observed = yield* registry.observeInstance!(nativeId);
+            assert.deepStrictEqual(Option.getOrThrow(observed).auth, {
+              status: "authenticated",
+              type: "chatgpt",
+              email: "account-b@example.test",
+            });
+            assert.isAtLeast((yield* Ref.get(probes)) - before, 1);
+            // Logged out: it is observed as such, never as the account read before.
+            yield* Ref.set(account, { status: "unauthenticated" });
+            assert.strictEqual(
+              Option.getOrThrow(yield* registry.observeInstance!(nativeId)).auth.status,
+              "unauthenticated",
+            );
+            // A managed login reports the account T3 connected, which is not observed this way.
+            const probed = yield* Ref.get(probes);
+            assert.isTrue(Option.isNone(yield* registry.observeInstance!(managedId)));
+            assert.strictEqual(yield* Ref.get(probes), probed);
+          }).pipe(Effect.provide(runtimeServices));
+        }).pipe(Effect.scoped),
+    );
 
     it.effect(
       "a second request for a cwd being scanned gets its result, even if the first leaves",

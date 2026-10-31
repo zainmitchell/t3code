@@ -46,18 +46,20 @@ export function npmLauncherPackageManifest(version: string, databaseMigration: n
   };
 }
 
-/** Highest server migration id, from the `NNN_Name.ts` files the server registers. */
+/** Highest id in the server's `migrationEntries`. Ids follow recorded history, not file prefixes;
+ * read from source so this script does not load the server's persistence graph. */
 const latestServerMigrationId = Effect.fn("latestServerMigrationId")(function* () {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  const dir = yield* path.fromFileUrl(
-    new URL("../apps/server/src/persistence/Migrations/", import.meta.url),
+  const file = yield* path.fromFileUrl(
+    new URL("../apps/server/src/persistence/Migrations.ts", import.meta.url),
   );
-  const ids = (yield* fs.readDirectory(dir)).flatMap((name) => {
-    const id = /^(\d+)_\w+\.ts$/.exec(name)?.[1];
-    return id === undefined ? [] : [Number(id)];
-  });
-  return Math.max(0, ...ids);
+  const entries = /const migrationEntries = \[([\s\S]*?)\] as const;/.exec(
+    yield* fs.readFileString(file),
+  )?.[1];
+  const ids = [...(entries ?? "").matchAll(/^\s*\[(\d+),/gm)].map(([, id]) => Number(id));
+  if (ids.length === 0) return yield* Effect.die(`No migration entries found in ${file}`);
+  return Math.max(...ids);
 });
 
 export const buildNpmLauncher = Effect.fn("buildNpmLauncher")(function* (input: {

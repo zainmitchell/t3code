@@ -91,32 +91,34 @@ const writesThread = <P extends { readonly threadId?: ThreadId | undefined }, A,
 ) => McpToolAccess.writesThreads((params: P) => [params.threadId], handle);
 
 export const layer = McpToolAccess.toLayer(ThreadToolkit, {
-  run_scheduled_task_now: McpToolAccess.writesEnvironment((input) =>
-    Effect.gen(function* () {
-      const scheduler = yield* ScheduledTasks.ScheduledTaskService;
-      const { tasks } = yield* scheduler.list().pipe(Effect.mapError(unavailable));
-      if (!tasks.some((task) => task.id === input.taskId))
-        return yield* new OrchestratorMcpFailure({
-          code: "invalid_request",
-          message: "The scheduled task was not found.",
-        });
-      const { task, threadId } = yield* scheduler
-        .runNow({ id: input.taskId })
-        .pipe(Effect.mapError(unavailable));
-      const scope = yield* McpInvocationContext.McpInvocationContext;
-      return {
-        taskId: task.id,
-        threadId,
-        ...(threadId === null
-          ? {}
-          : {
-              link: McpInvocationContext.threadLinkFor(scope, threadId),
-            }),
-        lastRunStatus: task.lastRunStatus,
-        runCount: task.runCount,
-        nextRunAt: task.nextRunAt,
-      };
-    }),
+  run_scheduled_task_now: McpToolAccess.writesEnvironment(
+    (input) =>
+      Effect.gen(function* () {
+        const scheduler = yield* ScheduledTasks.ScheduledTaskService;
+        const { tasks } = yield* scheduler.list().pipe(Effect.mapError(unavailable));
+        if (!tasks.some((task) => task.id === input.taskId))
+          return yield* new OrchestratorMcpFailure({
+            code: "invalid_request",
+            message: "The scheduled task was not found.",
+          });
+        const { task, threadId } = yield* scheduler
+          .runNow({ id: input.taskId })
+          .pipe(Effect.mapError(unavailable));
+        const scope = yield* McpInvocationContext.McpInvocationContext;
+        return {
+          taskId: task.id,
+          threadId,
+          ...(threadId === null
+            ? {}
+            : {
+                link: McpInvocationContext.threadLinkFor(scope, threadId),
+              }),
+          lastRunStatus: task.lastRunStatus,
+          runCount: task.runCount,
+          nextRunAt: task.nextRunAt,
+        };
+      }),
+    { startsExecutions: true },
   ),
   t3_thread_search: McpToolAccess.reads((input) =>
     Effect.gen(function* () {
@@ -174,6 +176,7 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
               .pipe(Effect.mapError(dispatchFailure));
             return { sequence: result.sequence, targetThreadId };
           }
+          const scope = yield* McpInvocationContext.McpInvocationContext;
           const targetThreadId = ThreadId.make(`${commandId}:fork`);
           const result = yield* threads
             .dispatch({
@@ -183,6 +186,10 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
               targetThreadId,
               sourcePoint,
               ...(input.title === undefined ? {} : { title: input.title }),
+              // The fork is the calling agent's work, whichever thread it selected as context.
+              ...(scope.thread === undefined
+                ? {}
+                : { createdFrom: { type: "thread", threadId: scope.thread.threadId } }),
               createdBy: "agent",
               creationSource: "mcp",
             })
