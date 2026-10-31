@@ -431,7 +431,8 @@ export const make = Effect.gen(function* () {
     // Earlier settle shells may still run foreground programs; do not type resumed settles into them.
     // Work that carries its run's container needs a shell started inside it, and an earlier setup
     // shell (the owner's own, or one an earlier generation started) cannot show it was.
-    const ownTerminal = trigger === "settle" || Option.isSome(yield* CurrentExecutionJoin);
+    const contained = Option.isSome(yield* CurrentExecutionJoin);
+    const ownTerminal = trigger === "settle" || contained;
     const terminalId = ownTerminal
       ? `${trigger}-${script.id}-${(yield* crypto.randomUUIDv4().pipe(Effect.orDie)).slice(0, 8)}`
       : `setup-${script.id}`;
@@ -545,9 +546,12 @@ export const make = Effect.gen(function* () {
       Effect.forkIn(serviceScope),
     );
 
+    // A failed setup's shell stays open for its owner to look into. A contained one is a member of
+    // its run's container, so left open it would hold the run until someone closed it; the shell is
+    // this call's own, so only it goes, and only while nothing runs in it.
     const completion = observed?.completion.pipe(
       Effect.tap(({ exitCode }) =>
-        exitCode === 0
+        exitCode === 0 || contained
           ? terminalManager.closeIdle({ threadId: input.threadId, terminalId })
           : Effect.void,
       ),

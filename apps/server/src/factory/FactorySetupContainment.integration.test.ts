@@ -16,10 +16,12 @@ import {
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as PtyAdapter from "@t3tools/shared/PtyAdapter";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Schedule from "effect/Schedule";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Stream from "effect/Stream";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -36,6 +38,7 @@ import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
 import * as ProviderRuntimeRecoveryService from "../orchestration-v2/ProviderRuntimeRecoveryService.ts";
+import type * as ProviderSessionManager from "../orchestration-v2/ProviderSessionManager.ts";
 import * as ProviderReplayHarness from "../orchestration-v2/testkit/ProviderReplayHarness.ts";
 import * as ThreadLaunch from "../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
@@ -63,8 +66,15 @@ import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
 import * as FactoryClaimStore from "./FactoryClaimStore.ts";
-import { readExecutionCustody } from "./factoryCustody.ts";
+import {
+  type FactoryCustody,
+  preparationFailures,
+  readExecutionCustody,
+} from "./factoryCustody.ts";
 import * as FactoryExecutionGenerations from "./FactoryExecutionGenerations.ts";
+import type * as FactoryGitReadback from "./FactoryGitReadback.ts";
+import { makeFactoryOutcomes } from "./factoryOutcomes.ts";
+import * as FactoryOutcomeStore from "./FactoryOutcomeStore.ts";
 import * as FactoryRunPreparation from "./FactoryRunPreparation.ts";
 import * as FactoryStore from "./FactoryStore.ts";
 
@@ -90,6 +100,7 @@ const layerFor = (
   directory: string,
   repo: string,
   setupCommand: string,
+  setupAsync: boolean,
   holders: Array<ExecutionContainment.ContainmentHolder>,
 ) => {
   const layerDatabase = SqlitePersistence.layerMemory;
@@ -134,7 +145,7 @@ const layerFor = (
                   command: setupCommand,
                   icon: "configure",
                   runOnWorktreeCreate: true,
-                  async: true,
+                  async: setupAsync,
                 },
               ],
               createdAt: "2026-10-31T00:00:00.000Z",
@@ -199,10 +210,17 @@ const layerFor = (
       }),
     ),
   );
-  // As the server builds them: the generations, and the resolver terminals ask. The replay
-  // harness builds the same generations layer without containment, so this one is its own.
-  const layerCustody = FactoryExecutionGenerations.layerExecutionJoin.pipe(
-    Layer.provideMerge(Layer.fresh(FactoryExecutionGenerations.layer)),
+  // As the server builds them: the generations, and the resolver terminals ask, which reads them.
+  // The replay harness builds the same generations layer without containment, and a layer is
+  // shared by reference, so these are built in a memo of their own. A fresh layer is rebuilt
+  // wherever it is used; `suspend` builds it once for the terminals and the test alike.
+  const layerCustody = Layer.suspend(() =>
+    Layer.fresh(
+      FactoryExecutionGenerations.layerExecutionJoin.pipe(
+        Layer.provideMerge(FactoryExecutionGenerations.layer),
+      ),
+    ),
+  ).pipe(
     Layer.provideMerge(FactoryStore.layer),
     Layer.provideMerge(layerContainment),
     Layer.provide(layerStores),
@@ -272,23 +290,17 @@ const layerFor = (
     layerThreads,
     layerStores,
     layerCustody,
+    layerTerminals,
+    FactoryOutcomeStore.layer.pipe(Layer.provide(layerDatabase)),
     layerDatabase,
     layerGitDriver,
   );
 };
 
-/**
- * A claimed run of a worktree stage whose async setup is running after its release, prepared as
- * the claim service prepares it: its container held before any workspace work, and its owned
- * preparation joined to it.
- */
-const runningSetup = (unit: string) =>
+/** An admitted worktree stage's launched run, bound to its reservation and not yet prepared. */
+const launchedExecution = (unit: string) =>
   Effect.gen(function* () {
-    const threads = yield* ThreadManagement.ThreadManagementService;
     const launches = yield* ThreadLaunch.ThreadLaunchService;
-    const preparation = yield* FactoryRunPreparation.FactoryRunPreparation;
-    const generations = yield* FactoryExecutionGenerations.FactoryExecutionGenerations;
-    const store = yield* FactoryStore.FactoryStore;
     const sql = yield* SqlClient.SqlClient;
     const threadId = ThreadId.make(`thread:factory-setup:${unit}`);
     const reservationId = FactoryReservationId.make(`reservation:factory-setup:${unit}`);
@@ -352,16 +364,24 @@ const runningSetup = (unit: string) =>
       SET record_json = ${JSON.stringify({ ...reservation, execution: { ...reservation.execution, runId } })}
       WHERE reservation_id = ${reservationId}
     `;
-    const ownerId = PreparationOwnerId.make(`owner:${unit}:1`);
+    return { threadId, runId, reservationId };
+  });
+
+/**
+ * The run's preparation by `ownerId`, joined to the run's held container as the claim service
+ * joins it, and the status the run leaves `preparing` for.
+ */
+const prepareOwned = (threadId: ThreadId, runId: RunId, ownerId: PreparationOwnerId) =>
+  Effect.gen(function* () {
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    const preparation = yield* FactoryRunPreparation.FactoryRunPreparation;
+    const generations = yield* FactoryExecutionGenerations.FactoryExecutionGenerations;
     const commandId = FactoryClaimStore.preparationCommandId(runId);
-    yield* store.openWorkspaceObligation({ runId, reservationId, threadId, commandId, ownerId });
-    const generation = yield* generations.openIntent({ runId, reservationId, threadId });
-    yield* generations.hold(generation);
     const afterSequence = yield* threads.getThreadEventSequence(threadId);
     const handle = yield* preparation
       .startOwned({ commandId, threadId, runId, ownerId, join: generations.joinFor(runId) })
       .pipe(Effect.map(Option.getOrThrow));
-    const released = yield* threads
+    const left = yield* threads
       .streamStoredEventsFrom({ threadId, afterSequence, eventType: "run.updated" })
       .pipe(
         Stream.filter(
@@ -372,25 +392,92 @@ const runningSetup = (unit: string) =>
         ),
         Stream.runHead,
       );
-    assert.strictEqual(
-      Option.map(released, (stored) =>
-        stored.event.type === "run.updated" ? stored.event.payload.status : undefined,
-      ).pipe(Option.getOrUndefined),
-      "starting",
-    );
+    const status = Option.map(left, (stored) =>
+      stored.event.type === "run.updated" ? stored.event.payload.status : undefined,
+    ).pipe(Option.getOrUndefined);
+    return { handle, status };
+  });
+
+/**
+ * A claimed run of a worktree stage whose async setup is running after its release, prepared as
+ * the claim service prepares it: its container held before any workspace work, and its owned
+ * preparation joined to it.
+ */
+const runningSetup = (unit: string) =>
+  Effect.gen(function* () {
+    const generations = yield* FactoryExecutionGenerations.FactoryExecutionGenerations;
+    const store = yield* FactoryStore.FactoryStore;
+    const { threadId, runId, reservationId } = yield* launchedExecution(unit);
+    const ownerId = PreparationOwnerId.make(`owner:${unit}:1`);
+    const commandId = FactoryClaimStore.preparationCommandId(runId);
+    yield* store.openWorkspaceObligation({ runId, reservationId, threadId, commandId, ownerId });
+    const generation = yield* generations.openIntent({ runId, reservationId, threadId });
+    yield* generations.hold(generation);
+    const { handle, status } = yield* prepareOwned(threadId, runId, ownerId);
+    assert.strictEqual(status, "starting");
     const bound = Option.getOrThrow(yield* store.bindingForThread(threadId));
     return { threadId, runId, ownerId, generation, handle, reservation: bound };
   });
+
+/**
+ * The lifecycle's ordinary outcome cleanup over this server's own stores and containers. No
+ * provider session opens here, and nothing settles a thread: no settlement service runs.
+ */
+const outcomeCleanup = Effect.gen(function* () {
+  const context = yield* Effect.context<
+    | FactoryStore.FactoryStore
+    | ProjectionStore.ProjectionStoreV2
+    | EffectOutbox.EffectOutboxV2
+    | FactoryExecutionGenerations.FactoryExecutionGenerations
+  >();
+  const unused = () => Effect.die("the outcome cleanup does not use this");
+  return makeFactoryOutcomes({
+    store: yield* FactoryStore.FactoryStore,
+    outcomes: yield* FactoryOutcomeStore.FactoryOutcomeStore,
+    projections: yield* ProjectionStore.ProjectionStoreV2,
+    generations: yield* FactoryExecutionGenerations.FactoryExecutionGenerations,
+    sessions: {
+      isLive: () => Effect.succeed(false),
+    } as unknown as ProviderSessionManager.ProviderSessionManagerV2Shape,
+    git: {} as FactoryGitReadback.FactoryGitReadbackShape,
+    custodyOf: (reservation) =>
+      readExecutionCustody(reservation).pipe(
+        Effect.provide(context),
+        Effect.orElseSucceed((): FactoryCustody => ({
+          state: "unknown",
+          reasons: ["execution_unreadable"],
+        })),
+      ),
+    settleThread: unused,
+    verifyEvidence: unused,
+    readArtifact: unused,
+    adoptedCriteria: unused,
+    onReported: unused,
+    ensureOperation: unused,
+    getOperation: unused,
+  });
+});
 
 /** A setup that reports `setup`, starts a detached `leaf`, and runs until something ends it. */
 const setupCommand = (port: number) =>
   `& '${process.execPath}' '${memberFixture}' ${port} setup --spawn leaf`;
 
+/** A setup that fails the first time it runs and succeeds after, as a flaky install does. */
+const failingOnce = (_port: number, directory: string) => {
+  const marker = `${directory}\\failed-once`;
+  return `if (-not (Test-Path '${marker}')) { New-Item -ItemType File '${marker}' | Out-Null; & '${process.execPath}' -e 'process.exit(3)' }`;
+};
+
 const withRepository = <A, E, R>(
   body: (
     milestones: Effect.Success<typeof makeMilestones>,
     holders: ReadonlyArray<ExecutionContainment.ContainmentHolder>,
+    repo: string,
   ) => Effect.Effect<A, E, R>,
+  setup: {
+    readonly command?: (port: number, directory: string) => string;
+    readonly async?: boolean;
+  } = {},
 ) =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -402,6 +489,7 @@ const withRepository = <A, E, R>(
       const milestones = yield* makeMilestones;
       // Every container still held when the test ends is closed, and with it its members.
       const holders: Array<ExecutionContainment.ContainmentHolder> = [];
+      const command = (setup.command ?? setupCommand)(milestones.port, directory);
       return yield* Effect.gen(function* () {
         const driver = yield* GitVcsDriver.GitVcsDriver;
         const git = (args: ReadonlyArray<string>) =>
@@ -413,8 +501,8 @@ const withRepository = <A, E, R>(
         yield* fs.writeFileString(path.join(repo, "tracked.txt"), "base\n");
         yield* git(["add", "tracked.txt"]);
         yield* git(["commit", "-m", "base"]);
-        return yield* body(milestones, holders);
-      }).pipe(Effect.provide(layerFor(directory, repo, setupCommand(milestones.port), holders)));
+        return yield* body(milestones, holders, repo);
+      }).pipe(Effect.provide(layerFor(directory, repo, command, setup.async ?? true, holders)));
     }),
   ).pipe(Effect.provide(NodeServices.layer));
 
@@ -517,6 +605,148 @@ describe.runIf(HostProcess.Platform.defaultValue() === "win32")(
           yield* milestones.ended("leaf");
         }),
       ),
+    );
+
+    it.live(
+      "Claims/R2: a failed setup's shell leaves its container, so a same-run retry and its outcome release the stage",
+      () =>
+        withRepository(
+          (_milestones, _holders, repo) =>
+            Effect.gen(function* () {
+              const store = yield* FactoryStore.FactoryStore;
+              const generations = yield* FactoryExecutionGenerations.FactoryExecutionGenerations;
+              const threads = yield* ThreadManagement.ThreadManagementService;
+              const terminals = yield* TerminalManager.TerminalManager;
+              const outcomes = yield* FactoryOutcomeStore.FactoryOutcomeStore;
+              const { threadId, runId, reservationId } = yield* launchedExecution("retry");
+              const setupTerminals: Array<string> = [];
+              yield* terminals.subscribe((event) =>
+                Effect.sync(() => {
+                  if (
+                    event.threadId === threadId &&
+                    event.type === "started" &&
+                    event.terminalId !== "owner"
+                  ) {
+                    setupTerminals.push(event.terminalId);
+                  }
+                }),
+              );
+              const first = PreparationOwnerId.make("owner:retry:1");
+              yield* store.openWorkspaceObligation({
+                runId,
+                reservationId,
+                threadId,
+                commandId: FactoryClaimStore.preparationCommandId(runId),
+                ownerId: first,
+              });
+              const generation = yield* generations.openIntent({ runId, reservationId, threadId });
+              yield* generations.hold(generation);
+              // The owner's own terminal, opened while the run is held, is one of its members.
+              yield* terminals.open({
+                threadId,
+                terminalId: "owner",
+                cwd: repo,
+                cols: 80,
+                rows: 24,
+              });
+
+              const failed = yield* prepareOwned(threadId, runId, first);
+              assert.strictEqual(failed.status, "failed");
+              yield* failed.handle.ended;
+              assert.include(
+                preparationFailures(yield* threads.getThreadProjection(threadId)).get(runId),
+                "Setup script exited with 3",
+              );
+              const failedShell = yield* Effect.exit(
+                terminals.getShell({ threadId, terminalId: setupTerminals[0]! }),
+              );
+
+              // The same run prepares again under a new owner, in the same container, and its
+              // setup succeeds in a terminal of its own.
+              const second = PreparationOwnerId.make("owner:retry:2");
+              assert.isTrue(
+                yield* store.reownWorkspaceObligation({
+                  runId,
+                  fromOwnerId: first,
+                  toOwnerId: second,
+                  endedGenerations: [],
+                }),
+              );
+              yield* threads.dispatch({
+                type: "prepared-run.retry",
+                commandId: CommandId.make(`factory-recovery:${runId}:${second}`),
+                threadId,
+                runId,
+              });
+              const retried = yield* prepareOwned(threadId, runId, second);
+              assert.strictEqual(retried.status, "starting");
+              yield* retried.handle.ended;
+              assert.strictEqual(new Set(setupTerminals).size, 2);
+              // As the claim service's watcher settles it: the container accounts for the setup.
+              assert.isTrue(
+                yield* store.settleWorkspaceObligation({
+                  runId,
+                  ownerId: second,
+                  scope: { type: "contained", generationId: generation.generationId },
+                }),
+              );
+              // No provider starts here: a restart's recovery cancels the released run.
+              yield* (yield* ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService).recover;
+              assert.deepStrictEqual(
+                (yield* threads.getThreadProjection(threadId)).runs.map((run) => run.status),
+                ["cancelled"],
+              );
+
+              const reservation = Option.getOrThrow(yield* store.bindingForThread(threadId));
+              const outcomeId = `outcome:${reservationId}`;
+              yield* outcomes.insertReported({
+                outcomeId,
+                factoryId: reservation.factoryId,
+                itemKey: reservation.itemKey,
+                origin: { type: "native", reservationId },
+                stage: "implement",
+                report: { outcome: "failed", failure: "Setup failed.", summary: "Nothing built." },
+                reportDigest: "report",
+                reportedAt: "2026-10-31T00:00:01.000Z",
+                state: "reported",
+              });
+              assert.isTrue(
+                yield* outcomes.markVerified({
+                  outcomeId,
+                  receipt: { verifiedAt: "2026-10-31T00:00:02.000Z" },
+                }),
+              );
+
+              const { settle } = yield* outcomeCleanup;
+              // The owner's shell is theirs: the cleanup leaves it running, and it holds the stage.
+              assert.isFalse(yield* settle(reservation));
+              assert.isTrue(
+                Exit.isSuccess(
+                  yield* Effect.exit(terminals.getShell({ threadId, terminalId: "owner" })),
+                ),
+              );
+              yield* terminals.close({ threadId, terminalId: "owner" });
+              // Each collection pass settles again: a closed shell leaves its container once its
+              // process has exited, which nothing reports.
+              const released = yield* settle(reservation).pipe(
+                Effect.repeat({
+                  until: (done) => done,
+                  times: 40,
+                  // oxlint-disable-next-line t3code/no-real-time-wait-in-tests -- a job object signals nothing when a member exits; passes re-read its count, as the lifecycle's do.
+                  schedule: Schedule.spaced("250 millis"),
+                }),
+              );
+              assert.isTrue(released, "no setup shell of the run may hold its container");
+              assert.isTrue(Exit.isFailure(failedShell), "the failed setup's shell was retired");
+              assert.strictEqual(
+                Option.map(yield* store.getReservation(reservationId), (held) => held.state).pipe(
+                  Option.getOrUndefined,
+                ),
+                "released",
+              );
+            }),
+          { command: failingOnce, async: false },
+        ),
     );
   },
 );
