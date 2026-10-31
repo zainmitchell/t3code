@@ -1879,12 +1879,27 @@ export const deriveVerificationBinding = Effect.fnUntraced(function* (
         "the recorded bytes read back",
       );
     if (input.record === "write") {
-      const existing = yield* fs.readFile(file).pipe(Effect.option);
-      if (Option.isSome(existing)) {
-        if (sha256(existing.value) !== digest) return unrecorded(`is not sha256 ${digest}`);
-      } else if (Option.isNone(yield* fs.writeFileString(file, text).pipe(Effect.option))) {
-        return unrecorded("could not be written");
+      let existing = yield* fs.readFile(file).pipe(Effect.option);
+      if (Option.isNone(existing)) {
+        // Written whole under a name no other writer shares, then linked into place, so the
+        // record's own name never holds a torn write and is never written over.
+        const temp = `${file}.${NodeCrypto.randomUUID()}.tmp`;
+        const written = yield* fs
+          .writeFileString(temp, text, { flag: "wx" })
+          .pipe(Effect.andThen(fs.link(temp, file)), Effect.result);
+        yield* fs.remove(temp).pipe(Effect.ignore);
+        existing = yield* fs.readFile(file).pipe(Effect.option);
+        if (Option.isNone(existing)) {
+          if (written._tag === "Failure") {
+            yield* Effect.logWarning("Factory binding record could not be written", {
+              file,
+              cause: written.failure.message,
+            });
+          }
+          return unrecorded("could not be written");
+        }
       }
+      if (sha256(existing.value) !== digest) return unrecorded(`is not sha256 ${digest}`);
     }
     recorded = { path: file, sha256: digest };
   }

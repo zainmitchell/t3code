@@ -53,7 +53,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
-import type * as PlatformError from "effect/PlatformError";
+import * as PlatformError from "effect/PlatformError";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
@@ -1864,6 +1864,43 @@ class GrantIssueFault extends Context.Service<GrantIssueFault, Ref.Ref<boolean>>
 
 const layerGrantIssueFault = Layer.effect(GrantIssueFault, Ref.make(false));
 
+/** Arms the next write of a binding record to stop partway, as a crash or a full disk leaves it. */
+class RecordWriteFault extends Context.Service<RecordWriteFault, Ref.Ref<boolean>>()(
+  "t3/factory/FactoryLifecycle.test/RecordWriteFault",
+) {}
+
+const layerRecordWriteFault = Layer.effect(RecordWriteFault, Ref.make(false));
+
+const layerFaultableFiles = Layer.effect(
+  FileSystem.FileSystem,
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const fault = yield* RecordWriteFault;
+    return FileSystem.make({
+      ...fs,
+      writeFile: (file, data, options) =>
+        Effect.flatMap(Ref.get(fault), (armed) =>
+          armed && file.includes(".binding-")
+            ? Ref.set(fault, false).pipe(
+                Effect.andThen(fs.writeFile(file, data.subarray(0, data.length >> 1), options)),
+                Effect.andThen(
+                  Effect.fail(
+                    PlatformError.systemError({
+                      _tag: "WriteZero",
+                      module: "FileSystem",
+                      method: "writeFile",
+                      pathOrDescriptor: file,
+                      description: "no space left on device",
+                    }),
+                  ),
+                ),
+              )
+            : fs.writeFile(file, data, options),
+        ),
+    });
+  }),
+);
+
 interface AdmissionLookupsState {
   /** Runs before the factory looks an admission up, so a test can act between two admissions. */
   before: Effect.Effect<void> | undefined;
@@ -1929,6 +1966,7 @@ const makeLayerTest = (options: TestRuntimeOptions = {}) => {
   const layerContainmentFake = makeLayerContainmentFake(options.contained ?? true);
   return FactoryLifecycle.layerUsingStores
     .pipe(
+      Layer.provideMerge(layerFaultableFiles),
       Layer.provideMerge(layerAdmissionPolicy),
       Layer.provideMerge(layerPolicyFake),
       Layer.provideMerge(
@@ -1973,6 +2011,7 @@ const makeLayerTest = (options: TestRuntimeOptions = {}) => {
       Layer.provideMerge(layerScriptedPendingWork),
       Layer.provideMerge(layerDecisionReadHold),
       Layer.provideMerge(layerGrantIssueFault),
+      Layer.provideMerge(layerRecordWriteFault),
       Layer.provideMerge(layerAdmissionLookups),
       Layer.provideMerge(Layer.fresh(SqlitePersistence.layerMemory)),
       Layer.provideMerge(layerPlatformTest),
@@ -12792,10 +12831,14 @@ it.effect(
 
           // Everything holds: the proof is admitted once, on its derived binding and output root,
           // and starts once its provider reports the adopted account and its worktree the landing.
+          // Its first record write is cut short; that leaves nothing torn for the next pass.
           const launch = yield* LaunchFake;
           launch.head = { commit: landed.mergeCommit, tree: landed.tree };
           const startsBefore = (yield* startedTurns).length;
+          const writeFault = yield* RecordWriteFault;
+          yield* Ref.set(writeFault, true);
           const admitted = admittedBy(yield* advance("clock"));
+          assert.isFalse(yield* Ref.get(writeFault));
           assert.deepStrictEqual(stageOf(admitted), [itemKeyFor(7501), "rework"]);
           const basis =
             admitted.reservation.origin === "admitted"
@@ -12814,6 +12857,7 @@ it.effect(
               brief,
             ) ?? [];
           assert.strictEqual(path.dirname(recordPath ?? ""), outputs);
+          assert.deepStrictEqual(yield* fs.readDirectory(outputs), [path.basename(recordPath!)]);
           const recordText = yield* fs.readFileString(recordPath!);
           assert.strictEqual(sha256(recordText), recordSha256);
           assert.deepInclude(JSON.parse(recordText), {
