@@ -111,7 +111,7 @@ const make = Effect.gen(function* () {
   /**
    * Our record on the issue, written if it is not there. Only a comment of our own account that
    * says exactly what the record says is adopted: one that merely carries the marker may be a
-   * worker's, or another record quoting it.
+   * worker's, or another record quoting it. Line endings alone may differ, as a tracker stores them.
    */
   const ensureComment = Effect.fnUntraced(function* (
     session: FactoryTracker.TrackerSession,
@@ -125,8 +125,9 @@ const make = Effect.gen(function* () {
     const issue = yield* session.readIssue(target);
     const ours = (comment: { readonly body: string; readonly authorId: string }) =>
       comment.body.includes(target.marker) && comment.authorId === session.account.accountId;
+    const lines = (text: string) => text.replaceAll("\r\n", "\n");
     const existing = issue.comments.find(
-      (comment) => ours(comment) && comment.body === target.body,
+      (comment) => ours(comment) && lines(comment.body) === lines(target.body),
     );
     if (existing !== undefined) {
       return { commentId: existing.id, bodyDigest: sha256(existing.body), issue } as const;

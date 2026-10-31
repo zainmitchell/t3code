@@ -103,6 +103,10 @@ class Hub extends Context.Service<
       publishThenLose?: boolean;
       issueCreateAmbiguous?: boolean;
       issueListingLags?: boolean;
+      /** The next comment create lands but its answer is lost. */
+      commentCreateAmbiguous?: boolean;
+      /** GitHub stores a comment body's CRLF line endings as LF. */
+      commentsStoredWithLf?: boolean;
     };
     markerSearch: Deferred.Deferred<void> | undefined;
     markerSearches: number;
@@ -428,7 +432,13 @@ const layerTracker = Layer.effect(
         Effect.sync((): FactoryTracker.CreateCommentOutcome => {
           hub.writes.push("create comment");
           const id = 300 + hub.comments.length;
-          hub.comments.push({ id, issueNumber, body, authorId: "9001" });
+          const stored =
+            hub.faults.commentsStoredWithLf === true ? body.replaceAll("\r\n", "\n") : body;
+          hub.comments.push({ id, issueNumber, body: stored, authorId: "9001" });
+          if (hub.faults.commentCreateAmbiguous === true) {
+            hub.faults.commentCreateAmbiguous = false;
+            return { type: "ambiguous", cause: "GitHubApiRequestError" };
+          }
           return { type: "written", commentId: id };
         }),
       readComment: ({ commentId }) =>
@@ -1135,5 +1145,35 @@ it.live(
         bodyDigest: NodeCrypto.createHash("sha256").update(again).digest("hex"),
       });
       assert.deepStrictEqual(hub.writes, ["create comment"]);
+
+      // GitHub kept a lost create's CRLF body with LF line endings: found again, not written twice.
+      const crlf = `${marker.replace("outcome-1", "outcome-3")}\r\n\r\nFactory implement outcome: failed.`;
+      hub.faults.commentsStoredWithLf = true;
+      hub.faults.commentCreateAmbiguous = true;
+      yield* intendReport("outcome-3", crlf);
+      yield* apply("report:outcome-3");
+      assert.strictEqual((yield* recordOf("report:outcome-3")).state, "intended");
+      yield* apply("report:outcome-3");
+      const stored = hub.comments.at(-1)!;
+      assert.deepStrictEqual(hub.writes, ["create comment", "create comment"]);
+      const found = yield* recordOf("report:outcome-3");
+      assert.deepStrictEqual(found.state === "applied" ? found.receipt : found, {
+        kind: "tracker_comment",
+        commentId: stored.id,
+        bodyDigest: NodeCrypto.createHash("sha256").update(stored.body).digest("hex"),
+      });
+      // Line endings are the only difference allowed: a trailing space makes another text.
+      hub.faults.commentsStoredWithLf = false;
+      const spaced = `${marker.replace("outcome-1", "outcome-4")}\n\nFactory review outcome: approved.`;
+      hub.comments.push({ id: 4, issueNumber: 142, body: `${spaced} `, authorId: "9001" });
+      yield* intendReport("outcome-4", spaced);
+      yield* apply("report:outcome-4");
+      const reposted = yield* recordOf("report:outcome-4");
+      const repostedId =
+        reposted.state === "applied" && "commentId" in reposted.receipt
+          ? reposted.receipt.commentId
+          : undefined;
+      assert.notStrictEqual(repostedId, 4);
+      assert.strictEqual(hub.comments.find((comment) => comment.id === repostedId)?.body, spaced);
     }).pipe(Effect.provide(layerTest)),
 );
