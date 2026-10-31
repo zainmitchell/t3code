@@ -2,7 +2,7 @@
 import * as NodeCrypto from "node:crypto";
 
 import { assert, describe, it } from "@effect/vitest";
-import { FactoryId, FactoryItemKey } from "@t3tools/contracts";
+import { FactoryId, FactoryItemKey, type FactoryCriteriaProposal } from "@t3tools/contracts";
 import * as Option from "effect/Option";
 
 import {
@@ -506,6 +506,109 @@ describe("parent criteria preparation", () => {
         ["B2", "open", undefined],
         ["whole-parent", "reserved", hold],
       ],
+    );
+    // Root's no-edit unit owns no paths and still decodes.
+    const noEdit = { title: "Verify", contract: "No edit.", paths: [], mode: "no_edit" };
+    const adoptedNoEdit = edited((clauses) => (clauses[0]!.unit = noEdit));
+    assert.isTrue(Option.isSome(decodeCriteria(JSON.stringify(adoptedNoEdit))));
+  });
+
+  const unit = {
+    title: "Export cites the rule",
+    contract: "The export cites rule 77 for every refused duplicate.",
+    paths: ["src/export.ts"],
+  };
+  const proposing = (units: Record<number, unknown>): FactoryCriteriaProposal => ({
+    ...proposal,
+    clauses: proposal.clauses.map((clause, at) =>
+      at in units ? ({ ...clause, unit: units[at] } as typeof clause) : clause,
+    ),
+  });
+
+  it("refuses a proposed clause unit that is not exactly a bounded {title, contract, paths}", () => {
+    const prefix = "clause B2 names a unit that is not a bounded {title, contract, paths}: ";
+    const rows: ReadonlyArray<readonly [unknown, string]> = [
+      [{ contract: unit.contract, paths: unit.paths }, 'Missing key at ["title"]'],
+      [{ title: unit.title, paths: unit.paths }, 'Missing key at ["contract"]'],
+      [{ ...unit, paths: "src/export.ts" }, 'Expected array at ["paths"]'],
+      [{ ...unit, title: "t".repeat(201) }, 'at ["title"]'],
+      [{ ...unit, paths: ["../src/export.ts"] }, 'at ["paths"][0]'],
+      [{ ...unit, mode: "no_edit" }, 'Expected no excess property at ["mode"]'],
+    ];
+    for (const [proposed, problem] of rows) {
+      const found = criteriaProposalProblems({
+        proposal: proposing({ 1: proposed }),
+        issue: 40,
+        body,
+      });
+      assert.strictEqual(found.length, 1, problem);
+      assert.isTrue(found[0]!.startsWith(prefix), found[0]);
+      assert.include(found[0], problem);
+    }
+    assert.deepStrictEqual(
+      criteriaProposalProblems({ proposal: proposing({ 1: unit }), issue: 40, body, comments }),
+      [],
+    );
+  });
+
+  it("prepares a proposed unit only where adoption names none; an adopted unit always wins", () => {
+    const carried = edited((clauses) => (clauses[1]!.unit = unit));
+    assert.deepStrictEqual(problems({ proposal: proposing({ 1: unit }), document: carried }), []);
+    for (const document of [
+      edited(() => {}),
+      edited((clauses) => (clauses[1]!.unit = { ...unit, title: "Another unit" })),
+    ]) {
+      assert.include(
+        problems({ proposal: proposing({ 1: unit }), document }).join(),
+        "clause B2 does not carry its proposed unit",
+      );
+    }
+    const rootUnit = {
+      title: "Importer keeps rows",
+      contract: "Root's.",
+      paths: ["src/import.ts"],
+    };
+    const adoptedB1 = {
+      ...adopted,
+      clauses: [
+        {
+          id: "B1",
+          required: true,
+          source: { kind: "issue_acceptance", ref: "root", excerpt: b1 },
+          state: "open",
+          unit: { ...rootUnit, resources: ["ocr"] },
+        },
+        wholeParent,
+      ],
+    };
+    const keeping = edited((clauses) => (clauses[0]!.unit = { ...rootUnit, resources: ["ocr"] }));
+    assert.deepStrictEqual(problems({ adopted: adoptedB1, document: keeping }), []);
+    assert.deepStrictEqual(
+      problems({ adopted: adoptedB1, document: keeping, proposal: proposing({ 0: unit }) }),
+      ["clause B1 proposes a unit other than its adopted unit"],
+    );
+    assert.deepStrictEqual(
+      problems({
+        adopted: adoptedB1,
+        document: edited((clauses) => (clauses[0]!.unit = unit)),
+        proposal: proposing({ 0: unit }),
+      }),
+      [
+        "clause B1 does not keep its adopted unit",
+        "clause B1 proposes a unit other than its adopted unit",
+      ],
+    );
+    const plainB1 = {
+      ...adoptedB1,
+      clauses: [{ ...adoptedB1.clauses[0], unit: rootUnit }, wholeParent],
+    };
+    assert.deepStrictEqual(
+      problems({
+        adopted: plainB1,
+        document: edited((clauses) => (clauses[0]!.unit = rootUnit)),
+        proposal: proposing({ 0: rootUnit }),
+      }),
+      [],
     );
   });
 });

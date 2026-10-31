@@ -747,6 +747,34 @@ it.effect("verifies a parent's criteria only as exact quotes of the text its tri
         );
       }).pipe(Effect.provide(layerTest));
     }
+    // A clause may name its bounded unit; the verified proposal keeps it for preparation.
+    yield* Effect.gen(function* () {
+      const fixture = yield* makeFixture(btc131(), { reservation: triage });
+      const sql = yield* SqlClient.SqlClient;
+      const record = yield* encodeItemEvent({
+        type: "admitted",
+        stage: "triage",
+        reservationId,
+        stageBasis: triage.stageBasis!,
+        issueText: { title: "Parent", body: parentBody },
+      });
+      yield* sql`INSERT INTO factory_item_events (factory_id, item_key, record_json)
+        VALUES (${factoryId}, ${triage.itemKey}, ${record})`;
+      const unit = { title: "Import keeps order", contract: "Rows keep order.", paths: ["a.ts"] };
+      const { outcomeId } = yield* fixture.ops.report({
+        threadId,
+        report: criteriaReport((proposal) => ({
+          ...proposal,
+          clauses: proposal.clauses.map((clause, at) => (at === 0 ? { ...clause, unit } : clause)),
+        })),
+      });
+      yield* fixture.ops.reconcile(factoryId);
+      const outcome = Option.getOrThrow(yield* fixture.outcomes.get(outcomeId));
+      assert.deepStrictEqual(
+        [outcome.state, outcome.report.criteria?.clauses.map((clause) => clause.unit)],
+        ["verified", [unit, undefined]],
+      );
+    }).pipe(Effect.provide(layerTest));
     // The payload is required with its outcome, and refused with any other.
     yield* Effect.gen(function* () {
       const fixture = yield* makeFixture(btc131(), { reservation: triage });

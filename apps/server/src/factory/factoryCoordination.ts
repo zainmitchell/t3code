@@ -1,7 +1,8 @@
 // @effect-diagnostics nodeBuiltinImport:off - every identity here is a sha256 digest.
 import * as NodeCrypto from "node:crypto";
 
-import type { FactoryCriteriaProposal } from "@t3tools/contracts";
+import { FactoryClauseUnit, type FactoryCriteriaProposal } from "@t3tools/contracts";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 
 import type * as FactoryOperationStore from "./FactoryOperationStore.ts";
@@ -343,7 +344,16 @@ const Criteria = Schema.Struct({
         Schema.Struct({ actor: Schema.String, action: Schema.String, resume: Schema.String }),
       ),
       revision: Schema.optional(Schema.String),
-      unit: Schema.optional(Schema.Unknown),
+      /** The adopted clause-unit shape; Root's no-edit unit owns no paths. */
+      unit: Schema.optional(
+        Schema.NullOr(
+          Schema.Struct({
+            title: Schema.String,
+            contract: Schema.String,
+            paths: Schema.optional(Schema.Array(Schema.String)),
+          }),
+        ),
+      ),
     }),
   ),
 });
@@ -591,7 +601,7 @@ type RawClause = Record<string, unknown> & { readonly id: string };
 
 /**
  * Root-adopted criteria as the preparation reads them, every hold and annotation kept: the raw
- * document, not `decodeCriteria`'s view, which drops `reserved`, `revision` and `unit`.
+ * document, not `decodeCriteria`'s view, which drops every field its schema does not name.
  */
 export const adoptedClauses = (document: unknown, issue: number) => {
   const clauseOk = (clause: unknown): clause is RawClause => {
@@ -709,10 +719,23 @@ export interface IssueComment {
 const sliceOf = (text: string, start: number, end: number) =>
   codePoints(text).slice(start, end).join("");
 
+const decodeClauseUnit = Schema.decodeUnknownResult(FactoryClauseUnit, {
+  onExcessProperty: "error",
+});
+
+/** Why a proposed clause unit is not exactly a bounded `{title, contract, paths}`, if it is not. */
+const clauseUnitProblem = (clause: FactoryCriteriaProposal["clauses"][number]) => {
+  if (clause.unit === undefined) return undefined;
+  const decoded = decodeClauseUnit(clause.unit);
+  return Result.isSuccess(decoded)
+    ? undefined
+    : `clause ${clause.id} names a unit that is not a bounded {title, contract, paths}: ${decoded.failure.message.replace(/\s+/g, " ")}`;
+};
+
 /**
  * Every way a criteria proposal departs from the exact acceptance of `body`: one clause per
- * item in order, each quoting its item exactly and the comments it cites. Comment quotes are
- * checked against `comments` when T3 holds them.
+ * item in order, each quoting its item exactly and the comments it cites, and naming at most a
+ * bounded unit. Comment quotes are checked against `comments` when T3 holds them.
  */
 export const criteriaProposalProblems = (input: {
   readonly proposal: FactoryCriteriaProposal;
@@ -738,6 +761,10 @@ export const criteriaProposalProblems = (input: {
   }
   if (new Set(proposal.clauses.map((clause) => clause.id)).size !== proposal.clauses.length) {
     problems.push("the proposal names a clause id twice");
+  }
+  for (const clause of proposal.clauses) {
+    const problem = clauseUnitProblem(clause);
+    if (problem !== undefined) problems.push(problem);
   }
   const comments = new Map((input.comments ?? []).map((comment) => [String(comment.id), comment]));
   accepted.items.forEach((item, at) => {
@@ -797,7 +824,8 @@ const sameJson = (left: unknown, right: unknown) => canonical(left) === canonica
 /**
  * Every way prepared criteria depart from what T3 derives from its own reads of the body,
  * comments, complete membership, adoption and verified proposal. Each clause keeps its source,
- * id, state and adopted holds; its evidence is only adopted for that text or a member quoting it.
+ * id, state and adopted holds; its evidence is only adopted for that text or a member quoting it,
+ * and its unit is the adopted one, else the proposal's.
  */
 export const preparedCriteriaProblems = (input: {
   readonly document: unknown;
@@ -890,6 +918,17 @@ export const preparedCriteriaProblems = (input: {
       const held = expected.adopted?.[key];
       if (held !== undefined && held !== null && !sameJson(clause[key], held)) {
         problems.push(`clause ${expected.id} does not keep its adopted ${key}`);
+      }
+    }
+    // An adopted unit always wins; a proposed one is prepared only where adoption names none.
+    const adoptedUnit = expected.adopted?.unit;
+    if (proposal.unit !== undefined) {
+      if (adoptedUnit !== undefined && adoptedUnit !== null) {
+        if (!sameJson(proposal.unit, adoptedUnit)) {
+          problems.push(`clause ${expected.id} proposes a unit other than its adopted unit`);
+        }
+      } else if (!sameJson(clause.unit, proposal.unit)) {
+        problems.push(`clause ${expected.id} does not carry its proposed unit`);
       }
     }
     if (state === "reserved" && !hasTexts(clause.reserved, ["actor", "action", "resume"])) {

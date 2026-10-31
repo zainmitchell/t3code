@@ -73,6 +73,36 @@ describe("criteria proposal reports", () => {
     },
   });
 
+  const unit = {
+    title: "Import keeps order",
+    contract: "Rows keep source order.",
+    paths: ["a.ts"],
+  };
+  const withUnit = (change: Record<string, unknown>) =>
+    report([{ ...clause("abc"), unit: { ...unit, ...change } }]);
+  const unitRefusals: ReadonlyArray<readonly [string, unknown]> = [
+    ["a unit with no title", report([{ ...clause("abc"), unit: { contract: "c", paths: ["a"] } }])],
+    ["a unit with no contract", report([{ ...clause("abc"), unit: { title: "t", paths: ["a"] } }])],
+    ["a blank contract", withUnit({ contract: "  " })],
+    ["paths that are not an array", withUnit({ paths: "a.ts" })],
+    ["a unit owning no path", withUnit({ paths: [] })],
+    ["a title over 200 characters", withUnit({ title: "t".repeat(201) })],
+    ["a contract over 4000 characters", withUnit({ contract: "c".repeat(4_001) })],
+    ["more than 50 paths", withUnit({ paths: Array.from({ length: 51 }, (_, at) => `p${at}`) })],
+    ["an absolute path", withUnit({ paths: ["/etc/a"] })],
+    ["a path leaving the repository", withUnit({ paths: ["a/../../b"] })],
+    [
+      "more than 65536 unit characters",
+      report(
+        Array.from({ length: 17 }, (_, at) => ({
+          ...clause("x"),
+          id: `N${at}`,
+          unit: { ...unit, contract: "c".repeat(4_000) },
+        })),
+      ),
+    ],
+  ];
+
   it("decodes only bounded, exactly measured quotes", () => {
     // Offsets count code points: an astral character is one.
     assert.isTrue(Option.isSome(decode(report([clause("keeps 🚀 order")]))));
@@ -126,7 +156,13 @@ describe("criteria proposal reports", () => {
         "a body digest that is not sha256",
         report([clause("abc")], { basis: { bodySha256: "x", itemVersion: "v" } }),
       ],
+      ...unitRefusals,
     ];
     for (const [name, input] of refused) assert.isTrue(Option.isNone(decode(input)), name);
+  });
+
+  it("keeps a clause's bounded unit, trimmed, and refuses any other", () => {
+    const decoded = decode(withUnit({ title: " Import keeps order " }));
+    assert.deepStrictEqual(Option.getOrThrow(decoded).criteria?.clauses[0]?.unit, unit);
   });
 });

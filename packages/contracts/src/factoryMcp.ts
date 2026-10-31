@@ -47,6 +47,23 @@ const isSpan = Schema.makeFilter(
   { expected: "end after start, and an excerpt exactly end - start code points long" },
 );
 
+/** A path a clause unit owns: relative, with no `..` segment, as the coordination helper reads it. */
+const UnitPath = Schema.String.check(
+  Schema.isPattern(/^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9_.@+/-]{1,200}$/),
+);
+
+/**
+ * A clause's bounded product unit in the adopted clause-unit shape: the title and contract of the
+ * one child T3 opens for the clause, and the paths that child owns. Root's adoption alone names
+ * resources, an execution or a no-edit unit.
+ */
+export const FactoryClauseUnit = Schema.Struct({
+  title: TrimmedNonEmptyString.check(Schema.isMaxLength(200)),
+  contract: TrimmedNonEmptyString.check(Schema.isMaxLength(4_000)),
+  paths: Schema.Array(UnitPath).check(Schema.isMinLength(1), Schema.isMaxLength(50)),
+});
+export type FactoryClauseUnit = typeof FactoryClauseUnit.Type;
+
 const FactoryCriteriaClause = Schema.Struct({
   id: FactoryKey,
   /** The acceptance list item, quoted exactly from the body the brief named. */
@@ -68,6 +85,8 @@ const FactoryCriteriaClause = Schema.Struct({
       what: TrimmedNonEmptyString.check(Schema.isMaxLength(300)),
     }),
   ),
+  /** Prepared into the clause only where Root's adoption names no unit for it. */
+  unit: Schema.optional(FactoryClauseUnit),
 });
 
 const quotedLength = (clauses: ReadonlyArray<typeof FactoryCriteriaClause.Type>) =>
@@ -76,6 +95,18 @@ const quotedLength = (clauses: ReadonlyArray<typeof FactoryCriteriaClause.Type>)
       total +
       clause.source.excerpt.length +
       (clause.comments ?? []).reduce((sum, comment) => sum + comment.excerpt.length, 0),
+    0,
+  );
+
+const unitLength = (clauses: ReadonlyArray<typeof FactoryCriteriaClause.Type>) =>
+  clauses.reduce(
+    (total, { unit }) =>
+      unit === undefined
+        ? total
+        : total +
+          unit.title.length +
+          unit.contract.length +
+          unit.paths.reduce((sum, path) => sum + path.length, 0),
     0,
   );
 
@@ -92,6 +123,9 @@ export const FactoryCriteriaProposal = Schema.Struct({
     Schema.isMaxLength(200),
     Schema.makeFilter((clauses) => quotedLength(clauses) <= 65_536, {
       expected: "at most 65536 quoted characters in all",
+    }),
+    Schema.makeFilter((clauses) => unitLength(clauses) <= 65_536, {
+      expected: "at most 65536 unit characters in all",
     }),
   ),
 });
