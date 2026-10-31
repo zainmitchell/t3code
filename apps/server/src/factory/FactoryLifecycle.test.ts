@@ -23039,6 +23039,14 @@ const noEditRepairCases: ReadonlyArray<readonly [string, NoEditRepairCase]> = [
       refused: "is not a verified execution_binding_repair",
     },
   ],
+  [
+    "a correction declaring another action is not one, whatever record it quotes",
+    {
+      issue: 7958,
+      correction: `Action class: product_change\nChange the importer.\n\nThe failed run's record:\nfailure class: harness\n${noSourceChange}`,
+      refused: "is not a verified execution_binding_repair",
+    },
+  ],
 ];
 
 it.effect.each(noEditRepairCases)("NoEdit/N2: at a rework, %s", ([, repair]) =>

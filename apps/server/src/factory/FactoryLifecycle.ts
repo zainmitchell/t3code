@@ -160,13 +160,18 @@ const decisionMarker = (decisionId: string) => `<!-- t3-factory-decision:${decis
 
 /**
  * Whether a correction spec repairs only a no-edit unit's run: its first line past any marker
- * comment declares an execution_binding_repair, or every failure class it states is harness and
- * it states that no source changes.
+ * comment declares an execution_binding_repair, or it declares no other action, every failure
+ * class it states is harness and it states that no source changes.
  */
 const repairsRun = (summary: string) => {
   const lines = summary.split("\n").map((line) => line.trim());
   const first = lines.find((line) => line !== "" && !/^<!--.*-->$/.test(line));
   if (/^action class:\s*execution_binding_repair$/i.test(first ?? "")) return true;
+  // A spec's own first declared action decides, whatever earlier record it goes on to quote.
+  const declared = lines.find((line) => /^action class:/i.test(line));
+  if (declared !== undefined && !/^action class:\s*execution_binding_repair$/i.test(declared)) {
+    return false;
+  }
   const classes = lines.flatMap((line) => /^failure class:\s*(\S+)$/i.exec(line)?.[1] ?? []);
   return (
     classes.length > 0 &&
