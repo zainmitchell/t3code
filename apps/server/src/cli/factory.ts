@@ -244,12 +244,22 @@ export const runAudited = Effect.fn("factoryCli.runAudited")(function* <C, A, E,
         // The request already applied: a lost audit line must not read as the request failing.
         Effect.tap((result) =>
           audit({ actor: destination.actor, outcome: "succeeded", result }).pipe(
-            Effect.mapError(
-              (cause) =>
-                new FactoryCliError({
-                  operation: call.operation,
-                  reason: `applied, but its audit line was not written (${String(cause)}); read the factory's state for its result`,
-                }),
+            Effect.catch((cause) =>
+              Effect.flatMap(
+                // Exactly what success prints, bounded; nothing more than its audit line holds.
+                encodeAudit(result).pipe(Effect.orElseSucceed(() => undefined)),
+                (text) =>
+                  Effect.fail(
+                    new FactoryCliError({
+                      operation: call.operation,
+                      reason: `applied, but its audit line was not written (${String(cause)}); ${
+                        text === undefined
+                          ? "read the factory's state for its result"
+                          : `its result: ${text.length > 1_000 ? `${text.slice(0, 1_000)}…` : text}`
+                      }`,
+                    }),
+                  ),
+              ),
             ),
           ),
         ),

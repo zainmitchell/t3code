@@ -577,6 +577,9 @@ it.effect(
         unaudited.message,
         "factory state: applied, but its audit line was not written",
       );
+      // What it returned is still shown, as success would print it.
+      assert.isTrue(unaudited.message.endsWith('; its result: "applied"'));
+      assert.deepStrictEqual(auth.revoked, ["session:host-admin"]);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
