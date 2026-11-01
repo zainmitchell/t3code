@@ -18717,7 +18717,7 @@ it.effect(
           const first = serverRun("p", 0);
           yield* setupEndsWithoutExitCode(yield* FactoryWorkspace);
           const basisOf = (admission: FactoryLifecycle.FactoryAdmissionResult) =>
-            admission.reservation.origin === "admitted"
+            admission.type === "admitted" && admission.reservation.origin === "admitted"
               ? admission.reservation.stageBasis
               : undefined;
           const outOf = (basis: string | undefined) =>
