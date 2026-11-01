@@ -261,9 +261,10 @@ it.layer(NodeServices.layer)("factoryRebind", (it) => {
         for (const link of ["ancestor", "final", "volume"] as const) {
           const fixture = yield* setup({ link });
           if (link === "volume") {
-            // Node reports the mount point as a plain directory: lstat alone would not refuse it.
-            assert.isFalse(
+            // Windows uses a mount point; the POSIX fixture uses a directory symlink.
+            assert.strictEqual(
               NodeFS.lstatSync(NodePath.join(fixture.pinRoot, "alias")).isSymbolicLink(),
+              process.platform !== "win32",
             );
           }
           if (link !== "final") {

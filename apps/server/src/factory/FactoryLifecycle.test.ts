@@ -27056,8 +27056,11 @@ it.effect(
           const path = yield* Path.Path;
           const fixture = yield* rebindFixture(7984, root, { viaJunction: "volume" });
           const alias = path.join(fixture.pins, "alias");
-          // Node sees no link, and the alias resolves inside the root with matching bytes.
-          assert.isFalse(NodeFS.lstatSync(alias).isSymbolicLink());
+          // Windows uses a mount point; the POSIX fixture uses a directory symlink.
+          assert.strictEqual(
+            NodeFS.lstatSync(alias).isSymbolicLink(),
+            process.platform !== "win32",
+          );
           assert.strictEqual(
             yield* fs.readFileString(path.join(alias, "units.json")),
             fixture.predecessor,
