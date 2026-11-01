@@ -62,6 +62,25 @@ export const CLIENT_GUARDED_RPC_SCOPES = {
   [ORCHESTRATION_V2_WS_METHODS.stopWorkflow]: AuthOrchestrationOperateScope,
   // Force stop kills agent processes, as Stop on a terminal does.
   [ORCHESTRATION_V2_WS_METHODS.forceStopThread]: AuthOrchestrationOperateScope,
+  // Owner authority over a factory: answering its gates, entering, rejecting, revoking, recovering.
+  [WS_METHODS.factoryDecide]: AuthOrchestrationOperateScope,
+  [WS_METHODS.factoryEnter]: AuthOrchestrationOperateScope,
+  [WS_METHODS.factoryRejectOutcome]: AuthOrchestrationOperateScope,
+  [WS_METHODS.factoryRevokeGrant]: AuthOrchestrationOperateScope,
+  [WS_METHODS.factoryRecoverRun]: AuthOrchestrationOperateScope,
+  [WS_METHODS.factoryObserveClaims]: AuthOrchestrationOperateScope,
+  [WS_METHODS.factoryTransfer]: AuthOrchestrationOperateScope,
+  [WS_METHODS.factoryRollbackTransfer]: AuthOrchestrationOperateScope,
+  [WS_METHODS.factoryDisposeClaim]: AuthOrchestrationOperateScope,
+  // A configuration names a command the host runs as the factory's policy, like any settings write.
+  [WS_METHODS.factoryConfigure]: AuthSettingsWriteScope,
+  [WS_METHODS.factorySwitchProvider]: AuthSettingsWriteScope,
+  // It changes how many agents every project may run at once.
+  [WS_METHODS.factoryAgentCeiling]: AuthSettingsWriteScope,
+  // It releases custody nothing proves, on the owner's word alone.
+  [WS_METHODS.factoryDisposeNeverStarted]: AuthSettingsWriteScope,
+  // It records the owner's decision on a historical stage's unprovable writers, or its proof.
+  [WS_METHODS.factoryHistoricalTermination]: AuthSettingsWriteScope,
   // A guest link hands thread access to someone outside, like a pairing link.
   [WS_METHODS.guestShareCreate]: AuthAccessWriteScope,
   [WS_METHODS.peerLinksLink]: AuthAccessWriteScope,

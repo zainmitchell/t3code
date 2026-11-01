@@ -7,6 +7,12 @@
       "command": "node scripts/setup-worktree.ts",
       "icon": "configure",
       "runOnWorktreeCreate": true
+    },
+    {
+      "name": "Remove Build Output On Settle",
+      "command": "node scripts/settle-worktree.ts",
+      "icon": "configure",
+      "runOnSettle": true
     }
   ]
 }

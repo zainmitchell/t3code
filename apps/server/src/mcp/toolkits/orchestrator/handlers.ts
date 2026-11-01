@@ -115,6 +115,8 @@ const handlers = {
             bindToCurrentThread,
           });
         }),
+      // A changed prompt, schedule or enablement decides what its later runs start.
+      { startsExecutions: true },
     ),
   ),
   list_scheduled_tasks: McpToolAccess.reads((input) =>
@@ -176,6 +178,7 @@ const handlers = {
         const service = yield* OrchestratorMcpService.OrchestratorMcpService;
         return yield* service.sendToThread(scope, input);
       }),
+    { startsExecutions: true },
   ),
   t3_thread_wait: McpToolAccess.reads((input) =>
     Effect.gen(function* () {

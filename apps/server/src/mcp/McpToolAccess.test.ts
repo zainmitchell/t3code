@@ -21,7 +21,7 @@ import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.t
 import * as McpHttpServer from "./McpHttpServer.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpToolAccess from "./McpToolAccess.ts";
-import { liveThreadShell } from "./McpToolAccess.testkit.ts";
+import { factoryStoreLayer, liveThreadShell } from "./McpToolAccess.testkit.ts";
 
 const supervisedThreadId = ThreadId.make("thread:supervised");
 const planThreadId = ThreadId.make("thread:plan");
@@ -31,6 +31,7 @@ const backgroundThreadId = ThreadId.make("thread:background");
 const oldProviderThreadId = ThreadId.make("thread:old-provider-background");
 const archivedThreadId = ThreadId.make("thread:archived-background");
 const unknownOwnerThreadId = ThreadId.make("thread:unknown-background-owner");
+const factoryThreadId = ThreadId.make("thread:factory-worker");
 
 const backgroundShell = (threadId: ThreadId, providerInstanceId: ProviderInstanceId) => ({
   ...liveThreadShell(threadId, { activeRunId: null }),
@@ -46,6 +47,7 @@ const shells = new Map([
     liveThreadShell(planThreadId, { runtimeMode: "approval-required", interactionMode: "plan" }),
   ],
   [fullAccessThreadId, liveThreadShell(fullAccessThreadId)],
+  [factoryThreadId, liveThreadShell(factoryThreadId)],
   [endedThreadId, liveThreadShell(endedThreadId, { activeRunId: null })],
   [backgroundThreadId, backgroundShell(backgroundThreadId, ProviderInstanceId.make("codex"))],
   [oldProviderThreadId, backgroundShell(oldProviderThreadId, ProviderInstanceId.make("claude"))],
@@ -218,6 +220,7 @@ const call = (
   );
 
 const supervised = threadCaller(supervisedThreadId);
+const factory = threadCaller(factoryThreadId);
 const plan = threadCaller(planThreadId);
 const fullAccess = threadCaller(fullAccessThreadId);
 const ended = threadCaller(endedThreadId);
@@ -375,13 +378,15 @@ const LinkedProbeToolkit = Toolkit.make(
   Tool.make("writes_with_capability", linkedProbe),
   Tool.make("writes_threads", linkedProbe),
   Tool.make("starts_threads", linkedProbe),
+  Tool.make("starts_in_threads", linkedProbe),
+  Tool.make("schedules", linkedProbe),
   Tool.make("writes_environment", linkedProbe),
 );
 /** Runs here, and tells whether `environmentId` reached the handler. */
 const ranHere = <P extends object>(params: P) =>
   Effect.succeed({ ran: "environmentId" in params ? "saw environmentId" : "here" });
 
-const linkedProbeServer = McpHttpServer.toolkitRegistration(
+const layerLinkedProbe = McpHttpServer.toolkitRegistration(
   LinkedProbeToolkit,
   McpToolAccess.toLayer(LinkedProbeToolkit, {
     reads: McpToolAccess.reads(ranHere),
@@ -389,9 +394,19 @@ const linkedProbeServer = McpHttpServer.toolkitRegistration(
     writes_with_capability: McpToolAccess.writesWithCapability(ranHere),
     writes_threads: McpToolAccess.writesThreads((input) => [input.threadId], ranHere),
     starts_threads: McpToolAccess.startsThreads((input) => input, ranHere, "stamped"),
+    starts_in_threads: McpToolAccess.writesThreads((input) => [input.threadId], ranHere, {
+      startsExecutions: true,
+    }),
+    schedules: McpToolAccess.either(
+      (input) => input.threadId === undefined,
+      McpToolAccess.startsThreads(() => ({}), ranHere, { refused: "schedule here" }),
+      McpToolAccess.writes(ranHere, { startsExecutions: true }),
+    ),
     writes_environment: McpToolAccess.writesEnvironment(ranHere),
   }),
-).pipe(
+);
+const linkedProbeServer = layerLinkedProbe.pipe(
+  Layer.provide(factoryStoreLayer(new Set([factoryThreadId]))),
   Layer.provideMerge(McpServer.McpServer.layer),
   Layer.provideMerge(
     Layer.mock(ThreadManagement.ThreadManagementService)({
@@ -433,6 +448,20 @@ it.effect.each([
   ],
   ["writes_environment", fullAccess, { environmentId: here }, "here"],
 
+  // Factory work here may not start or queue runs there; it still reads, stops and edits there.
+  ["starts_threads", factory, { environmentId: box }, "capability_denied"],
+  ["starts_in_threads", factory, { environmentId: box }, "capability_denied"],
+  ["schedules", factory, { environmentId: box }, "capability_denied"],
+  ["schedules", factory, { environmentId: box, threadId: supervisedThreadId }, "capability_denied"],
+  ["starts_threads", factory, { environmentId: here }, "here"],
+  ["starts_in_threads", factory, {}, "here"],
+  ["reads", factory, { environmentId: box }, "reads in environment-box"],
+  ["writes_threads", factory, { environmentId: box }, "writes_threads in environment-box"],
+  ["writes", factory, { environmentId: box }, "writes in environment-box"],
+  ["starts_in_threads", supervised, { environmentId: box }, "starts_in_threads in environment-box"],
+  ["schedules", supervised, { environmentId: box }, "schedules in environment-box"],
+  ["starts_threads", supervisedClient, { environmentId: box }, "starts_threads in environment-box"],
+
   // A thread id names a thread where the call runs, and is checked there.
   [
     "writes_threads",
@@ -450,6 +479,33 @@ it.effect.each([
   call(tool, scope, args).pipe(
     Effect.map((outcome) => expect(outcome).toBe(expected)),
     Effect.provide(linkedProbeServer),
+  ),
+);
+
+it.effect.each([
+  ["starts_threads", supervised, "orchestration_error"],
+  ["starts_in_threads", supervised, "orchestration_error"],
+  ["writes_threads", supervised, "writes_threads in environment-box"],
+  ["starts_threads", supervisedClient, "starts_threads in environment-box"],
+] as const)("without the factory store a linked %s from %o: %s", ([tool, scope, expected]) =>
+  call(tool, scope, { environmentId: box }).pipe(
+    Effect.map((outcome) => expect(outcome).toBe(expected)),
+    Effect.provide(
+      layerLinkedProbe.pipe(
+        Layer.provideMerge(McpServer.McpServer.layer),
+        Layer.provideMerge(
+          Layer.mock(ThreadManagement.ThreadManagementService)({
+            getThreadShell: (threadId) => Effect.succeed(shells.get(threadId) ?? null),
+          }),
+        ),
+        Layer.provide(
+          Layer.mock(PeerForwarding.PeerForwarding)({
+            call: (_scope, tool, environmentId) =>
+              Effect.succeed({ ran: `${tool.name} in ${environmentId}` } as never),
+          }),
+        ),
+      ),
+    ),
   ),
 );
 

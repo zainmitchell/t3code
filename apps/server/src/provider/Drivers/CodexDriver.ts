@@ -366,6 +366,9 @@ export const CodexDriver: ProviderDriver<
       accentColor,
       enabled,
       snapshot,
+      // Nothing to drop: each probe reads the account from a new app-server, and a failed one
+      // reports none rather than the last one read.
+      invalidateCaches: Effect.void,
       snapshotForCwd,
       consumeResetCredit,
       orchestrationAdapter,

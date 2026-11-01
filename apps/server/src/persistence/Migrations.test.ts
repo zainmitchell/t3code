@@ -3,11 +3,25 @@ import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Migrator from "effect/sql/Migrator";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import { migrationManifest, runMigrations } from "./Migrations.ts";
+import ShellStopRequestIndex from "./Migrations/068_ShellStopRequestIndex.ts";
+import ThreadMessageSearch from "./Migrations/069_ThreadMessageSearch.ts";
+import PeerLinks from "./Migrations/070_PeerLinks.ts";
+import FactoryLifecycle from "./Migrations/070_FactoryLifecycle.ts";
+import FactoryExecutionGenerations from "./Migrations/071_FactoryExecutionGenerations.ts";
+import PeerLinkFence from "./Migrations/071_PeerLinkFence.ts";
+import FactoryOutcomes from "./Migrations/072_FactoryOutcomes.ts";
+import WaitingLinkRequestIndex from "./Migrations/072_WaitingLinkRequestIndex.ts";
+import FactoryTransfers from "./Migrations/073_FactoryTransfers.ts";
+import ActiveTurnItemIndexes from "./Migrations/073_ActiveTurnItemIndexes.ts";
+import ExcludeAttachmentPlaceholdersFromSearch from "./Migrations/074_ExcludeAttachmentPlaceholdersFromSearch.ts";
+import SubagentDeliveryState from "./Migrations/075_SubagentDeliveryState.ts";
+import ProjectionProjectsPinArchive from "./Migrations/076_ProjectionProjectsPinArchive.ts";
 
 const v2Migrations = migrationManifest.filter(([id]) => id >= 55);
 const newerMigrationId = Math.max(...migrationManifest.map(([id]) => id)) + 1;
@@ -26,6 +40,53 @@ const v2TableCount = Effect.gen(function* () {
     SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'orchestration_v2_%'
   `;
   return rows.length;
+});
+
+const schema = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  return yield* sql<{
+    readonly type: string;
+    readonly name: string;
+    readonly tbl_name: string;
+    readonly sql: string | null;
+  }>`SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name`;
+});
+
+const isFactoryObject = ({ tbl_name }: { readonly tbl_name: string }) =>
+  tbl_name.startsWith("factory_") || tbl_name === "command_job_fences";
+
+const inSeparateDatabase = <A, E>(effect: Effect.Effect<A, E, SqlClient.SqlClient>) =>
+  effect.pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" })));
+
+const migrateAfter67 = (
+  migrations: Record<string, Effect.Effect<void, unknown, SqlClient.SqlClient>>,
+) =>
+  Effect.gen(function* () {
+    yield* runMigrations({ toMigrationInclusive: 67 });
+    yield* Migrator.make({})({ loader: Migrator.fromRecord(migrations) });
+  });
+
+// The history patched factory builds wrote, which their databases keep.
+const migrateLikePatchedBuild = migrateAfter67({
+  "68_PeerLinks": PeerLinks,
+  "69_ShellStopRequestIndex": ShellStopRequestIndex,
+  "70_FactoryLifecycle": FactoryLifecycle,
+  "71_FactoryExecutionGenerations": FactoryExecutionGenerations,
+  "72_FactoryOutcomes": FactoryOutcomes,
+  "73_FactoryTransfers": FactoryTransfers,
+  "74_ThreadMessageSearch": ThreadMessageSearch,
+});
+
+const migrateLikeUpstream = migrateAfter67({
+  "68_ShellStopRequestIndex": ShellStopRequestIndex,
+  "69_ThreadMessageSearch": ThreadMessageSearch,
+  "70_PeerLinks": PeerLinks,
+  "71_PeerLinkFence": PeerLinkFence,
+  "72_WaitingLinkRequestIndex": WaitingLinkRequestIndex,
+  "73_ActiveTurnItemIndexes": ActiveTurnItemIndexes,
+  "74_ExcludeAttachmentPlaceholdersFromSearch": ExcludeAttachmentPlaceholdersFromSearch,
+  "75_SubagentDeliveryState": SubagentDeliveryState,
+  "76_ProjectionProjectsPinArchive": ProjectionProjectsPinArchive,
 });
 
 describe("runMigrations", () => {
@@ -125,9 +186,142 @@ describe("runMigrations", () => {
       assert.deepStrictEqual(yield* runMigrations(), []);
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
   );
+
+  it.effect("upgrades a patched factory database by running only the later migrations", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* migrateLikePatchedBuild;
+      yield* sql`
+        INSERT INTO factory_configurations
+        VALUES ('factory', 1, 'project', '{"policyDigest":"sha256:policy"}', '2026-10-29T00:00:00Z')
+      `;
+      yield* sql`INSERT INTO factory_grants VALUES ('grant', 'factory', 'issue-1', 'open', 1, '{}')`;
+      yield* sql`
+        INSERT INTO factory_reserved_decisions VALUES ('decision', 'factory', 'issue-1', 'open', '{}')
+      `;
+      yield* sql`
+        INSERT INTO factory_item_events (factory_id, item_key, record_json)
+        VALUES ('factory', 'issue-1', '{"kind":"admitted"}')
+      `;
+      yield* sql`
+        INSERT INTO peer_environment_links
+          (environment_id, secret_name, label, urls_json, access, linked_at, expires_at)
+        VALUES ('peer', 'peer-secret', 'Peer', '[]', 'standard', '2026-10-29', '2026-11-29')
+      `;
+      const factoryRows = Effect.all([
+        sql`SELECT * FROM factory_configurations`,
+        sql`SELECT * FROM factory_grants`,
+        sql`SELECT * FROM factory_reserved_decisions`,
+        sql`SELECT * FROM factory_item_events`,
+      ]);
+      const rowsBefore = yield* factoryRows;
+      const factorySchemaBefore = (yield* schema).filter(isFactoryObject);
+
+      assert.deepStrictEqual(yield* runMigrations(), [
+        [75, "PeerLinkFence"],
+        [76, "WaitingLinkRequestIndex"],
+        [77, "FactoryPreparedCriteria"],
+        [78, "FactoryAgentCeiling"],
+        [79, "ActiveTurnItemIndexes"],
+        [80, "ExcludeAttachmentPlaceholdersFromSearch"],
+        [81, "SubagentDeliveryState"],
+        [82, "ProjectionProjectsPinArchive"],
+      ]);
+      assert.deepStrictEqual(yield* history, migrationManifest);
+      assert.deepStrictEqual(yield* factoryRows, rowsBefore);
+      assert.deepStrictEqual(
+        (yield* schema).filter(
+          (row) =>
+            isFactoryObject(row) &&
+            row.tbl_name !== "factory_prepared_criteria" &&
+            row.tbl_name !== "factory_environment",
+        ),
+        factorySchemaBefore,
+      );
+      assert.deepStrictEqual(yield* sql`SELECT * FROM factory_prepared_criteria`, []);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM factory_environment`, []);
+      assert.deepStrictEqual(
+        yield* sql`SELECT environment_id, fenced FROM peer_environment_links`,
+        [{ environment_id: "peer", fenced: 0 }],
+      );
+      // Patched builds check and run ids up to 74, so they still start on the upgraded database.
+      assert.deepStrictEqual(yield* runMigrations({ toMigrationInclusive: 74 }), []);
+      assert.deepStrictEqual(yield* runMigrations(), []);
+      assert.deepStrictEqual(yield* history, migrationManifest);
+      assert.deepStrictEqual(yield* factoryRows, rowsBefore);
+    }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+  );
+
+  it.effect(
+    "upgrades a deployed 78-migration factory database with only the v0.1.6 migrations",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* migrateLikePatchedBuild;
+        yield* runMigrations({ toMigrationInclusive: 78 });
+        yield* sql`
+        INSERT INTO factory_configurations
+        VALUES ('factory', 1, 'project', '{"policyDigest":"sha256:policy"}', '2026-10-29T00:00:00Z')
+      `;
+        yield* sql`
+        INSERT INTO factory_item_events (factory_id, item_key, record_json)
+        VALUES ('factory', 'issue-1', '{"kind":"admitted"}')
+      `;
+        const factoryRows = Effect.all([
+          sql`SELECT * FROM factory_configurations`,
+          sql`SELECT * FROM factory_item_events`,
+        ]);
+        const rowsBefore = yield* factoryRows;
+        const factorySchemaBefore = (yield* schema).filter(isFactoryObject);
+
+        assert.deepStrictEqual(yield* runMigrations(), [
+          [79, "ActiveTurnItemIndexes"],
+          [80, "ExcludeAttachmentPlaceholdersFromSearch"],
+          [81, "SubagentDeliveryState"],
+          [82, "ProjectionProjectsPinArchive"],
+        ]);
+        assert.deepStrictEqual(yield* history, migrationManifest);
+        assert.deepStrictEqual(yield* factoryRows, rowsBefore);
+        assert.deepStrictEqual((yield* schema).filter(isFactoryObject), factorySchemaBefore);
+        // The 0.1.5 factory runtime this replaces still starts on the upgraded history.
+        assert.deepStrictEqual(yield* runMigrations({ toMigrationInclusive: 78 }), []);
+      }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+  );
+
+  it.effect("refuses a database written by upstream v0.1.6 without changing it", () =>
+    Effect.gen(function* () {
+      yield* migrateLikeUpstream;
+      const before = yield* history;
+
+      const exit = yield* Effect.exit(runMigrations());
+
+      assert.isTrue(Exit.isFailure(exit));
+      assert.include(String(exit), "68_PeerLinks (recorded: ShellStopRequestIndex)");
+      assert.include(String(exit), "73_FactoryTransfers (recorded: ActiveTurnItemIndexes)");
+      assert.deepStrictEqual(yield* history, before);
+    }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+  );
+
+  it.effect("gives fresh, upgraded patched and upstream databases the same schema", () =>
+    Effect.gen(function* () {
+      const fresh = yield* runMigrations().pipe(Effect.andThen(schema), inSeparateDatabase);
+      const patched = yield* migrateLikePatchedBuild.pipe(
+        Effect.andThen(runMigrations()),
+        Effect.andThen(schema),
+        inSeparateDatabase,
+      );
+      const upstream = yield* migrateLikeUpstream.pipe(Effect.andThen(schema), inSeparateDatabase);
+
+      assert.deepStrictEqual(patched, fresh);
+      assert.deepStrictEqual(
+        upstream,
+        fresh.filter((row) => !isFactoryObject(row)),
+      );
+    }),
+  );
 });
 
-// The npm launcher reads the highest migration id from these file names.
+// Historical patched ledger ids 68-76 keep upstream file prefixes, so only names are compared.
 it.effect("registers every migration file", () =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -135,11 +329,8 @@ it.effect("registers every migration file", () =>
     const dir = path.join(import.meta.dirname, "Migrations");
     const files = (yield* fs.readDirectory(dir)).flatMap((name) => {
       const match = /^(\d+)_(\w+)\.ts$/.exec(name);
-      return match ? [[Number(match[1]), match[2]] as const] : [];
+      return match ? [match[2]] : [];
     });
-    assert.deepStrictEqual(
-      files.toSorted(([a], [b]) => a - b),
-      migrationManifest,
-    );
+    assert.deepStrictEqual(files.toSorted(), migrationManifest.map(([, name]) => name).toSorted());
   }).pipe(Effect.provide(NodeServices.layer)),
 );

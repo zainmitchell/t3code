@@ -633,6 +633,27 @@ export interface ProjectionStoreV2Shape {
   readonly getRecoveryThreadIds: (
     kind: ProjectionRecoveryKind,
   ) => Effect.Effect<ReadonlyArray<ThreadId>, ProjectionStoreV2Error>;
+  /**
+   * The thread's cancelled runs that never left `queued`, proved by their own retained history:
+   * created queued, moved only to cancelled. Such a run was never dequeued, so no launch, provider
+   * turn or process was ever its own. A run whose history is incomplete is never named.
+   */
+  readonly getNeverDequeuedRunIds: (
+    threadId: ThreadId,
+  ) => Effect.Effect<ReadonlySet<RunId>, ProjectionStoreV2Error>;
+  /**
+   * Every thread descended from `threadIds`, at any depth, by lineage or by a subagent's child,
+   * archived and deleted included. `unreadableThreads` counts thread rows whose lineage does not
+   * have the schema's shape: any one of them could be a descendant, so the set is not whole.
+   * Optional so partial test stores need not list it; a store without it reads as unknown lineage.
+   */
+  readonly getLineageDescendants?: (threadIds: ReadonlyArray<ThreadId>) => Effect.Effect<
+    {
+      readonly threadIds: ReadonlyArray<ThreadId>;
+      readonly unreadableThreads: number;
+    },
+    ProjectionStoreV2Error
+  >;
   readonly getUnreadableThreadIds: () => Effect.Effect<
     ReadonlyArray<ThreadId>,
     ProjectionStoreV2Error
@@ -3946,6 +3967,83 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })),
     );
 
+    const getNeverDequeuedRunIds = Effect.fn("ProjectionStore.getNeverDequeuedRunIds")(
+      function* (threadId: ThreadId) {
+        // Run events are never compacted, so the history is whole or absent; absent proves nothing.
+        const rows = yield* sql<{ readonly run_id: string }>`
+          SELECT run.run_id FROM orchestration_v2_projection_runs AS run
+          WHERE run.thread_id = ${threadId}
+            AND run.status = 'cancelled'
+            AND EXISTS (
+              SELECT 1 FROM orchestration_events AS created
+              WHERE created.aggregate_kind = 'thread' AND created.stream_id = ${threadId}
+                AND created.event_type = 'run.created'
+                AND json_extract(created.payload_json, '$.id') = run.run_id
+                AND json_extract(created.payload_json, '$.status') = 'queued'
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM orchestration_events AS moved
+              WHERE moved.aggregate_kind = 'thread' AND moved.stream_id = ${threadId}
+                AND moved.event_type IN ('run.created', 'run.updated')
+                AND json_extract(moved.payload_json, '$.id') = run.run_id
+                AND json_extract(moved.payload_json, '$.status') NOT IN ('queued', 'cancelled')
+            )
+        `;
+        return new Set(rows.map((row) => RunId.make(row.run_id)));
+      },
+      Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })),
+    );
+
+    const getLineageDescendants = Effect.fn("ProjectionStore.getLineageDescendants")(
+      function* (threadIds: ReadonlyArray<ThreadId>) {
+        if (threadIds.length === 0) return { threadIds: [], unreadableThreads: 0 };
+        // The schema's lineage: rootThreadId text, parentThreadId null or text, relationship null,
+        // fork or subagent. Explicit root lineage is known; anything else, a missing key's NULL
+        // included, is unknown membership.
+        const usableLineage = sql`CASE WHEN json_valid(payload_json) THEN COALESCE(
+          json_type(payload_json, '$.lineage') = 'object'
+          AND json_type(payload_json, '$.lineage.rootThreadId') = 'text'
+          AND length(trim(json_extract(payload_json, '$.lineage.rootThreadId'))) > 0
+          AND json_type(payload_json, '$.lineage.parentThreadId') IN ('null', 'text')
+          AND (json_type(payload_json, '$.lineage.relationshipToParent') = 'null'
+            OR json_extract(payload_json, '$.lineage.relationshipToParent') IN ('fork', 'subagent')),
+          0
+        ) ELSE 0 END`;
+        const rows = yield* sql<{ readonly thread_id: string }>`
+          WITH RECURSIVE descendants(thread_id) AS (
+            SELECT t.thread_id FROM orchestration_v2_projection_threads AS t
+            WHERE json_valid(t.payload_json)
+              AND (json_extract(t.payload_json, '$.lineage.parentThreadId') IN ${sql.in(threadIds)}
+                OR json_extract(t.payload_json, '$.lineage.rootThreadId') IN ${sql.in(threadIds)})
+            UNION
+            SELECT child_thread_id FROM orchestration_v2_projection_subagents
+            WHERE thread_id IN ${sql.in(threadIds)} AND child_thread_id IS NOT NULL
+            UNION
+            SELECT t.thread_id FROM orchestration_v2_projection_threads AS t
+            JOIN descendants AS d
+              ON json_valid(t.payload_json)
+              AND json_extract(t.payload_json, '$.lineage.parentThreadId') = d.thread_id
+            UNION
+            SELECT s.child_thread_id FROM orchestration_v2_projection_subagents AS s
+            JOIN descendants AS d ON s.thread_id = d.thread_id
+            WHERE s.child_thread_id IS NOT NULL
+          )
+          SELECT thread_id FROM descendants
+          WHERE thread_id NOT IN ${sql.in(threadIds)}
+          ORDER BY thread_id
+        `;
+        const unreadable = yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM orchestration_v2_projection_threads
+          WHERE NOT (${usableLineage})
+        `;
+        return {
+          threadIds: rows.map((row) => ThreadId.make(row.thread_id)),
+          unreadableThreads: unreadable[0]?.count ?? 0,
+        };
+      },
+      Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })),
+    );
+
     const getRecoveryThreadIds = Effect.fn("ProjectionStore.getRecoveryThreadIds")(
       function* (kind: ProjectionRecoveryKind) {
         const candidates = (() => {
@@ -7041,6 +7139,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getLimitRecoveryCandidates: readOnReader(getLimitRecoveryCandidates),
       getLimitRecoveryWakeAt: readOnReader(getLimitRecoveryWakeAt),
       getRecoveryThreadIds: readOnReader(getRecoveryThreadIds),
+      getNeverDequeuedRunIds: readOnReader(getNeverDequeuedRunIds),
+      getLineageDescendants: readOnReader(getLineageDescendants),
       getUnreadableThreadIds: readOnReader(getUnreadableThreadIds),
       getThreadSnapshot: readOnReader(getThreadSnapshot),
       getThreadSnapshotWindow: readOnReader(getThreadSnapshotWindow),

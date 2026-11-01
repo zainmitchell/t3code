@@ -1,0 +1,893 @@
+// @effect-diagnostics nodeBuiltinImport:off - clause digests are sha256.
+import * as NodeCrypto from "node:crypto";
+
+import { assert, describe, it } from "@effect/vitest";
+import { FactoryId, FactoryItemKey, type FactoryCriteriaProposal } from "@t3tools/contracts";
+import * as Option from "effect/Option";
+
+import {
+  criterionToken,
+  criteriaProposalProblems,
+  decodeCriteria,
+  decodeVerificationDocument,
+  defectChild,
+  type ItemRecord,
+  landingOf,
+  namesPolicy,
+  outputRootName,
+  parentAcceptance,
+  preparedCriteriaProblems,
+  reconcileCriteria,
+} from "./factoryCoordination.ts";
+import type * as FactoryOutcomeStore from "./FactoryOutcomeStore.ts";
+
+const repository = "example-org/beta";
+const head = "4ead000000000000000000000000000000000145";
+const merge = "3e70000000000000000000000000000000000145";
+const tree = "7ee0000000000000000000000000000000000145";
+const base = "ba5e000000000000000000000000000000000145";
+
+const outcome = (
+  outcomeId: string,
+  itemKey: string,
+  stage: FactoryOutcomeStore.FactoryOutcome["stage"],
+  report: FactoryOutcomeStore.FactoryOutcome["report"],
+): FactoryOutcomeStore.FactoryOutcome => ({
+  outcomeId,
+  factoryId: FactoryId.make("beta"),
+  itemKey: FactoryItemKey.make(itemKey),
+  origin: { type: "native" },
+  stage,
+  report,
+  reportDigest: outcomeId,
+  reportedAt: "2026-10-30T00:00:00.000Z",
+  state: "verified",
+  receipt: { verifiedAt: "2026-10-30T00:00:00.000Z" },
+});
+
+/** A child built, independently reviewed and landed by a receipt T3 matched (`proved`). */
+const landedRecord = (issue: number, proved = true): ItemRecord => {
+  const itemKey = `github:${repository}#${issue}`;
+  return {
+    itemKey,
+    outcomes: [
+      outcome(`${issue}-implement`, itemKey, "implement", {
+        outcome: "implemented",
+        subject: { repository, baseCommit: base, headCommit: head },
+        summary: "Built.",
+      }),
+      outcome(`${issue}-review`, itemKey, "review", {
+        outcome: "review_passed",
+        subject: { repository, headCommit: head },
+        summary: "Reviewed.",
+      }),
+      {
+        ...outcome(`${issue}-integrate`, itemKey, "integrate", {
+          outcome: "integrated",
+          summary: "Landed.",
+          integration: {
+            targetBranch: "main",
+            mergeCommit: merge,
+            parents: [base, head],
+            tree,
+            attribution: "operation",
+          },
+        }),
+        ...(proved
+          ? { landingOrigin: { type: "native" as const, operationId: `integrate:${issue}` } }
+          : {}),
+      },
+    ],
+  };
+};
+
+describe("landingOf", () => {
+  it("proves a landing only from a receipt-proved integration of the reviewed head", () => {
+    const found = landingOf(landedRecord(145));
+    assert.deepStrictEqual("landing" in found ? found.landing : found, {
+      itemKey: `github:${repository}#145`,
+      operationId: "integrate:145",
+      commit: merge,
+      tree,
+      parents: [base, head],
+      branch: "main",
+      reviewedHead: head,
+      reviewOutcomeId: "145-review",
+      integratedOutcomeId: "145-integrate",
+    });
+  });
+
+  it.each<[string, ItemRecord, string]>([
+    ["a report with no matched receipt", landedRecord(146, false), "no applied receipt"],
+    [
+      "accepted but unlanded",
+      { ...landedRecord(147), outcomes: landedRecord(147).outcomes.slice(0, 2) },
+      "accepted",
+    ],
+    [
+      "a rejected review",
+      { ...landedRecord(148), events: [{ type: "rejected", outcomeId: "148-review" }] },
+      "no verified independent review_passed",
+    ],
+    [
+      "a reopened closure after landing",
+      {
+        ...landedRecord(149),
+        outcomes: [
+          ...landedRecord(149).outcomes,
+          outcome("149-close", `github:${repository}#149`, "close", {
+            outcome: "closed",
+            summary: "Closed.",
+          }),
+        ],
+        events: [{ type: "reopened", closureOutcomeId: "149-close" }],
+      },
+      "reopened",
+    ],
+  ])("refuses %s", (_name, record, why) => {
+    const found = landingOf(record);
+    assert.include("why" in found ? found.why : "", why);
+  });
+});
+
+describe("shared identities with the policy", () => {
+  // Synthetic vectors use canonical JSON and SHA-256.
+  it("derives the defect child by the policy's basis token", () => {
+    const itemKey = `github:${repository}#139`;
+    const failed = outcome("139-verify", itemKey, "rework", {
+      outcome: "failed",
+      failure: "settlement check failed",
+      summary: "Failed.",
+    });
+    const ticket = (outcomeId: string, token: string, number: number) =>
+      outcome(outcomeId, itemKey, "rework", {
+        outcome: "ticket_opened",
+        summary: `Opened ${repository}#${number} (Correct #139 product defect ${token}).`,
+        ticket: { repository, number },
+      });
+    const outcomes = [
+      ticket("before", "[defect 86cce90ea802]", 140),
+      failed,
+      ticket("other", "[defect 000000000000]", 141),
+      ticket("first", "[defect 86cce90ea802]", 145),
+      ticket("second", "[defect 86cce90ea802]", 146),
+    ];
+    assert.strictEqual(defectChild(itemKey, outcomes, failed), 145);
+    assert.strictEqual(criterionToken(98, "C2"), "[criterion C2 b3ca1bc0feca]");
+  });
+});
+
+describe("binding naming", () => {
+  it("names the installed policy whole or without its configuration pin", () => {
+    assert.isTrue(
+      namesPolicy("beta-policy:0123456789abcdef", "beta-policy:0123456789abcdef:fedcba9876543210"),
+    );
+    assert.isTrue(namesPolicy("connector-r3", "connector-r3"));
+    assert.isFalse(
+      namesPolicy("beta-policy:0123456789abcdef", "beta-policy:0123456789abcdee:fedcba9876543210"),
+    );
+    assert.isFalse(namesPolicy("beta-policy", "beta-policy:x"));
+  });
+
+  it("gives each failure, landing and template its own output root", () => {
+    const at = {
+      issue: 139,
+      itemKey: `github:${repository}#139`,
+      failedOutcomeId: "139-verify",
+      commit: merge,
+      templateSha256: "a".repeat(64),
+    };
+    const roots = new Set(
+      [
+        at,
+        { ...at, failedOutcomeId: "139-verify-2" },
+        { ...at, commit: head },
+        { ...at, templateSha256: "b".repeat(64) },
+      ].map(outputRootName),
+    );
+    assert.strictEqual(roots.size, 4);
+    assert.match(outputRootName(at), /^139-[0-9a-f]{16}$/);
+  });
+
+  it("reads a template or a whole binding, and nothing else", () => {
+    const template = {
+      schema: "factory-verification-template/1",
+      issue: 139,
+      worker: { execution: "verifier" },
+      auth: { identity: "verifier@example.invalid" },
+      inputs: [{ path: "inputs/a.json", sha256: "a".repeat(64) }],
+      consumer: { contract: "settlement-proof", version: "1" },
+      policyIdentity: "beta-policy:0123456789abcdef",
+      ownership: { owned: [] },
+    };
+    assert.isTrue(Option.isSome(decodeVerificationDocument(JSON.stringify(template))));
+    for (const value of [
+      { ...template, schema: "factory-verification-template/2" },
+      { ...template, worker: {} },
+      { schema: "factory-verification-binding/1", issue: 139 },
+    ]) {
+      assert.isTrue(Option.isNone(decodeVerificationDocument(JSON.stringify(value))));
+    }
+  });
+});
+
+describe("reconcileCriteria", () => {
+  const parentKey = `github:${repository}#98`;
+  const criteria = (clauses: ReadonlyArray<unknown>) =>
+    Option.getOrThrow(
+      decodeCriteria(
+        JSON.stringify({
+          schema: "factory-parent-criteria/1",
+          issue: 98,
+          version: "v1",
+          bodySha256: "b".repeat(64),
+          clauses,
+        }),
+      ),
+    );
+  const source = { kind: "issue-body", ref: "## Acceptance" };
+  const records = new Map<string, ItemRecord>([
+    [`github:${repository}#145`, landedRecord(145)],
+    [
+      `github:${repository}#146`,
+      { ...landedRecord(146), outcomes: landedRecord(146).outcomes.slice(0, 2) },
+    ],
+    [`github:${repository}#150`, landedRecord(150)],
+  ]);
+  // T3 opened the clause C5 child itself; the criteria never name it.
+  const parentOutcomes = [
+    outcome("98-ticket", parentKey, "implement", {
+      outcome: "ticket_opened",
+      summary: `Opened ${repository}#150 (#98 ${criterionToken(98, "C5")} Add the export).`,
+      ticket: { repository, number: 150 },
+    }),
+  ];
+
+  it("judges every clause from landed records, never from membership or counts", () => {
+    const clauses = reconcileCriteria({
+      criteria: criteria([
+        {
+          id: "C1",
+          required: true,
+          source,
+          evidence: [{ itemKey: `github:${repository}#145`, scope: "settlement" }],
+        },
+        {
+          id: "C2",
+          required: true,
+          source,
+          evidence: [{ itemKey: `github:${repository}#146`, scope: "export" }],
+        },
+        { id: "C3", required: true, source, state: "reserved" },
+        { id: "C4", required: true, source, state: "revised" },
+        { id: "C5", required: true, source },
+        {
+          id: "C6",
+          required: true,
+          source,
+          evidence: [{ itemKey: `github:${repository}#777`, scope: "x" }],
+        },
+        { id: "C7", required: false, source },
+      ]),
+      repository,
+      parentOutcomes,
+      records,
+    });
+    assert.deepStrictEqual(
+      clauses.map((clause) => [clause.id, clause.status, clause.landed.map((each) => each.scope)]),
+      [
+        ["C1", "satisfied", ["settlement"]],
+        ["C2", "missing", []],
+        ["C3", "reserved", []],
+        ["C4", "revised", []],
+        ["C5", "satisfied", ["criterion C5 child"]],
+        ["C6", "unknown_source", []],
+        ["C7", "missing", []],
+      ],
+    );
+    assert.include(clauses[1]!.why ?? "", "accepted");
+    assert.strictEqual(clauses[0]!.landed[0]!.commit, merge);
+  });
+});
+
+describe("acceptance with historical details", () => {
+  it("retains current items after nested historical details", () => {
+    const body =
+      "## Acceptance\n- A: ship safely\n\n<details><summary>Historical note</summary>\n<details>old</details>\n</details>\n\n- B: preserve required payment hold\n";
+    assert.deepStrictEqual(
+      parentAcceptance(body).items.map((item) => item.excerpt),
+      ["A: ship safely", "B: preserve required payment hold"],
+    );
+  });
+  it.each([
+    [
+      "lookalike",
+      "## Acceptance\n- A: ship safely\n<details-history>\n- B: preserve required payment hold\n</details>\n",
+    ],
+    [
+      "mixed malformed closer",
+      "## Acceptance\n- A: ship safely\n<details>\n- old\n</details broken> </details>\n- B: preserve required payment hold\n",
+    ],
+    [
+      "unclosed",
+      "## Acceptance\n- A: ship safely\n<details>\n- B: preserve required payment hold\n",
+    ],
+    [
+      "inline current text",
+      "## Acceptance\n- A: ship safely\n<details>old</details> - B: preserve required payment hold\n",
+    ],
+  ])("refuses a full-body-hash truncated proposal across %s", (_name, body) => {
+    const hash = (text: string) => NodeCrypto.createHash("sha256").update(text).digest("hex");
+    const accepted = parentAcceptance(body);
+    assert.isAbove(accepted.unlisted.length, 0);
+    const source = {
+      start: 16,
+      end: 30,
+      excerpt: "A: ship safely",
+      sha256: hash("A: ship safely"),
+    };
+    const proposal = {
+      schema: "factory-parent-criteria-proposal/1" as const,
+      issue: 1,
+      basis: { itemVersion: "v1", bodySha256: hash(body) },
+      clauses: [{ id: "A", source }],
+    };
+    const document = {
+      schema: "factory-parent-criteria/1",
+      issue: 1,
+      version: "1",
+      bodySha256: hash(body),
+      clauses: [
+        {
+          id: "A",
+          required: true,
+          state: "open",
+          source: {
+            kind: "issue_acceptance",
+            ref: `https://github.com/${repository}/issues/1#acceptance`,
+            ...source,
+          },
+          evidence: [],
+        },
+      ],
+    };
+    assert.include(
+      criteriaProposalProblems({ proposal, issue: 1, body }).join(),
+      "text outside its list items",
+    );
+    assert.include(
+      preparedCriteriaProblems({
+        proposal,
+        document,
+        issue: 1,
+        repository,
+        body,
+        comments: [],
+        children: [],
+        adopted: undefined,
+      }).join(),
+      "text outside its list items",
+    );
+  });
+});
+describe("parent criteria preparation", () => {
+  const sha = (text: string) => NodeCrypto.createHash("sha256").update(text).digest("hex");
+  const b1 = "**B1:** the importer keeps one row per source line.";
+  const b2 =
+    "B2: the export cites [the rule](https://github.com/example-org/beta/issues/40#issuecomment-77).";
+  const body = `Intro 🙂.\n\n## Completion criteria\n- [x] ${b1}\n- ${b2}\n\n<details>\n\n- old: not acceptance\n</details>\n`;
+  const rule = "Rule: a duplicate is refused.";
+  const comments = [{ id: 77, body: rule }];
+  const items = parentAcceptance(body).items;
+  const proposal = {
+    schema: "factory-parent-criteria-proposal/1" as const,
+    issue: 40,
+    basis: { bodySha256: sha(body), itemVersion: "v40" },
+    clauses: items.map((item, at) => ({
+      id: ["B1", "B2"][at]!,
+      source: { start: item.start, end: item.end, sha256: item.sha256, excerpt: item.excerpt },
+      ...(at === 1
+        ? { comments: [{ id: "77", start: 0, end: 5, sha256: sha(rule), excerpt: "Rule:" }] }
+        : {}),
+    })),
+  };
+  const hold = { actor: "owner", action: "approve the whole parent", resume: "the owner approves" };
+  const wholeParent = {
+    id: "whole-parent",
+    required: true,
+    source: { kind: "owner_decision", ref: "q" },
+    state: "reserved",
+    reserved: hold,
+  };
+  const adopted = {
+    schema: "factory-parent-criteria/1",
+    issue: 40,
+    version: "root-1",
+    bodySha256: "0".repeat(64),
+    clauses: [wholeParent],
+  };
+  const carrier = { itemKey: `github:${repository}#41`, body: `## Acceptance\n- ${b1}\n` };
+  const document = {
+    schema: "factory-parent-criteria/1",
+    issue: 40,
+    version: "auto",
+    bodySha256: sha(body),
+    clauses: [
+      ...items.map((item, at) => ({
+        id: ["B1", "B2"][at]!,
+        required: true,
+        state: "open",
+        source: {
+          kind: "issue_acceptance",
+          ref: `https://github.com/${repository}/issues/40#completion-criteria`,
+          start: item.start,
+          end: item.end,
+          sha256: item.sha256,
+          excerpt: item.excerpt,
+          ...(at === 1 ? { comments: proposal.clauses[1]!.comments } : {}),
+        },
+        evidence: at === 0 ? [{ itemKey: carrier.itemKey, scope: b1 }] : [],
+      })),
+      wholeParent,
+    ],
+  };
+  const problems = (change: Partial<Parameters<typeof preparedCriteriaProblems>[0]> = {}) =>
+    preparedCriteriaProblems({
+      document,
+      issue: 40,
+      repository,
+      body,
+      comments,
+      children: [carrier],
+      adopted,
+      proposal,
+      ...change,
+    });
+  const edited = (edit: (clauses: Array<Record<string, unknown>>) => void) => {
+    const copy = structuredClone(document) as { clauses: Array<Record<string, unknown>> };
+    edit(copy.clauses);
+    return copy;
+  };
+
+  it("reads the current acceptance by code points, never history or fences", () => {
+    assert.deepStrictEqual(
+      items.map((item) => [item.excerpt, item.checked, item.anchor]),
+      [
+        [b1, true, "completion-criteria"],
+        [b2, false, "completion-criteria"],
+      ],
+    );
+    // The emoji before it is one code point, so the offset is not the UTF-16 index.
+    assert.strictEqual(items[0]!.start, body.indexOf(b1) - 1);
+  });
+
+  it("accepts prepared criteria only where T3's own reads support every clause and hold", () => {
+    assert.deepStrictEqual(problems(), []);
+    const rows: ReadonlyArray<readonly [string, ReturnType<typeof problems>[number]]> = [
+      [
+        problems({ document: edited((clauses) => (clauses[0]!.id = "B9")) }).join(),
+        "clause 1 is not B1",
+      ],
+      [
+        problems({ document: edited((clauses) => clauses.pop()) }).join(),
+        "2 acceptance items and 1 kept holds need 3",
+      ],
+      [
+        problems({
+          document: edited((clauses) => (clauses[2]!.reserved = { ...hold, actor: "anyone" })),
+        }).join(),
+        "the adopted hold whole-parent is not kept as adopted",
+      ],
+      // A member whose body T3 did not read carries nothing.
+      [problems({ children: [{ itemKey: carrier.itemKey }] }).join(), "clause B1 cites evidence"],
+      [
+        problems({ comments: [{ id: 77, body: "Rule: a duplicate is merged." }] }).join(),
+        "does not quote comment 77 as T3 read it",
+      ],
+      [
+        problems({ adopted: { ...adopted, clauses: [] } }).join(),
+        "not a usable factory-parent-criteria/1",
+      ],
+      [
+        problems({ document: edited((clauses) => (clauses[1]!.state = "revised")) }).join(),
+        "clause B2 is revised, not open",
+      ],
+      [problems({ body: `${body}x` }).join(), "the proposal names body"],
+    ];
+    for (const [found, expected] of rows) assert.include(found, expected);
+  });
+
+  it("keeps a reserved clause's hold through the criteria decoder", () => {
+    const decoded = Option.getOrThrow(decodeCriteria(JSON.stringify(document)));
+    assert.deepStrictEqual(
+      decoded.clauses.map((clause) => [clause.id, clause.state, clause.reserved]),
+      [
+        ["B1", "open", undefined],
+        ["B2", "open", undefined],
+        ["whole-parent", "reserved", hold],
+      ],
+    );
+    // Root's no-edit unit owns no paths and still decodes.
+    const noEdit = { title: "Verify", contract: "No edit.", paths: [], mode: "no_edit" };
+    const adoptedNoEdit = edited((clauses) => (clauses[0]!.unit = noEdit));
+    assert.isTrue(Option.isSome(decodeCriteria(JSON.stringify(adoptedNoEdit))));
+  });
+
+  const unit = {
+    title: "Export cites the rule",
+    contract: "The export cites rule 77 for every refused duplicate.",
+    paths: ["src/export.ts"],
+  };
+  const proposing = (units: Record<number, unknown>): FactoryCriteriaProposal => ({
+    ...proposal,
+    clauses: proposal.clauses.map((clause, at) =>
+      at in units ? ({ ...clause, unit: units[at] } as typeof clause) : clause,
+    ),
+  });
+
+  it("refuses a proposed clause unit that is not exactly a bounded {title, contract, paths}", () => {
+    const prefix = "clause B2 names a unit that is not a bounded {title, contract, paths}: ";
+    const rows: ReadonlyArray<readonly [unknown, string]> = [
+      [{ contract: unit.contract, paths: unit.paths }, 'Missing key at ["title"]'],
+      [{ title: unit.title, paths: unit.paths }, 'Missing key at ["contract"]'],
+      [{ ...unit, paths: "src/export.ts" }, 'Expected array at ["paths"]'],
+      [{ ...unit, title: "t".repeat(201) }, 'at ["title"]'],
+      [{ ...unit, paths: ["../src/export.ts"] }, 'at ["paths"][0]'],
+      [{ ...unit, mode: "no_edit" }, 'Expected no excess property at ["mode"]'],
+    ];
+    for (const [proposed, problem] of rows) {
+      const found = criteriaProposalProblems({
+        proposal: proposing({ 1: proposed }),
+        issue: 40,
+        body,
+      });
+      assert.strictEqual(found.length, 1, problem);
+      assert.isTrue(found[0]!.startsWith(prefix), found[0]);
+      assert.include(found[0], problem);
+    }
+    assert.deepStrictEqual(
+      criteriaProposalProblems({ proposal: proposing({ 1: unit }), issue: 40, body, comments }),
+      [],
+    );
+  });
+
+  it("prepares a proposed unit only where adoption names none; an adopted unit always wins", () => {
+    const carried = edited((clauses) => (clauses[1]!.unit = unit));
+    assert.deepStrictEqual(problems({ proposal: proposing({ 1: unit }), document: carried }), []);
+    for (const document of [
+      edited(() => {}),
+      edited((clauses) => (clauses[1]!.unit = { ...unit, title: "Another unit" })),
+    ]) {
+      assert.include(
+        problems({ proposal: proposing({ 1: unit }), document }).join(),
+        "clause B2 does not carry its proposed unit",
+      );
+    }
+    const rootUnit = {
+      title: "Importer keeps rows",
+      contract: "Root's.",
+      paths: ["src/import.ts"],
+    };
+    const adoptedB1 = {
+      ...adopted,
+      clauses: [
+        {
+          id: "B1",
+          required: true,
+          source: { kind: "issue_acceptance", ref: "root", excerpt: b1 },
+          state: "open",
+          unit: { ...rootUnit, resources: ["ocr"] },
+        },
+        wholeParent,
+      ],
+    };
+    const keeping = edited((clauses) => (clauses[0]!.unit = { ...rootUnit, resources: ["ocr"] }));
+    assert.deepStrictEqual(problems({ adopted: adoptedB1, document: keeping }), []);
+    assert.deepStrictEqual(
+      problems({ adopted: adoptedB1, document: keeping, proposal: proposing({ 0: unit }) }),
+      ["clause B1 proposes a unit other than its adopted unit"],
+    );
+    assert.deepStrictEqual(
+      problems({
+        adopted: adoptedB1,
+        document: edited((clauses) => (clauses[0]!.unit = unit)),
+        proposal: proposing({ 0: unit }),
+      }),
+      [
+        "clause B1 does not keep its adopted unit",
+        "clause B1 proposes a unit other than its adopted unit",
+      ],
+    );
+    const plainB1 = {
+      ...adoptedB1,
+      clauses: [{ ...adoptedB1.clauses[0], unit: rootUnit }, wholeParent],
+    };
+    assert.deepStrictEqual(
+      problems({
+        adopted: plainB1,
+        document: edited((clauses) => (clauses[0]!.unit = rootUnit)),
+        proposal: proposing({ 0: rootUnit }),
+      }),
+      [],
+    );
+  });
+});
+
+// A current-body Root route's shape (BETA #18, #31): adopted clauses record their list item as
+// `source.text` and may anchor acceptance on a heading of the parent's own.
+describe("parent criteria on a current-body Root route", () => {
+  const sha = (text: string) => NodeCrypto.createHash("sha256").update(text).digest("hex");
+  const c1 =
+    "Identify the exact intended accessible target and safe metadata without private-body access.";
+  const c2 =
+    "Complete authorized path/reparse/compatibility checks for the exact release candidate.";
+  const routed = (
+    id: string,
+    text: string,
+    anchor: string,
+    change: Record<string, unknown> = {},
+  ): Record<string, unknown> => ({
+    id,
+    required: true,
+    source: {
+      kind: "github_issue",
+      ref: `https://github.com/${repository}/issues/18#${anchor}`,
+      text,
+    },
+    state: "open",
+    evidence: [],
+    ...change,
+  });
+  const route = (clauses: ReadonlyArray<Record<string, unknown>>) => ({
+    schema: "factory-parent-criteria/1",
+    issue: 18,
+    version: "route-1",
+    bodySha256: "0".repeat(64),
+    clauses,
+  });
+  const proposalFor = (
+    body: string,
+    ids: ReadonlyArray<string>,
+    anchors?: ReadonlySet<string>,
+  ): FactoryCriteriaProposal => ({
+    schema: "factory-parent-criteria-proposal/1",
+    issue: 18,
+    basis: { bodySha256: sha(body), itemVersion: "v18" },
+    clauses: parentAcceptance(body, anchors).items.map((item, at) => ({
+      id: ids[at]!,
+      source: { start: item.start, end: item.end, sha256: item.sha256, excerpt: item.excerpt },
+    })),
+  });
+  const preparedFor = (
+    body: string,
+    clauses: ReadonlyArray<{ readonly id: string } & Record<string, unknown>>,
+    kept: ReadonlyArray<unknown> = [],
+    anchors?: ReadonlySet<string>,
+  ) => ({
+    schema: "factory-parent-criteria/1",
+    issue: 18,
+    version: "auto",
+    bodySha256: sha(body),
+    clauses: [
+      ...parentAcceptance(body, anchors).items.map((item, at) => ({
+        required: true,
+        state: "open",
+        source: {
+          kind: "issue_acceptance",
+          ref: `https://github.com/${repository}/issues/18#${item.anchor}`,
+          start: item.start,
+          end: item.end,
+          sha256: item.sha256,
+          excerpt: item.excerpt,
+        },
+        evidence: [],
+        ...clauses[at],
+      })),
+      ...kept,
+    ],
+  });
+  const problemsOf = (input: {
+    readonly body: string;
+    readonly adopted: unknown;
+    readonly document: unknown;
+    readonly anchors?: ReadonlySet<string>;
+  }) =>
+    preparedCriteriaProblems({
+      document: input.document,
+      issue: 18,
+      repository,
+      body: input.body,
+      comments: [],
+      children: [],
+      adopted: input.adopted,
+      proposal: proposalFor(
+        input.body,
+        parentAcceptance(input.body, input.anchors).items.map((_, at) => `P${at + 1}`),
+        input.anchors,
+      ),
+    });
+  const digestId = (text: string) => `clause-${sha(text).slice(0, 12)}`;
+
+  it("S1: reads acceptance under the headings an adopted required clause names, and no other", () => {
+    const body = `Stage.\n\n## Done when\n- [ ] ${c1}\n- [x] ${c2}\n\n## Boundaries\n- Read-only.\n`;
+    const anchors = new Set(["done-when"]);
+    const adopted = route([
+      routed("C01", `- [ ] ${c1}`, "done-when"),
+      routed("C02", `- [ ] ${c2}`, "done-when"),
+    ]);
+    // A Done when heading is acceptance only where a required adopted clause anchors on it.
+    for (const unnamed of [
+      undefined,
+      route([routed("C01", `- [ ] ${c1}`, "done-when", { required: false })]),
+      route([routed("C01", `- [ ] ${c1}`, "completion-criteria")]),
+      route([
+        {
+          ...routed("C01", `- [ ] ${c1}`, ""),
+          source: { kind: "github_issue", ref: "issue body", text: c1 },
+        },
+      ]),
+    ]) {
+      assert.deepStrictEqual(
+        criteriaProposalProblems({
+          proposal: proposalFor(body, ["C01", "C02"], anchors),
+          issue: 18,
+          body,
+          adopted: unnamed,
+        }),
+        ["the body of #18 states no acceptance list"],
+      );
+    }
+    // Golden: anchors naming a standard heading, or none, read the body as before.
+    const standard = `Stage.\n\n## Completion criteria\n- [ ] ${c1}\n\n## Done when\n- [ ] ${c2}\n`;
+    assert.deepStrictEqual(
+      parentAcceptance(standard, new Set(["completion-criteria"])),
+      parentAcceptance(standard),
+    );
+    const read = parentAcceptance(body, anchors);
+    assert.deepStrictEqual(
+      read.items.map((item) => [item.excerpt, item.checked, item.anchor]),
+      [
+        [c1, false, "done-when"],
+        [c2, true, "done-when"],
+      ],
+    );
+    assert.deepStrictEqual(read.unlisted, []);
+    assert.deepStrictEqual(
+      criteriaProposalProblems({
+        proposal: proposalFor(body, ["C01", "C02"], anchors),
+        issue: 18,
+        body,
+        adopted,
+      }),
+      [],
+    );
+    assert.deepStrictEqual(
+      problemsOf({
+        body,
+        adopted,
+        anchors,
+        document: preparedFor(body, [{ id: "C01" }, { id: "C02" }], [], anchors),
+      }),
+      [],
+    );
+  });
+
+  it("S2: an adopted clause recorded as its list item keeps its id, state, evidence, hold and unit", () => {
+    const body = `Stage.\n\n## Completion criteria\n- [ ] ${c1}\n- [ ] ${c2}\n`;
+    // Golden: a clause adopted by its excerpt matches as before.
+    const byExcerpt = route([
+      { ...routed("C01", "", "completion-criteria"), source: { kind: "k", ref: "r", excerpt: c1 } },
+    ]);
+    assert.deepStrictEqual(
+      problemsOf({
+        body,
+        adopted: byExcerpt,
+        document: preparedFor(body, [{ id: "C01" }, { id: digestId(c2) }]),
+      }),
+      [],
+    );
+    // No match on other text or on a blank item, and one adopted clause never takes two items.
+    const blank = `Stage.\n\n## Completion criteria\n- [ ] \n- [ ] ${c1}\n- [ ] ${c1}\n`;
+    const once = route([
+      routed("W", "- [ ]   ", "completion-criteria"),
+      routed("C01", `- [ ] ${c1}`, "completion-criteria"),
+      routed("C09", "- [ ] another target", "completion-criteria"),
+    ]);
+    assert.include(
+      problemsOf({
+        body: blank,
+        adopted: once,
+        document: preparedFor(blank, [{ id: "W" }, { id: "C01" }, { id: digestId(c1) }]),
+      }).join(),
+      `clause 1 is not ${digestId("")}`,
+    );
+    assert.deepStrictEqual(
+      problemsOf({
+        body: blank,
+        adopted: once,
+        document: preparedFor(blank, [{ id: digestId("") }, { id: "C01" }, { id: digestId(c1) }]),
+      }),
+      [],
+    );
+    // Marker, checkbox and spacing variants of the recorded item all name it.
+    const hold = { actor: "owner", action: "settle the target", resume: "the owner answers" };
+    const unit = { title: "Check the candidate", contract: "Run the checks.", paths: ["a.ts"] };
+    const evidence = [{ itemKey: `github:${repository}#48`, scope: "target binding" }];
+    const adopted = route([
+      routed("C01", `* [X]  ${c1}  `, "completion-criteria", { evidence }),
+      routed("C02", `2. ${c2}`, "completion-criteria", { state: "reserved", reserved: hold, unit }),
+    ]);
+    assert.deepStrictEqual(
+      problemsOf({
+        body,
+        adopted,
+        document: preparedFor(body, [
+          { id: "C01", evidence },
+          { id: "C02", state: "reserved", reserved: hold, unit },
+        ]),
+      }),
+      [],
+    );
+  });
+
+  it("S3: an unmatched optional adopted clause stays byte-exact in adopted order", () => {
+    const body = `Stage.\n\n## Completion criteria\n- [ ] ${c1}\n`;
+    const byExcerpt = {
+      ...routed("C01", "", "completion-criteria"),
+      source: { kind: "k", ref: "r", excerpt: c1 },
+    };
+    const hold = {
+      id: "whole-parent",
+      required: true,
+      source: { kind: "owner_decision", ref: "q" },
+      state: "reserved",
+      reserved: { actor: "owner", action: "approve", resume: "approved" },
+    };
+    const revisedOption = routed("RETAIN-9", "- [x] Superseded replay.", "retained", {
+      required: false,
+      state: "revised",
+      revision: "dropped",
+    });
+    // Golden: holds are kept and a revised option is dropped, as before.
+    assert.deepStrictEqual(
+      problemsOf({
+        body,
+        adopted: route([byExcerpt, revisedOption, hold]),
+        document: preparedFor(body, [{ id: "C01" }], [hold]),
+      }),
+      [],
+    );
+    const retained = routed("RETAIN-136", "- [x] Retained replay output only.", "retained", {
+      required: false,
+      evidence: [{ itemKey: `github:${repository}#136`, scope: "replay output only" }],
+    });
+    const adopted = route([byExcerpt, retained, revisedOption, hold]);
+    const rows: ReadonlyArray<readonly [ReadonlyArray<unknown>, ReadonlyArray<string>]> = [
+      [[retained, hold], []],
+      [
+        [hold],
+        [
+          "the prepared document has 2 clauses; 1 acceptance items, 1 kept holds and 1 kept optional clauses need 3",
+        ],
+      ],
+      // Preparation never adds to it: only its own adopted evidence can prove it.
+      [
+        [{ ...retained, evidence: [{ itemKey: `github:${repository}#18`, scope: c1 }] }, hold],
+        ["the adopted optional clause RETAIN-136 is not kept as adopted"],
+      ],
+      [
+        [hold, retained],
+        [
+          "the adopted optional clause RETAIN-136 is not kept as adopted",
+          "the adopted hold whole-parent is not kept as adopted",
+        ],
+      ],
+    ];
+    for (const [kept, expected] of rows) {
+      assert.deepStrictEqual(
+        problemsOf({ body, adopted, document: preparedFor(body, [{ id: "C01" }], kept) }),
+        expected,
+      );
+    }
+  });
+});

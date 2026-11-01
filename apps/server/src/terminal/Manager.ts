@@ -38,6 +38,7 @@ import {
 import { makeKeyedCoalescingWorker } from "@t3tools/shared/KeyedCoalescingWorker";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import { AgentScope } from "@t3tools/shared/AgentScope";
+import { CurrentExecutionJoin, ExecutionJoin, JoinRefused } from "@t3tools/shared/ExecutionJoin";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { mergePathEntries } from "@t3tools/shared/shell";
 
@@ -1553,7 +1554,10 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
   const platform = yield* HostProcess.Platform;
   const architecture = yield* HostProcess.Architecture;
   const agentScope = yield* AgentScope;
-  // Inherit the full environment minus createTerminalSpawnEnv's blocklist; allowlists silently drop user tooling variables.
+  const executionJoin = yield* ExecutionJoin;
+  // Terminals must inherit the user's full environment (minus the blocklist
+  // applied in createTerminalSpawnEnv) — an allowlist here silently strips
+  // things like PSModulePath, DISPLAY, proxies, and toolchain variables.
   const baseEnv = options.env ?? process.env;
   const shellResolver = options.shellResolver ?? (() => defaultShellResolver(platform, baseEnv));
   const processRunner = yield* ProcessRunner.ProcessRunner;
@@ -2398,13 +2402,34 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
       );
     }
 
-    const launch = yield* agentScope.wrap({
+    const scoped = yield* agentScope.wrap({
       command: candidate.shell,
       args: candidate.args ?? [],
       name: "terminal",
       env: spawnEnv,
       survivesRestart: true,
     });
+    // Work that carries its run's container (a contained preparation's setup script) starts the
+    // shell in that container or not at all: the thread's current run may already be cancelled.
+    // Otherwise a terminal of a thread whose execution is running here belongs to that execution,
+    // so its shell starts inside the run's container; with none running it is the owner's own work.
+    const carried = yield* CurrentExecutionJoin;
+    const join = Option.isSome(carried)
+      ? carried
+      : yield* executionJoin.heldForThread(session.threadId);
+    const ticket = Option.isNone(join)
+      ? undefined
+      : yield* join.value(scoped.command, scoped.args).pipe(
+          Effect.mapError(
+            (cause) =>
+              new PtyAdapter.PtySpawnError({
+                adapter: "terminal-manager",
+                attemptedShells: [formatShellCandidate(candidate)],
+                cause,
+              }),
+          ),
+        );
+    const launch = ticket ?? scoped;
     const attempt = yield* Effect.result(
       options.ptyAdapter.spawn({
         shell: launch.command,
@@ -2417,12 +2442,24 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     );
 
     if (attempt._tag === "Success") {
+      if (ticket !== undefined) {
+        const admitted = yield* Effect.exit(ticket.admit(attempt.success.pid));
+        if (admitted._tag === "Failure") {
+          attempt.success.kill();
+          return yield* new PtyAdapter.PtySpawnError({
+            adapter: "terminal-manager",
+            attemptedShells: [formatShellCandidate(candidate)],
+            cause: admitted.cause,
+          });
+        }
+      }
       return {
         process: attempt.success,
         shell: candidate.shell,
         shellLabel: formatShellCandidate(candidate),
       };
     }
+    if (ticket !== undefined) yield* ticket.cancel;
 
     const spawnError = attempt.failure;
     if (!isRetryableShellSpawnError(spawnError)) {
@@ -2931,6 +2968,17 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     }
 
     const liveSession = existing.value;
+    // Work that carries its run's container runs only in a shell started inside it, and nothing
+    // here records which container a running shell joined: it may be the owner's own, or an
+    // earlier generation's. Such work opens a terminal of its own; this shell is left alone.
+    if (liveSession.process !== null && Option.isSome(yield* CurrentExecutionJoin)) {
+      return yield* Effect.die(
+        new JoinRefused({
+          threadId: input.threadId,
+          reason: `terminal ${terminalId} already runs a shell this work did not start`,
+        }),
+      );
+    }
     const nextRuntimeEnv = normalizedRuntimeEnv(input.env);
     const currentRuntimeEnv = liveSession.runtimeEnv;
     const targetCols = input.cols ?? liveSession.cols;

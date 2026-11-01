@@ -121,6 +121,9 @@ import { isLiveCallerShell, threadNotFound } from "./threadAccess.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as PeerForwarding from "../peer/PeerForwarding.ts";
 import * as RemoteDelegation from "../peer/RemoteDelegation.ts";
+import * as FactoryStore from "../factory/FactoryStore.ts";
+import * as DelegateTaskCheck from "./DelegateTaskCheck.ts";
+import { refuseFactoryStartElsewhere } from "./McpToolAccess.ts";
 
 const DEFAULT_WAIT_TIMEOUT_MS = 10 * 60 * 1_000;
 const MAX_WAIT_TIMEOUT_MS = 60 * 60 * 1_000;
@@ -996,6 +999,9 @@ const make = Effect.gen(function* () {
   const gitDriver = yield* GitVcsDriver.GitVcsDriver;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const remoteDelegation = yield* RemoteDelegation.RemoteDelegation;
+  // Optional so compositions without factories build; a factory thread then delegates nowhere else.
+  const factoryStore = yield* Effect.serviceOption(FactoryStore.FactoryStore);
+  const delegateTaskCheck = yield* DelegateTaskCheck.fromContext;
 
   const requireProject = (projectId: ProjectId) =>
     projects.getById(projectId).pipe(
@@ -2225,6 +2231,7 @@ const make = Effect.gen(function* () {
       if (input.target !== undefined && environmentId !== undefined) {
         yield* requireCapability(callerScope);
         const scope = yield* requireThreadScope(callerScope, "delegate_task");
+        yield* refuseFactoryStartElsewhere(factoryStore, scope);
         // The task's child runs as an ordinary thread there; this thread keeps the task.
         const { taskId } = yield* remoteDelegation.delegate(scope, {
           ...input,
@@ -2264,7 +2271,9 @@ const make = Effect.gen(function* () {
         requestKey: key,
         operation: "delegate-task",
       });
-      const isRetryOfAcceptedDelegation = yield* threadManagement.hasReceipt(commandId);
+      const isRetryOfAcceptedDelegation = yield* threadManagement
+        .hasReceipt(commandId)
+        .pipe(Effect.mapError(threadManagementFailure));
       const target = yield* resolveTargetRechecking({
         parent,
         target: input.target,
@@ -2309,6 +2318,35 @@ const make = Effect.gen(function* () {
             );
         }
         workspaceStrategy = { type: "worktree", baseRef: base.commitSha, startFromOrigin: false };
+      }
+      // Checked before the command commits, so a refused task leaves no thread or receipt. A retry of
+      // an accepted delegation starts no work and keeps the task it was accepted with.
+      if (Option.isSome(delegateTaskCheck) && !isRetryOfAcceptedDelegation) {
+        const project = yield* requireProject(parent.thread.projectId);
+        const driver = providers.find(
+          (provider) => provider.instanceId === target.modelSelection.instanceId,
+        )?.driver;
+        yield* delegateTaskCheck.value
+          .check({
+            task: input.task,
+            workspaceRoot: project.workspaceRoot,
+            checkoutPath: parent.thread.worktreePath ?? project.workspaceRoot,
+            isolation: input.isolation ?? "shared",
+            baseCommit: workspaceStrategy?.type === "worktree" ? workspaceStrategy.baseRef : null,
+            driver: driver ?? "",
+            providerInstanceId: target.modelSelection.instanceId,
+          })
+          .pipe(
+            Effect.tapError((error) =>
+              Effect.logWarning("Dispatch check refused a delegate_task.", {
+                category: error.category,
+                cause: error,
+              }),
+            ),
+            Effect.mapError((error) =>
+              failure("invalid_request", `The dispatch check refused this task: ${error.message}`),
+            ),
+          );
       }
       // ThreadManagementService.dispatch is the chokepoint for this command
       // type's own enablement check, using the same command id and its
@@ -2668,7 +2706,9 @@ const make = Effect.gen(function* () {
                 requestKey: key,
                 index,
               });
-              const isRetryOfAcceptedCreation = yield* threadManagement.hasReceipt(commandId);
+              const isRetryOfAcceptedCreation = yield* threadManagement
+                .hasReceipt(commandId)
+                .pipe(Effect.mapError(threadManagementFailure));
               const committedThread = isRetryOfAcceptedCreation
                 ? yield* threadManagement
                     .getThreadShell(threadId)
@@ -2707,6 +2747,9 @@ const make = Effect.gen(function* () {
                   type: "thread.create",
                   createdBy: "agent",
                   creationSource: "mcp",
+                  // From the authenticated caller, so a later start without a sender still
+                  // belongs to the caller's work.
+                  createdFrom: { type: "thread", threadId: scope.thread.threadId },
                   commandId,
                   threadId,
                   projectId: parent.thread.projectId,

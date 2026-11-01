@@ -1,0 +1,168 @@
+import { assert, describe, expect, it } from "@effect/vitest";
+import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
+
+import {
+  FactoryReportInput,
+  factoryCardRequestId,
+  isFactoryCardRequestId,
+  parseFactoryCardRequestId,
+} from "./factoryMcp.ts";
+
+describe("factory card request ids", () => {
+  it("reads every id a factory issued as a card, whichever build wrote it", () => {
+    const encoded = factoryCardRequestId({
+      factoryId: "alpha-native-pilot-20000101",
+      kind: "result",
+      subjectId: "no-result:reservation:factory:alpha:decision:9c1",
+      n: 2,
+    });
+    expect(parseFactoryCardRequestId(encoded)).toEqual({
+      factoryId: "alpha-native-pilot-20000101",
+      kind: "result",
+      subjectId: "no-result:reservation:factory:alpha:decision:9c1",
+      n: 2,
+      legacy: false,
+    });
+    expect(parseFactoryCardRequestId("factory-card:alpha:gate:a00000000001:1")).toEqual({
+      factoryId: "alpha",
+      kind: "gate",
+      subjectId: "a00000000001",
+      n: 1,
+      legacy: false,
+    });
+    // An earlier build wrote a subject with colons as it was: still its card, never answerable.
+    expect(
+      parseFactoryCardRequestId("factory-card:beta:result:native:integrate:a0000001:1"),
+    ).toEqual({
+      factoryId: "beta",
+      kind: "result",
+      subjectId: "native:integrate:a0000001",
+      n: 1,
+      legacy: true,
+    });
+    for (const id of [
+      encoded,
+      "factory-card:beta:result:native:integrate:a0000001:1",
+      "factory-card:beta:result:no-result:9c1:3",
+      "factory-card:beta:result:%E0%A4%A:1",
+      "factory-card:beta",
+    ]) {
+      expect(isFactoryCardRequestId(id), id).toBe(true);
+    }
+    expect(parseFactoryCardRequestId("factory-card:beta:result:%E0%A4%A:1")).toBeUndefined();
+    expect(isFactoryCardRequestId("request:provider:42")).toBe(false);
+  });
+});
+
+describe("criteria proposal reports", () => {
+  const decode = Schema.decodeUnknownOption(FactoryReportInput);
+  const clause = (excerpt: string, start = 10) => ({
+    id: "N1",
+    source: { start, end: start + [...excerpt].length, sha256: "a".repeat(64), excerpt },
+  });
+  const report = (clauses: ReadonlyArray<unknown>, change: Record<string, unknown> = {}) => ({
+    outcome: "criteria_proposed",
+    summary: "Clauses.",
+    criteria: {
+      schema: "factory-parent-criteria-proposal/1",
+      issue: 27,
+      basis: { bodySha256: "b".repeat(64), itemVersion: "v27" },
+      clauses,
+      ...change,
+    },
+  });
+
+  const unit = {
+    title: "Import keeps order",
+    contract: "Rows keep source order.",
+    paths: ["a.ts"],
+  };
+  const withUnit = (change: Record<string, unknown>) =>
+    report([{ ...clause("abc"), unit: { ...unit, ...change } }]);
+  const unitRefusals: ReadonlyArray<readonly [string, unknown]> = [
+    ["a unit with no title", report([{ ...clause("abc"), unit: { contract: "c", paths: ["a"] } }])],
+    ["a unit with no contract", report([{ ...clause("abc"), unit: { title: "t", paths: ["a"] } }])],
+    ["a blank contract", withUnit({ contract: "  " })],
+    ["paths that are not an array", withUnit({ paths: "a.ts" })],
+    ["a unit owning no path", withUnit({ paths: [] })],
+    ["a title over 200 characters", withUnit({ title: "t".repeat(201) })],
+    ["a contract over 4000 characters", withUnit({ contract: "c".repeat(4_001) })],
+    ["more than 50 paths", withUnit({ paths: Array.from({ length: 51 }, (_, at) => `p${at}`) })],
+    ["an absolute path", withUnit({ paths: ["/etc/a"] })],
+    ["a path leaving the repository", withUnit({ paths: ["a/../../b"] })],
+    [
+      "more than 65536 unit characters",
+      report(
+        Array.from({ length: 17 }, (_, at) => ({
+          ...clause("x"),
+          id: `N${at}`,
+          unit: { ...unit, contract: "c".repeat(4_000) },
+        })),
+      ),
+    ],
+  ];
+
+  it("decodes only bounded, exactly measured quotes", () => {
+    // Offsets count code points: an astral character is one.
+    assert.isTrue(Option.isSome(decode(report([clause("keeps 🚀 order")]))));
+    assert.isTrue(
+      Option.isSome(
+        decode(
+          report([
+            {
+              ...clause("cites the rule"),
+              comments: [{ id: "777", start: 0, end: 4, sha256: "c".repeat(64), excerpt: "Rule" }],
+              needs: { kind: "qualification", what: "who certifies it" },
+            },
+          ]),
+        ),
+      ),
+    );
+    const refused: ReadonlyArray<readonly [string, unknown]> = [
+      ["no clause", report([])],
+      [
+        "a span longer than its excerpt",
+        report([{ ...clause("abc"), source: { ...clause("abc").source, end: 20 } }]),
+      ],
+      [
+        "an empty span",
+        report([{ ...clause("abc"), source: { ...clause("abc").source, end: 10 } }]),
+      ],
+      [
+        "a digest that is not sha256",
+        report([{ ...clause("abc"), source: { ...clause("abc").source, sha256: "A".repeat(64) } }]),
+      ],
+      ["more than 200 clauses", report(Array.from({ length: 201 }, () => clause("x")))],
+      [
+        "more than 65536 quoted characters",
+        report(Array.from({ length: 9 }, () => clause("x".repeat(8_000)))),
+      ],
+      [
+        "a need that is not a person's",
+        report([{ ...clause("abc"), needs: { kind: "evidence", what: "x" } }]),
+      ],
+      [
+        "a comment id that is not a number",
+        report([
+          {
+            ...clause("abc"),
+            comments: [{ id: "abc", start: 0, end: 1, sha256: "c".repeat(64), excerpt: "R" }],
+          },
+        ]),
+      ],
+      ["another schema", report([clause("abc")], { schema: "factory-parent-criteria/1" })],
+      [
+        "a body digest that is not sha256",
+        report([clause("abc")], { basis: { bodySha256: "x", itemVersion: "v" } }),
+      ],
+      ...unitRefusals,
+    ];
+    for (const [name, input] of refused) assert.isTrue(Option.isNone(decode(input)), name);
+  });
+
+  it("keeps a clause's bounded unit, trimmed, and refuses any other", () => {
+    const decoded = decode(withUnit({ title: " Import keeps order " }));
+    assert.deepStrictEqual(Option.getOrThrow(decoded).criteria?.clauses[0]?.unit, unit);
+  });
+});
