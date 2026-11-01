@@ -2599,7 +2599,8 @@ const make = Effect.gen(function* () {
         return yield* sql.withTransaction(
           Effect.gen(function* () {
             const grant = yield* readGrant(input.grantId);
-            if (Option.isNone(grant) || grant.value.state !== "active") return false;
+            // A spent grant is revoked too: that withdraws the one environment retry it could fund.
+            if (Option.isNone(grant) || grant.value.state === "revoked") return false;
             yield* writeGrant({
               ...grant.value,
               state: "revoked",

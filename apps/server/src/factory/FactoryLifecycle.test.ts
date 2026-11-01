@@ -26595,3 +26595,54 @@ it.effect("Grant/E2: a changed item or an unchanged execution never reuses a spe
     ),
   ),
 );
+
+it.effect(
+  "Grant/E2: a revoked spent grant, or a product result, funds no retry; the owner is asked as before",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* configureLifecycleFactory;
+          const factory = yield* FactoryLifecycle.FactoryLifecycle;
+          const revoked = yield* grantedBuild(7963);
+          yield* failFast(revoked);
+          yield* startsNothing;
+          const [spent] = (yield* grantView(7963)).grants;
+          assert.isTrue(
+            yield* factory.revokeGrant({ factoryId, grantId: spent!.grantId, by: "owner" }),
+          );
+          yield* configureFactory(
+            lifecycleConfiguration({
+              stageExecution: {
+                implement: { ...buildExecution, runtimeMode: "approval-required" },
+              },
+            }),
+          );
+          assert.deepStrictEqual(admittedOnly(yield* advance("tracker_event", 3)), []);
+          assert.strictEqual(yield* dispositionOf(7963), "awaiting_grant");
+          assert.deepStrictEqual(
+            (yield* grantView(7963)).grants.map((grant) => [grant.state, grant.recoveries]),
+            [["revoked", undefined]],
+          );
+
+          // A product failure is a result: the build's unit is consumed, whatever follows.
+          const failed = yield* grantedBuild(7964);
+          yield* workStage(failed, {
+            outcome: "failed",
+            failure: "pytest tests/test_intake.py::test_dates FAILED",
+            summary: "Build failed its checks.",
+          });
+          const later = admittedOnly(yield* advance("outcome", 3)).filter(
+            (admission) => stageOf(admission)?.[1] === "implement",
+          );
+          assert.deepStrictEqual(later, []);
+          assert.deepStrictEqual(
+            (yield* grantView(7964)).grants
+              .filter((grant) => grant.stage === "implement")
+              .map((grant) => [grant.state, grant.recoveries]),
+            [["spent", undefined]],
+          );
+        }),
+      ),
+    ),
+);
