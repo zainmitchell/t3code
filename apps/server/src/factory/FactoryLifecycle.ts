@@ -3000,6 +3000,7 @@ const make = Effect.gen(function* () {
   const reconcileClaims = Effect.fnUntraced(function* (
     factoryId: FactoryId,
     generation: FactoryReadGeneration,
+    observations: ReadonlyMap<FactoryItemKey, FactoryStore.ItemObservation>,
   ) {
     const pending: Array<EffectOutbox.PendingOrchestrationEffectV2> = [];
     for (const claim of yield* claims.list(factoryId)) {
@@ -3014,7 +3015,7 @@ const make = Effect.gen(function* () {
       ) {
         const [obligation] = yield* store.openWorkspaceObligations(claim.reservationId);
         if (obligation === undefined) {
-          yield* releaseFailedPreparationHold(claim);
+          yield* releaseFailedPreparationHold(claim, generation, observations.get(claim.itemKey));
           continue;
         }
         const recoveryCommandId = CommandId.make(`factory-recovery-check:${obligation.runId}`);
@@ -3632,7 +3633,10 @@ const make = Effect.gen(function* () {
       }
     };
     const candidates: Array<Candidate> = [];
+    // This pass's recorded reads, as the claims it reconciles are judged on: no older read.
+    const observations = new Map<FactoryItemKey, FactoryStore.ItemObservation>();
     for (const { itemKey, subject, issue, observed, recorded } of recordedReads) {
+      if (recorded.type === "recorded") observations.set(itemKey, recorded.observation);
       const overtaken =
         recorded.type === "superseded"
           ? recorded.current
@@ -4134,7 +4138,7 @@ const make = Effect.gen(function* () {
     );
     yield* Ref.update(factoryIssues, (current) => new Map(current).set(factoryId, issues));
     if (retry) yield* Ref.update(retryWanted, (current) => new Set(current).add(factoryId));
-    yield* reconcileClaims(factoryId, generation);
+    yield* reconcileClaims(factoryId, generation, observations);
     yield* recoverRefusedWakes(factoryId);
     // Asking the owner never holds a pass back: a card that fails is asked again next pass.
     yield* syncOwnerCards(factoryId).pipe(
@@ -4735,8 +4739,21 @@ const make = Effect.gen(function* () {
    */
   const releaseFailedPreparationHold = Effect.fnUntraced(function* (
     claim: FactoryClaimStore.FactoryClaimRecord,
+    generation: FactoryReadGeneration,
+    observation: FactoryStore.ItemObservation | undefined,
   ) {
     if (claim.state !== "stale_after_claim" || claim.reason !== "workspace_preparation_failed") {
+      return;
+    }
+    // Judged only on this pass's complete read of the item showing our carrier as its one claim.
+    if (
+      observation === undefined ||
+      observation.generation !== generation ||
+      observation.itemKey !== claim.itemKey ||
+      !observation.complete ||
+      observation.claims.length !== 1 ||
+      observation.claims[0]!.carrierKey !== claim.carrierKey
+    ) {
       return;
     }
     const reservation = Option.flatten(
@@ -4770,18 +4787,6 @@ const make = Effect.gen(function* () {
       configuration.value.claim === undefined ||
       receipt === undefined ||
       receipt.accountId !== configuration.value.claim.accountId
-    ) {
-      return;
-    }
-    const latest = (yield* store.observationsAfter({
-      factoryId: claim.factoryId,
-      observationId: claim.admitted.observationId,
-    })).at(-1);
-    if (
-      latest === undefined ||
-      !latest.complete ||
-      latest.claims.length !== 1 ||
-      latest.claims[0]!.carrierKey !== claim.carrierKey
     ) {
       return;
     }

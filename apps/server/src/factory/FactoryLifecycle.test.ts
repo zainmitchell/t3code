@@ -18521,30 +18521,93 @@ it.effect.each([
     ),
 );
 
-it.effect(
-  "Environment/startup: a failed build's claim the tracker no longer shows stays held: no later server run builds it",
-  () =>
+it.effect.each(["comment_removed", "foreign_claim", "account_changed", "helper_changed"] as const)(
+  "Environment/startup: a failed build's claim stays held and nothing builds when %s before the restore",
+  (change) =>
     runIsolated(
       Effect.scoped(
         Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const scratch = yield* fs.realPath(yield* fs.makeTempDirectoryScoped());
+          const helperPath = path.join(scratch, "factory-helper.py");
+          yield* fs.writeFileString(helperPath, "print('helper v1')\n");
+          const helperSha256 = sha256("print('helper v1')\n");
+          const packet = {
+            briefSchemaVersion: "brief-v1",
+            helper: { path: helperPath, sha256: helperSha256 },
+          };
           const first = serverRun("k", 0);
-          const { build, carrierKey } = yield* buildSetupFails(7963, first);
-          const issue = (yield* GitHubFake).issues.get(issueKey(claimRepository, 7963))!;
-          issue.comments = issue.comments.filter(
-            (comment) => !comment.body.includes("Claimed by T3 Code"),
+          yield* configureLifecycleFactory;
+          yield* configureFactory(lifecycleConfiguration({ packet }));
+          yield* usePolicy((input: ProposeInput) =>
+            Effect.map(stageRequest(input), (decision) =>
+              decision !== undefined && "taskKind" in decision
+                ? {
+                    ...decision,
+                    workspaceStrategy: { type: "worktree" as const, baseRef: "main" },
+                    packet: { ...decision.packet, helperSha256 },
+                  }
+                : decision,
+            ),
           );
-          yield* inServerRun(first, startsNothing);
-          const later = yield* laterServerRun("l");
-          assert.deepStrictEqual(yield* inServerRun(later, advance("clock", 3)), []);
-          assert.strictEqual(yield* dispositionOf(7963), "not_owned");
-          assert.deepStrictEqual(yield* itemClaims, [
+          yield* seedIssue(7963);
+          yield* setupEndsWithoutExitCode(yield* FactoryWorkspace);
+          const build = admittedBy(yield* inServerRun(first, advance("tracker_event", 1)));
+          const [heldNow] = yield* itemClaims;
+          const held = [
             [
               build.reservation.reservationId,
               "stale_after_claim",
               "workspace_preparation_failed",
-              carrierKey,
+              heldNow![3],
             ],
-          ]);
+          ];
+          assert.deepStrictEqual(yield* itemClaims, held);
+
+          const issue = (yield* GitHubFake).issues.get(issueKey(claimRepository, 7963))!;
+          switch (change) {
+            case "comment_removed":
+              issue.comments = issue.comments.filter((c) => !c.body.includes("Claimed by T3 Code"));
+              break;
+            case "foreign_claim":
+              issue.comments.push({
+                id: (yield* GitHubFake).nextCommentId++,
+                body: "Claimed issue-7963 by someone else",
+                user: { id: 77, login: "other-writer" },
+                created_at: "2026-10-27T03:00:00Z",
+              });
+              break;
+            case "account_changed":
+              yield* configureFactory(
+                lifecycleConfiguration({
+                  packet,
+                  claim: { ...claimConfig, repositories: [claimRepository], accountId: "9002" },
+                }),
+              );
+              break;
+            case "helper_changed":
+              yield* fs.writeFileString(helperPath, "print('helper v2')\n");
+              break;
+          }
+          yield* inServerRun(first, startsNothing);
+          const later = yield* laterServerRun("l");
+          const results = yield* inServerRun(later, advance("clock", 3));
+          assert.deepStrictEqual(admittedOnly(results), []);
+          assert.deepStrictEqual(yield* inServerRun(later, restartedPass), []);
+          assert.strictEqual((yield* startedTurns).length, 0);
+          if (change === "helper_changed") {
+            // The claim is this factory's again; the new build's admission refuses the helper.
+            assert.strictEqual((yield* itemClaims)[0]?.[1], "workspace_authorized");
+            const refusals = results.flatMap((result) =>
+              result.type === "refused" ? [result.reason] : [],
+            );
+            assert.isAtLeast(refusals.length, 1);
+            assert.deepStrictEqual([...new Set(refusals)], ["helper_unavailable"]);
+          } else {
+            assert.strictEqual(yield* dispositionOf(7963), "not_owned");
+            assert.deepStrictEqual(yield* itemClaims, held);
+          }
         }),
       ),
     ),
