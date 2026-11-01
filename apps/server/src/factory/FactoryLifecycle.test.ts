@@ -1617,6 +1617,8 @@ class GitGraphFake extends Context.Service<
   {
     readonly parents: Map<string, ReadonlyArray<string>>;
     readonly branches: Map<string, string>;
+    /** Each commit's files a test names: text content, or `link` for a symbolic link. */
+    readonly files: Map<string, Map<string, string | { readonly link: string }>>;
     /** Each integration commit's message, which carries its operation marker. */
     readonly messages: Map<string, string>;
     /** `base:head` pairs whose merge conflicts. */
@@ -1737,6 +1739,21 @@ const layerGitGraphFake = Layer.effect(
       isAncestor: (input) =>
         read("is-ancestor", () => ancestors(input.descendant).has(input.ancestor)),
       branchExists: (input) => read("branch-exists", () => graph.branches.has(input.branch)),
+      objectsAt: (input) =>
+        read("objects-at", () => {
+          const files = graph.files.get(resolve(input.commit)) ?? new Map();
+          return {
+            tree: `tree-${resolve(input.commit)}`,
+            objects: input.paths.map((path): FactoryGitReadback.FactoryGitObject => {
+              const file = files.get(path);
+              return file === undefined
+                ? { path, kind: "missing" }
+                : typeof file === "string"
+                  ? { path, kind: "blob", sha256: sha256(file) }
+                  : { path, kind: "link" };
+            }),
+          };
+        }),
     });
   }),
 );
@@ -1745,6 +1762,7 @@ const layerGitGraphFake = Layer.effect(
 const layerGitGraphState = Layer.sync(GitGraphFake, () => ({
   parents: new Map<string, ReadonlyArray<string>>([["base000", []]]),
   branches: new Map<string, string>([["main", "base000"]]),
+  files: new Map(),
   messages: new Map<string, string>(),
   conflicts: new Set<string>(),
   loseNextAnswer: false,

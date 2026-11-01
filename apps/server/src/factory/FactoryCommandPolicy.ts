@@ -48,6 +48,16 @@ const PolicyDecision = Schema.Union([
      * kept clear of them. Coordination only: T3 does not confine what the worker writes.
      */
     writes: Schema.optional(Schema.Array(Bounded(512)).check(Schema.isMaxLength(200))),
+    /**
+     * Pinned inputs an owner-approved correction invalidates: T3 derives each successor at the
+     * review's verified head, records it beside the predecessor, and shows the reviewer both.
+     */
+    rebind: Schema.optional(
+      Schema.Struct({
+        evidence: Bounded(200_000),
+        pins: Schema.Array(PinnedFile).check(Schema.isMaxLength(16)),
+      }),
+    ),
     /** One of the configuration's named executions, such as a builder effort. */
     execution: Schema.optional(Bounded(200)),
     /**
@@ -614,6 +624,7 @@ export const layer = Layer.effect(
               ? {}
               : { verificationBinding: decision.verificationBinding }),
             ...(decision.noEdit === undefined ? {} : { noEdit: decision.noEdit }),
+            ...(decision.rebind === undefined ? {} : { rebind: decision.rebind }),
             ...(decision.resources === undefined || decision.resources.length === 0
               ? {}
               : { resources: [...new Set(decision.resources)].toSorted() }),

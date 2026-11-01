@@ -129,6 +129,7 @@ const fakeGit = (
   const resolve = (rev: string) =>
     rev.startsWith("refs/") ? repository.branches?.get(rev.slice("refs/".length)) : rev;
   return {
+    objectsAt: () => Effect.fail(unreadable("objectsAt")),
     commitExists: ({ commit }) => {
       if (repository.unreadable) return Effect.fail(unreadable("commitExists"));
       const resolved = resolve(commit);

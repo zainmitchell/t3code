@@ -72,6 +72,7 @@ import * as FactoryStore from "./FactoryStore.ts";
 import * as FactoryExecutionGenerations from "./FactoryExecutionGenerations.ts";
 import * as FactoryTracker from "./FactoryTracker.ts";
 import * as FactoryGitReadback from "./FactoryGitReadback.ts";
+import * as FactoryRebind from "./factoryRebind.ts";
 import * as FactoryOutcomeStore from "./FactoryOutcomeStore.ts";
 import { entryView } from "./factoryEntry.ts";
 import {
@@ -416,6 +417,8 @@ export interface FactoryAdmissionRequest {
   readonly verificationBinding?: PinnedFile;
   /** An adopted no-edit unit: it verifies an exact existing commit and changes no file. */
   readonly noEdit?: NoEditRequirement;
+  /** Pinned inputs its owner-approved correction invalidates, rebound at the head a review reads. */
+  readonly rebind?: FactoryRebind.RebindRequest;
   /** The grant the lifecycle found for it; set by the lifecycle, spent in the admission commit. */
   readonly grant?: {
     readonly grantId: string;
@@ -5660,6 +5663,50 @@ const make = Effect.gen(function* () {
         ].join("\n"),
       };
     }
+    let rebind: { readonly basis: string; readonly note: string } | undefined;
+    if (decision.rebind !== undefined) {
+      const derived =
+        stage.type === "review"
+          ? yield* FactoryRebind.derivePinRebind(
+              {
+                fs,
+                path,
+                insideRoot: insideArtifactRoot,
+                objectsAt: (input) =>
+                  gitReadback.objectsAt({ projectId: configuration.projectId, ...input }),
+              },
+              {
+                request: decision.rebind,
+                itemKey,
+                itemVersion: candidate.observation.itemVersion,
+                head: stage.head,
+                pinRoot: configuration.verification?.templateRoot,
+                artifactRoot: configuration.artifactRoot,
+                approvals: yield* outcomeStore.reservedDecisions(factoryId),
+              },
+            )
+          : {
+              what: "a pinned-input rebind derives only at a review, from the head it reviews",
+              actor: "project policy",
+              action: "propose the rebind on the review of the corrected head",
+              held: false,
+            };
+      if ("what" in derived) {
+        return {
+          disposition: "nothing_proposed",
+          detail: waitText({
+            issue: subject.issueNumber,
+            what: derived.what,
+            actor: derived.actor,
+            action: derived.action,
+            consequence: "the review does not start, and no pinned input is rebound",
+            resume: "a rebind T3 can derive and bound by the approved scope",
+          }),
+          reasonClass: derived.held ? "held" : "waiting",
+        };
+      }
+      rebind = derived;
+    }
     let grant: FactoryAdmissionRequest["grant"];
     let grantRetry = "";
     if (decision.requiresGrant !== undefined) {
@@ -5712,7 +5759,7 @@ const make = Effect.gen(function* () {
       grantRetry = recovered === undefined ? "" : `|grx:${recovered.failed}`;
     }
     // The binding and its output root are part of the decision: a changed one is another decision.
-    const notes = [bound?.note, noEdit?.note].filter((note) => note !== undefined);
+    const notes = [bound?.note, noEdit?.note, rebind?.note].filter((note) => note !== undefined);
     const text = [decision.packet.text, ...notes].join("\n\n");
     const packet =
       notes.length === 0 ? decision.packet : { ...decision.packet, text, sha256: sha256(text) };
@@ -5724,7 +5771,7 @@ const make = Effect.gen(function* () {
             stage: {
               type: stage.type,
               // The binding's output root stays last: the store reads it at the end.
-              basis: `${stageBasis(stage)}${environmentRetry}${resourceBasis(decision.resources)}${choiceBasis(decision)}${grantRetry}${noEdit?.basis ?? ""}${bound?.basis ?? ""}`,
+              basis: `${stageBasis(stage)}${environmentRetry}${resourceBasis(decision.resources)}${choiceBasis(decision)}${grantRetry}${rebind?.basis ?? ""}${noEdit?.basis ?? ""}${bound?.basis ?? ""}`,
             },
             ...(candidate.owner === undefined ? {} : { continues: candidate.owner.reservationId }),
             ...(grant === undefined ? {} : { grant }),
