@@ -12,6 +12,7 @@ import {
 } from "@t3tools/contracts";
 import { CurrentExecutionJoin, type JoinFor, JoinRefused } from "@t3tools/shared/ExecutionJoin";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import { SpawnExecutableResolution } from "@t3tools/shared/shell";
 import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
@@ -786,6 +787,44 @@ it.layer(
         manager.getShell({ threadId: "thread-1", terminalId: "setup-2" }),
       );
       assert.isTrue(Exit.isFailure(shell));
+    }),
+  );
+
+  it.effect("hands a container only a shell this host has, falling back like any terminal", () =>
+    Effect.gen(function* () {
+      const windowsPowerShell = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+      // A host without PowerShell 7: only Windows PowerShell resolves.
+      const onlyWindowsPowerShell = (command: string) =>
+        command.toLowerCase().endsWith("powershell.exe") ? windowsPowerShell : undefined;
+      const { manager, ptyAdapter } = yield* createManager(5, {
+        shellResolver: () => "pwsh.exe",
+        env: { SystemRoot: "C:\\Windows" },
+      }).pipe(Effect.provide(layerWithHostPlatform("win32")));
+      const members: Array<number> = [];
+      yield* manager
+        .open(openInput({ terminalId: "setup" }))
+        .pipe(
+          Effect.provideService(CurrentExecutionJoin, Option.some(generationJoin(members))),
+          Effect.provideService(SpawnExecutableResolution, onlyWindowsPowerShell),
+        );
+      expect(ptyAdapter.spawnInputs.map(({ shell, args }) => [shell, ...(args ?? [])])).toEqual([
+        ["join", windowsPowerShell, "-NoLogo"],
+      ]);
+      expect(members).toEqual([ptyAdapter.processes[0]!.pid]);
+
+      // No shell at all: nothing starts in the container rather than a helper that cannot start one.
+      yield* manager
+        .open(openInput({ terminalId: "setup-2" }))
+        .pipe(
+          Effect.provideService(CurrentExecutionJoin, Option.some(generationJoin(members))),
+          Effect.provideService(SpawnExecutableResolution, () => undefined),
+        );
+      const shell = yield* Effect.exit(
+        manager.getShell({ threadId: "thread-1", terminalId: "setup-2" }),
+      );
+      assert.isTrue(Exit.isFailure(shell));
+      expect(ptyAdapter.spawnInputs).toHaveLength(1);
+      expect(members).toHaveLength(1);
     }),
   );
 

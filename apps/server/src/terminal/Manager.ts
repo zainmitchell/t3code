@@ -40,7 +40,7 @@ import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import { AgentScope } from "@t3tools/shared/AgentScope";
 import { CurrentExecutionJoin, ExecutionJoin, JoinRefused } from "@t3tools/shared/ExecutionJoin";
 import * as HostProcess from "@t3tools/shared/HostProcess";
-import { mergePathEntries } from "@t3tools/shared/shell";
+import { mergePathEntries, SpawnExecutableResolution } from "@t3tools/shared/shell";
 
 import { acpRegistryManagedBinaryDirectories } from "@t3tools/provider-acp-registry/server";
 import { getTerminalLabel } from "@t3tools/shared/terminalLabels";
@@ -2417,9 +2417,27 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     const join = Option.isSome(carried)
       ? carried
       : yield* executionJoin.heldForThread(session.threadId);
+    // The container's helper starts whatever it is given, so a shell this host lacks would start
+    // the helper and end it at once, past the fallback below: it is handed only a resolved shell.
+    const contained = Option.isNone(join)
+      ? undefined
+      : (yield* SpawnExecutableResolution)(scoped.command, platform, spawnEnv);
+    if (Option.isSome(join) && contained === undefined) {
+      return yield* trySpawn(
+        shellCandidates,
+        spawnEnv,
+        session,
+        index + 1,
+        new PtyAdapter.PtySpawnError({
+          adapter: "terminal-manager",
+          attemptedShells: [formatShellCandidate(candidate)],
+          cause: `${scoped.command} not found`,
+        }),
+      );
+    }
     const ticket = Option.isNone(join)
       ? undefined
-      : yield* join.value(scoped.command, scoped.args).pipe(
+      : yield* join.value(contained ?? scoped.command, scoped.args).pipe(
           Effect.mapError(
             (cause) =>
               new PtyAdapter.PtySpawnError({
