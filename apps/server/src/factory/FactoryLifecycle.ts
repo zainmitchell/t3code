@@ -98,6 +98,7 @@ import { makeSwitchProvider } from "./factoryProviderSwitch.ts";
 import { decisionGuidance } from "./factoryDecisionGuidance.ts";
 import * as FactoryEffects from "./FactoryEffects.ts";
 import * as FactoryIntegrator from "./FactoryIntegrator.ts";
+import * as FactoryLandedCommands from "./FactoryLandedCommands.ts";
 import * as FactoryOperationStore from "./FactoryOperationStore.ts";
 import * as FactoryPreparedCriteriaStore from "./FactoryPreparedCriteriaStore.ts";
 import {
@@ -2206,6 +2207,7 @@ const make = Effect.gen(function* () {
     store: preparedCriteriaStore,
   });
   const integrator = yield* FactoryIntegrator.FactoryIntegrator;
+  const landedCommands = yield* FactoryLandedCommands.FactoryLandedCommands;
   const projectService = yield* ProjectService.ProjectService;
   const transfers = yield* FactoryTransferStore.FactoryTransferStore;
   const fence = yield* CommandJobFence.CommandJobFence;
@@ -3316,10 +3318,15 @@ const make = Effect.gen(function* () {
   ) {
     // T3's finished effects become outcomes, results are recovered and verified, and verified
     // stages settle, before anything new is decided; then every intended write gets its effect.
-    yield* nativeStages.recordOutcomes(factoryId);
+    yield* nativeStages.recordOutcomes(factoryId, configuration);
     yield* nativeStages.settleTicketCreates(factoryId);
     yield* outcomeOps.reconcile(factoryId);
     for (const operation of yield* operationStore.listIntended(factoryId)) {
+      if (operation.intent.kind === "landed_command") {
+        // Removing afterIntegration is the off switch: recorded commands wait, visible, until it returns.
+        if (configuration.afterIntegration !== undefined) yield* landedCommands.ensure(operation);
+        continue;
+      }
       // A ticket create already sent once moves only when its ticket is asked for again.
       if (operation.createPending !== undefined && operation.createdIssue === undefined) continue;
       yield* ensureOperation(operation);

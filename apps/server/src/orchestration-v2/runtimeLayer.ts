@@ -32,6 +32,7 @@ import * as FactoryClaimStore from "../factory/FactoryClaimStore.ts";
 import * as FactoryCommandPolicy from "../factory/FactoryCommandPolicy.ts";
 import * as FactoryEffects from "../factory/FactoryEffects.ts";
 import * as FactoryOperationStore from "../factory/FactoryOperationStore.ts";
+import * as FactoryLandedCommands from "../factory/FactoryLandedCommands.ts";
 import * as FactoryLifecycle from "../factory/FactoryLifecycle.ts";
 import * as FactoryStore from "../factory/FactoryStore.ts";
 import * as FactoryTransferStore from "../factory/FactoryTransferStore.ts";
@@ -436,6 +437,17 @@ const layerFactoryLifecycleProvided = FactoryLifecycle.layer.pipe(
       CommandJobFence.layer,
       FactoryTransferStore.layer,
       layerFactoryWakes,
+      // After-integration commands run in their own fibers, never in the effect worker.
+      FactoryLandedCommands.layer.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            ProcessRunner.layer,
+            FactoryOperationStore.layer,
+            FactoryStore.layer,
+            layerFactoryWakes,
+          ),
+        ),
+      ),
     ),
   ),
 );

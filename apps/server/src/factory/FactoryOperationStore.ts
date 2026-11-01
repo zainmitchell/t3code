@@ -63,6 +63,8 @@ export const FactoryOperationIntent = Schema.Union([
     /** The target's tip the integration was decided on; a moved target is not overwritten. */
     expected: Schema.String,
     reviewedHead: Schema.String,
+    /** The review_passed outcome this integration lands; absent on intents recorded before it was kept. */
+    reviewOutcomeId: Schema.optional(Schema.String),
     mode: Schema.Literals(["merge", "fast_forward"]),
     marker: Schema.String,
     message: Schema.String,
@@ -78,6 +80,8 @@ export const FactoryOperationIntent = Schema.Union([
     /** The branch the reviewed head is published to; its open pull request is this merge's. */
     head: Schema.String,
     reviewedHead: Schema.String,
+    /** The review_passed outcome this integration lands; absent on intents recorded before it was kept. */
+    reviewOutcomeId: Schema.optional(Schema.String),
     method: Schema.Literals(["merge", "squash", "rebase"]),
     /** Carried by the merge commit's message, so a lost answer is read back as ours. */
     marker: Schema.String,
@@ -87,6 +91,23 @@ export const FactoryOperationIntent = Schema.Union([
     acceptanceStatus: Schema.optional(
       Schema.Struct({ context: Schema.String, description: Schema.String }),
     ),
+  }),
+  /**
+   * The project's after-integration command for one recorded integration, pinned as it was
+   * configured then, with the exact native facts it reads on stdin. T3 reads nothing back from it:
+   * the command's own idempotence makes a replay after a restart safe.
+   */
+  Schema.Struct({
+    kind: Schema.Literal("landed_command"),
+    /** The integration outcome it follows. */
+    outcomeId: Schema.String,
+    command: Schema.Struct({
+      executable: Schema.String,
+      script: Schema.String,
+      sha256: Schema.String,
+      timeoutSeconds: Schema.Int,
+    }),
+    input: Schema.String,
   }),
 ]);
 export type FactoryOperationIntent = typeof FactoryOperationIntent.Type;
@@ -131,6 +152,13 @@ export const FactoryOperationReceipt = Schema.Union([
     /** `external`: someone else merged the pull request at the reviewed head. */
     attribution: Schema.Literals(["operation", "external"]),
   }),
+  Schema.Struct({
+    kind: Schema.Literal("landed_command"),
+    exitCode: Schema.Int,
+    stdoutDigest: Schema.String,
+    /** The command's last stdout line, when it is a JSON object of at most 4 KB. */
+    result: Schema.optional(Schema.String),
+  }),
 ]);
 export type FactoryOperationReceipt = typeof FactoryOperationReceipt.Type;
 
@@ -142,6 +170,8 @@ const Fields = {
   createdAt: Schema.String,
   /** Why the last attempt did not end it, as the factory's state shows it: `wait`, rendered. */
   lastError: Schema.optional(Schema.String),
+  /** When a command that asked to run later is due again; kept so a restart honors it. */
+  retryAt: Schema.optional(Schema.String),
   wait: Schema.optional(OperationWait),
   /**
    * The issue a `tracker_create_issue` created, recorded as soon as it is known: later attempts
@@ -275,6 +305,7 @@ export class FactoryOperationStore extends Context.Service<
       readonly operationId: string;
       readonly wait: Omit<OperationWait, "since">;
       readonly text: string;
+      readonly retryAt?: string;
     }) => Effect.Effect<boolean, FactoryOperationStoreError>;
     /**
      * Records the issue an intended operation created; the first one recorded stays. Returns the
@@ -519,6 +550,7 @@ const make = Effect.gen(function* () {
         readonly operationId: string;
         readonly wait: Omit<OperationWait, "since">;
         readonly text: string;
+        readonly retryAt?: string;
       }) {
         const at = DateTime.formatIso(yield* DateTime.now);
         const text = redact(input.text);
@@ -531,9 +563,16 @@ const make = Effect.gen(function* () {
         const written = yield* amend(input.operationId, (current) => {
           const previous = current.wait;
           const same = previous?.basis === wait.basis && previous.kind === wait.kind;
-          if (same && current.lastError === text) return undefined;
+          if (same && current.lastError === text && current.retryAt === input.retryAt) {
+            return undefined;
+          }
           const since = same ? previous.since : at;
-          return { ...current, lastError: text, wait: { ...wait, since } };
+          return {
+            ...current,
+            lastError: text,
+            wait: { ...wait, since },
+            ...(input.retryAt === undefined ? {} : { retryAt: input.retryAt }),
+          };
         });
         return Option.isSome(written);
       },

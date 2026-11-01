@@ -32,7 +32,7 @@ export const makeBookkeeping =
       const intended = new Set<string>();
       for (const operation of yield* deps.operations.forItem(input)) {
         const { intent } = operation;
-        if (intent.kind === "git_integrate") continue;
+        if (intent.kind === "git_integrate" || intent.kind === "landed_command") continue;
         if (operation.state === "applied" && "commentId" in operation.receipt) {
           written.add(`${operation.receipt.commentId}:${operation.receipt.bodyDigest}`);
         }

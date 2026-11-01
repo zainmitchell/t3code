@@ -147,6 +147,20 @@ export const FactoryConfigurationInput = Schema.Struct({
       sha256: Bounded,
     }),
   ),
+  /**
+   * The project's command T3 runs once for each integration it records, such as building the
+   * development app from the exact merged commit: pinned by content, run without a shell from its
+   * own directory, fed the landing's native facts on stdin and never tracker text. Exit 0 records
+   * it done, 75 runs it again a minute later, anything else fails it. Absent, nothing runs.
+   */
+  afterIntegration: Schema.optional(
+    Schema.Struct({
+      executable: TrimmedNonEmptyString,
+      script: TrimmedNonEmptyString,
+      sha256: Bounded,
+      timeoutSeconds: PositiveInt.check(Schema.isLessThanOrEqualTo(7_200)),
+    }),
+  ),
   /** How often the server reconciles the factory on its own; absent, only triggers do. */
   reconcileEveryMinutes: Schema.optional(PositiveInt),
   /**

@@ -321,6 +321,18 @@ const make = Effect.gen(function* () {
     | ProjectService.ProjectOperationError
   > {
     const { intent } = operation;
+    if (intent.kind === "landed_command") {
+      return {
+        state: "held",
+        reason: "an after-integration command runs from the factory pass, not the effect worker",
+        wait: dependency({
+          actor: "T3",
+          action: "run it from the next factory pass",
+          resume: "the pass hands it to FactoryLandedCommands",
+          facts: ["landed_command", operation.operationId],
+        }),
+      };
+    }
     if (intent.kind === "git_integrate") {
       const project = yield* projects.getById(intent.projectId);
       if (Option.isNone(project)) {
@@ -488,6 +500,8 @@ const make = Effect.gen(function* () {
     function* (operationId: string) {
       const operation = yield* operations.get(operationId);
       if (Option.isNone(operation) || operation.value.state !== "intended") return;
+      // After-integration commands run outside the effect worker (FactoryLandedCommands).
+      if (operation.value.intent.kind === "landed_command") return;
       const intended = operation.value;
       const attempted = yield* Effect.result(attempt(intended));
       const completion = Result.isSuccess(attempted) ? attempted.success : undefined;

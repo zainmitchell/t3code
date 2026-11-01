@@ -9,6 +9,7 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 
 import type * as ProjectService from "../project/ProjectService.ts";
 import type * as FactoryIntegrator from "./FactoryIntegrator.ts";
@@ -44,6 +45,14 @@ export const isCorrectable = (reason: string) =>
 
 const isIntegration = (intent: FactoryOperationStore.FactoryOperationIntent) =>
   intent.kind === "git_integrate" || intent.kind === "pull_request_merge";
+
+/** The one after-integration command operation an integration outcome gets. */
+export const landedOperationId = (factoryId: FactoryId, outcomeId: string) =>
+  `landed:${sha256(canonical([factoryId, outcomeId])).slice(0, 40)}`;
+
+/** What an after-integration command reads on stdin: native facts only, never tracker text. */
+export const LANDED_INPUT_SCHEMA = "t3-factory-landed/1";
+const encodeLandedInput = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
 export type NativeStagePlan =
   | { readonly type: "in_flight"; readonly operationId: string }
@@ -310,6 +319,7 @@ export const makeNativeStages = (deps: NativeStageDependencies) => {
             // T3's own branch: one a worker reports is never a push target (main, say).
             head: `t3-factory/${configuration.factoryId}/${issue.issueNumber}`,
             reviewedHead: stage.head,
+            reviewOutcomeId: stage.reviewOutcomeId,
             method: integration.method,
             // The stored marker keeps a recovery from a refused create read-only across restarts.
             marker: `${acknowledging ? ACKNOWLEDGEMENT_MARKER : "T3-Factory-Operation: "}${operationId}`,
@@ -362,6 +372,7 @@ export const makeNativeStages = (deps: NativeStageDependencies) => {
           remote: integration.remote,
           expected,
           reviewedHead: stage.head,
+          reviewOutcomeId: stage.reviewOutcomeId,
           mode: integration.mode,
           marker,
           message: [
@@ -570,13 +581,73 @@ export const makeNativeStages = (deps: NativeStageDependencies) => {
       : { type: "in_flight", operationId };
   });
 
+  /**
+   * The configured after-integration command for an integration T3 proved landed: one intent per
+   * outcome, recorded before that outcome so a crash between the two still runs it. It gets no
+   * outbox effect; each pass hands every intended one to FactoryLandedCommands instead, so a long
+   * build never holds an effect worker.
+   */
+  const intendLanded = Effect.fnUntraced(function* (
+    configuration: FactoryStore.FactoryConfiguration | undefined,
+    operation: FactoryOperationStore.FactoryOperation,
+    outcomeId: string,
+    integration: NonNullable<FactoryOutcomeStore.FactoryOutcomeReport["integration"]>,
+  ) {
+    const command = configuration?.afterIntegration;
+    const { intent } = operation;
+    if (
+      command === undefined ||
+      (intent.kind !== "git_integrate" && intent.kind !== "pull_request_merge")
+    ) {
+      return;
+    }
+    const operationId = landedOperationId(operation.factoryId, outcomeId);
+    const input = encodeLandedInput({
+      schema: LANDED_INPUT_SCHEMA,
+      factoryId: operation.factoryId,
+      itemKey: operation.itemKey,
+      outcomeId,
+      operationId,
+      subject: subjectOf(operation.itemKey) ?? null,
+      configurationRevision: configuration?.revision ?? null,
+      policyRevision: configuration?.policyRevision ?? null,
+      review: { outcomeId: intent.reviewOutcomeId ?? null, head: intent.reviewedHead },
+      integration: {
+        targetBranch: integration.targetBranch,
+        remote: intent.remote,
+        mergeCommit: integration.mergeCommit,
+        parents: integration.parents,
+        tree: integration.tree,
+        attribution: integration.attribution,
+        ...(integration.pullRequest === undefined ? {} : { pullRequest: integration.pullRequest }),
+      },
+    });
+    yield* operations.intend({
+      operationId,
+      factoryId: operation.factoryId,
+      itemKey: operation.itemKey,
+      intent: {
+        kind: "landed_command",
+        outcomeId,
+        command: {
+          executable: command.executable,
+          script: command.script,
+          sha256: command.sha256,
+          timeoutSeconds: command.timeoutSeconds,
+        },
+        input,
+      },
+    });
+  });
+
   /** Ended integrations, closures and ticket creations become the outcomes their readback proved. */
   const recordOutcomes = Effect.fn("FactoryLifecycle.recordNativeOutcomes")(function* (
     factoryId: FactoryId,
+    configuration?: FactoryStore.FactoryConfiguration,
   ) {
     for (const operation of yield* operations.listEnded(factoryId)) {
       const { intent } = operation;
-      if (intent.kind === "tracker_comment") continue;
+      if (intent.kind === "tracker_comment" || intent.kind === "landed_command") continue;
       const outcomeId = `native:${operation.operationId}`;
       if (Option.isSome(yield* outcomes.get(outcomeId))) continue;
       if (intent.kind === "tracker_create_issue") {
@@ -633,6 +704,9 @@ export const makeNativeStages = (deps: NativeStageDependencies) => {
         report = { outcome: "failed", failure: operation.reason, summary: "Integration failed." };
       }
       if (report === undefined) continue;
+      if (report.integration !== undefined) {
+        yield* intendLanded(configuration, operation, outcomeId, report.integration);
+      }
       yield* outcomes.insertReported({
         outcomeId,
         factoryId,
