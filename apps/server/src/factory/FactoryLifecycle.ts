@@ -3013,7 +3013,10 @@ const make = Effect.gen(function* () {
         FactoryClaimStore.PREPARATION_HOLD_REASONS.has(claim.reason)
       ) {
         const [obligation] = yield* store.openWorkspaceObligations(claim.reservationId);
-        if (obligation === undefined) continue;
+        if (obligation === undefined) {
+          yield* releaseFailedPreparationHold(claim);
+          continue;
+        }
         const recoveryCommandId = CommandId.make(`factory-recovery-check:${obligation.runId}`);
         const checking = (yield* outbox.listByCommandId(recoveryCommandId)).some(
           (effect) => effect.status === "pending" || effect.status === "running",
@@ -4722,6 +4725,84 @@ const make = Effect.gen(function* () {
       return undefined;
     }
     return { message, failedAt: DateTime.toEpochMillis(run.completedAt) };
+  });
+
+  /**
+   * A claim held only because its own run's workspace preparation failed returns to that spent
+   * run once T3 verified that failure as its own missing result, the run proves it ended before
+   * any provider turn, and the claim is still the item's only one, by its configured account, as
+   * the tracker was last read. The item stays this factory's; a later stage is a new decision.
+   */
+  const releaseFailedPreparationHold = Effect.fnUntraced(function* (
+    claim: FactoryClaimStore.FactoryClaimRecord,
+  ) {
+    if (claim.state !== "stale_after_claim" || claim.reason !== "workspace_preparation_failed") {
+      return;
+    }
+    const reservation = Option.flatten(
+      yield* store.getReservation(claim.reservationId).pipe(Effect.option),
+    );
+    if (
+      Option.isNone(reservation) ||
+      reservation.value.origin !== "admitted" ||
+      reservation.value.state !== "released" ||
+      reservation.value.itemKey !== claim.itemKey
+    ) {
+      return;
+    }
+    const missing = (yield* outcomeStore.listForOrigin(claim.reservationId)).find(
+      (outcome) =>
+        outcome.state === "verified" &&
+        outcome.origin.type === "native" &&
+        outcome.origin.reservationId === claim.reservationId &&
+        outcome.report.failureClass === "environment",
+    );
+    if (missing === undefined) return;
+    if ((yield* workspacePreparationFailure({ outcomeId: missing.outcomeId })) === undefined)
+      return;
+    const configuration = yield* store.getConfiguration(claim.factoryId);
+    const entry = yield* claims.get(claim.reservationId);
+    const receipt = Option.isNone(entry)
+      ? undefined
+      : entry.value.attempts.find((attempt) => attempt.phase === "verified");
+    if (
+      Option.isNone(configuration) ||
+      configuration.value.claim === undefined ||
+      receipt === undefined ||
+      receipt.accountId !== configuration.value.claim.accountId
+    ) {
+      return;
+    }
+    const latest = (yield* store.observationsAfter({
+      factoryId: claim.factoryId,
+      observationId: claim.admitted.observationId,
+    })).at(-1);
+    if (
+      latest === undefined ||
+      !latest.complete ||
+      latest.claims.length !== 1 ||
+      latest.claims[0]!.carrierKey !== claim.carrierKey
+    ) {
+      return;
+    }
+    const runId = reservation.value.execution.runId;
+    yield* sql.withTransaction(
+      Effect.gen(function* () {
+        if ((yield* store.openWorkspaceObligations(claim.reservationId)).length > 0) return;
+        const holders = (yield* claims.list(claim.factoryId)).filter(
+          (other) =>
+            other.itemKey === claim.itemKey &&
+            other.reservationId !== claim.reservationId &&
+            other.state !== "released",
+        );
+        if (holders.length > 0) return;
+        yield* claims.recoverPreparation({
+          reservationId: claim.reservationId,
+          runId,
+          carrierKey: claim.carrierKey,
+        });
+      }),
+    );
   });
 
   const closeParent = Effect.fnUntraced(function* (

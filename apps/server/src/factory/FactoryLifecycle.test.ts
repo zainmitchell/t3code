@@ -18386,6 +18386,223 @@ it.effect(
     ),
 );
 
+/** The item's claims as reservation, state, reason and carrier: its build's is its only one. */
+const itemClaims = Effect.gen(function* () {
+  const claims = yield* FactoryClaimStore.FactoryClaimStore;
+  return (yield* claims.list(factoryId)).map((claim) => [
+    claim.reservationId,
+    claim.state,
+    "reason" in claim ? claim.reason : null,
+    "carrierKey" in claim ? claim.carrierKey : null,
+  ]);
+});
+
+/** A build, which makes its item's claim, bound to a worktree whose setup fails before its agent. */
+const buildSetupFails = (issueNumber: number, run: ReturnType<typeof serverRun>) =>
+  Effect.gen(function* () {
+    yield* configureLifecycleFactory;
+    yield* usePolicy((input: ProposeInput) =>
+      Effect.map(stageRequest(input), (decision) =>
+        decision !== undefined && "taskKind" in decision
+          ? { ...decision, workspaceStrategy: { type: "worktree" as const, baseRef: "main" } }
+          : decision,
+      ),
+    );
+    yield* seedIssue(issueNumber);
+    yield* setupEndsWithoutExitCode(yield* FactoryWorkspace);
+    const build = admittedBy(yield* inServerRun(run, advance("tracker_event", 1)));
+    assert.deepStrictEqual(stageOf(build), [itemKeyFor(issueNumber), "implement"]);
+    // Its own preparation failed: the claim is held, as a lost or failed preparation's is.
+    const [held] = yield* itemClaims;
+    assert.deepStrictEqual(held?.slice(0, 3), [
+      build.reservation.reservationId,
+      "stale_after_claim",
+      "workspace_preparation_failed",
+    ]);
+    return { build, carrierKey: held![3] };
+  });
+
+it.effect(
+  "Environment/startup: a build whose workspace preparation failed before its agent started stays this factory's: it waits in that server run and runs once in a later one, under its own claim",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const item = itemKeyFor(7961);
+          const first = serverRun("f", 0);
+          const { build, carrierKey } = yield* buildSetupFails(7961, first);
+          const owning = [
+            [build.reservation.reservationId, "workspace_authorized", null, carrierKey],
+          ];
+          yield* inServerRun(first, startsNothing);
+          assert.deepStrictEqual(yield* itemHistory(7961), ["implement", "failed"]);
+          assert.strictEqual((yield* startedTurns).length, 0);
+          // The claim is back on its spent run, once, however passes race over it.
+          assert.deepStrictEqual(yield* itemClaims, owning);
+          assert.deepStrictEqual(yield* inServerRun(first, concurrentPasses), []);
+          assert.deepStrictEqual(yield* itemClaims, owning);
+          // Still this factory's item: it waits on its workspace preparation, not on its owner.
+          const waiting = yield* recordOf(7961);
+          assert.deepStrictEqual(
+            [waiting?.disposition, waiting?.reasonClass],
+            ["nothing_proposed", "awaiting_environment"],
+            waiting?.detail,
+          );
+          assert.include(waiting?.detail ?? "", "workspace preparation");
+          assert.deepStrictEqual(yield* inServerRun(first, restartedPass), []);
+
+          // A later server run builds once more, as a new decision under the claim it holds.
+          const second = yield* laterServerRun("g");
+          const [retry, ...others] = yield* inServerRun(second, concurrentPasses);
+          assert.deepStrictEqual(others, []);
+          assert.deepStrictEqual(stageOf(retry!), [item, "implement"]);
+          assert.strictEqual(
+            retry!.reservation.origin === "admitted" ? retry!.reservation.continues : undefined,
+            build.reservation.reservationId,
+          );
+          assert.deepStrictEqual(yield* itemClaims, owning);
+          yield* inServerRun(second, startsNothing);
+          assert.isTrue(yield* waitsOnEnvironment(7961));
+
+          // Preparation is repaired: the next run's build starts, reports, and is reviewed.
+          (yield* PreparationFake).setup = { status: "no-script" };
+          const third = yield* laterServerRun("h");
+          const repaired = admittedBy(yield* inServerRun(third, advance("clock", 1)));
+          assert.deepStrictEqual(stageOf(repaired), [item, "implement"]);
+          yield* recordCommit("e0007961", [lifecycleBase]);
+          yield* inServerRun(
+            third,
+            workStage(repaired, {
+              outcome: "implemented",
+              subject: subjectFor("e0007961", lifecycleBase),
+              summary: "Built once its workspace could be prepared.",
+            }),
+          );
+          assert.deepStrictEqual(
+            stageOf(admittedBy(yield* inServerRun(third, advance("outcome")))),
+            [item, "review"],
+          );
+          assert.deepStrictEqual(yield* itemClaims, owning);
+          assert.notInclude(yield* itemHistory(7961), "correct");
+        }),
+      ),
+    ),
+);
+
+it.effect.each([
+  "workspace_preparation_unknown",
+  "workspace_preparation_cancelled",
+  "source_changed",
+  "own_claim_missing",
+] as const)(
+  "Environment/startup: a build's claim held for %s stays held: no later server run builds it",
+  (reason) =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const first = serverRun("i", 0);
+          const { build, carrierKey } = yield* buildSetupFails(7962, first);
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`
+            UPDATE factory_claims
+            SET record_json = json_set(record_json, '$.reason', ${reason})
+            WHERE reservation_id = ${build.reservation.reservationId}
+          `;
+          const held = [[build.reservation.reservationId, "stale_after_claim", reason, carrierKey]];
+          yield* inServerRun(first, startsNothing);
+          const later = yield* laterServerRun("j");
+          assert.deepStrictEqual(yield* inServerRun(later, advance("clock", 3)), []);
+          assert.deepStrictEqual(yield* inServerRun(later, restartedPass), []);
+          assert.strictEqual(yield* dispositionOf(7962), "not_owned");
+          assert.deepStrictEqual(yield* itemClaims, held);
+          assert.strictEqual((yield* startedTurns).length, 0);
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Environment/startup: a failed build's claim the tracker no longer shows stays held: no later server run builds it",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const first = serverRun("k", 0);
+          const { build, carrierKey } = yield* buildSetupFails(7963, first);
+          const issue = (yield* GitHubFake).issues.get(issueKey(claimRepository, 7963))!;
+          issue.comments = issue.comments.filter(
+            (comment) => !comment.body.includes("Claimed by T3 Code"),
+          );
+          yield* inServerRun(first, startsNothing);
+          const later = yield* laterServerRun("l");
+          assert.deepStrictEqual(yield* inServerRun(later, advance("clock", 3)), []);
+          assert.strictEqual(yield* dispositionOf(7963), "not_owned");
+          assert.deepStrictEqual(yield* itemClaims, [
+            [
+              build.reservation.reservationId,
+              "stale_after_claim",
+              "workspace_preparation_failed",
+              carrierKey,
+            ],
+          ]);
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Environment/startup (R2-S04): the spent run a failed build's claim returns to never prepares again",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const first = serverRun("m", 0);
+          const { build } = yield* buildSetupFails(7964, first);
+          yield* inServerRun(first, startsNothing);
+          const owning = yield* itemClaims;
+          assert.strictEqual(owning[0]?.[1], "workspace_authorized");
+          const preparation = yield* PreparationFake;
+          preparation.setup = { status: "no-script" };
+          const worktrees = preparation.worktrees.length;
+          // An ordinary retry of the spent run, as a client sends it.
+          const execution = admittedExecution(build);
+          const run = yield* claimedRunOf(execution);
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const afterSequence = yield* orchestrator.getThreadEventSequence(execution.threadId);
+          yield* Effect.exit(
+            (yield* ThreadLaunchService.ThreadLaunchService).retryPreparation({
+              commandId: CommandId.make(`command:retry:${run.id}`),
+              threadId: execution.threadId,
+              runId: run.id,
+            }),
+          );
+          if ((yield* claimedRunOf(execution)).status === "preparing") {
+            yield* orchestrator
+              .streamStoredEventsFrom({
+                threadId: execution.threadId,
+                afterSequence,
+                eventType: "run.updated",
+              })
+              .pipe(
+                Stream.filter(
+                  (stored) =>
+                    stored.event.type === "run.updated" &&
+                    stored.event.payload.id === run.id &&
+                    stored.event.payload.status !== "preparing",
+                ),
+                Stream.runHead,
+              );
+          }
+          yield* runEffects;
+          assert.strictEqual(preparation.worktrees.length, worktrees);
+          assert.strictEqual((yield* startedTurns).length, 0);
+          assert.strictEqual((yield* claimedRunOf(execution)).status, "failed");
+          assert.deepStrictEqual(yield* itemClaims, owning);
+        }),
+      ),
+    ),
+);
+
 it.effect.each(["runtime", "owner"] as const)(
   "Environment/#107: a correction that failed in its environment, run again after a %s repair, still corrects its failure",
   (repair) =>
