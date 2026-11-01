@@ -1886,6 +1886,13 @@ class GrantIssueFault extends Context.Service<GrantIssueFault, Ref.Ref<boolean>>
 
 const layerGrantIssueFault = Layer.effect(GrantIssueFault, Ref.make(false));
 
+/** How often the store was asked for an item's observation history. */
+class ObservationScans extends Context.Service<ObservationScans, Ref.Ref<number>>()(
+  "t3/factory/FactoryLifecycle.test/ObservationScans",
+) {}
+
+const layerObservationScans = Layer.effect(ObservationScans, Ref.make(0));
+
 /** Arms the next write of a binding record to stop partway, as a crash or a full disk leaves it. */
 class RecordWriteFault extends Context.Service<RecordWriteFault, Ref.Ref<boolean>>()(
   "t3/factory/FactoryLifecycle.test/RecordWriteFault",
@@ -1963,8 +1970,14 @@ const layerFaultableStore = Layer.effect(
     const store = yield* FactoryStore.FactoryStore;
     const fault = yield* GrantIssueFault;
     const lookups = yield* AdmissionLookups;
+    const scans = yield* ObservationScans;
     return FactoryStore.FactoryStore.of({
       ...store,
+      observationsAfter: (input) =>
+        Effect.andThen(
+          Ref.update(scans, (n) => n + 1),
+          store.observationsAfter(input),
+        ),
       findAdmission: (input) =>
         Effect.suspend(() =>
           lookups.before === undefined
@@ -2033,6 +2046,7 @@ const makeLayerTest = (options: TestRuntimeOptions = {}) => {
       Layer.provideMerge(layerScriptedPendingWork),
       Layer.provideMerge(layerDecisionReadHold),
       Layer.provideMerge(layerGrantIssueFault),
+      Layer.provideMerge(layerObservationScans),
       Layer.provideMerge(layerRecordWriteFault),
       Layer.provideMerge(layerAdmissionLookups),
       Layer.provideMerge(Layer.fresh(SqlitePersistence.layerMemory)),
@@ -18661,6 +18675,31 @@ it.effect(
           assert.strictEqual((yield* startedTurns).length, 0);
           assert.strictEqual((yield* claimedRunOf(execution)).status, "failed");
           assert.deepStrictEqual(yield* itemClaims, owning);
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Environment/startup: a held claim is judged on this pass's read, never by scanning the item's observation history",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const first = serverRun("n", 0);
+          const { build } = yield* buildSetupFails(7965, first);
+          // Our claim comment is gone from the tracker: the hold can never be released, so every
+          // pass re-judges it. Each judgement must cost one lookup, not the item's whole history.
+          const issue = (yield* GitHubFake).issues.get(issueKey(claimRepository, 7965))!;
+          issue.comments = issue.comments.filter((c) => !c.body.includes("Claimed by T3 Code"));
+          yield* inServerRun(first, startsNothing);
+          const scans = yield* ObservationScans;
+          yield* Ref.set(scans, 0);
+          const later = yield* laterServerRun("o");
+          assert.deepStrictEqual(admittedOnly(yield* inServerRun(later, advance("clock", 4))), []);
+          assert.strictEqual(yield* Ref.get(scans), 0);
+          assert.strictEqual((yield* itemClaims)[0]?.[0], build.reservation.reservationId);
+          assert.strictEqual(yield* dispositionOf(7965), "not_owned");
         }),
       ),
     ),
