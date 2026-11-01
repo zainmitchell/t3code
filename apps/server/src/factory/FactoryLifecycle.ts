@@ -655,8 +655,8 @@ export interface FactoryPolicyActive {
   readonly custody: "native" | "legacy" | "foreign";
   readonly issue: TrackerIssue;
   /**
-   * The writes its running native admissions recorded, when every one of them recorded writes; absent
-   * otherwise, so a policy keeps the item's own declared unit as its lane and widens nothing.
+   * The writes its running native admissions recorded, when every one of them recorded writes. Absent
+   * means T3 does not know the running scope: a policy relying on `active-writes` treats it as unknown.
    */
   readonly writes?: ReadonlyArray<string>;
 }

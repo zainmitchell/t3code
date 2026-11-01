@@ -366,7 +366,10 @@ export const policyInput = (
   schema: "t3-factory-policy-input/2",
   factoryId: input.configuration.factoryId,
   policyRevision: input.configuration.policyRevision,
-  /** Facts this T3 supplies; `active-writes`: every running native admission shows the writes it recorded. */
+  /**
+   * Facts this T3 supplies. `active-writes`: a running native item shows its recorded writes, or none
+   * when any of its running admissions recorded none, which means its scope is unknown, never narrow.
+   */
   capabilities: ["active-writes"],
   items: input.items.map((item) => ({
     decisionKey: item.decisionKey,
