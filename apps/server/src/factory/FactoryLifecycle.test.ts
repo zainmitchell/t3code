@@ -26787,3 +26787,31 @@ it.effect(
       ),
     ),
 );
+
+it("Grant/E2: the retry marker is read only where the lifecycle writes it, before the no-edit and binding suffixes", () => {
+  const a = "a".repeat(32);
+  const b = "b".repeat(32);
+  const cases: ReadonlyArray<readonly [string | undefined, string | undefined]> = [
+    [undefined, undefined],
+    ["implement", undefined],
+    ["implement|res:ocr|exe:builder", undefined],
+    ["implement|grx:reservation:r1", "reservation:r1"],
+    [
+      "implement:env:0123456789ab:" + "d".repeat(32) + "|res:ocr|exe:builder|grx:reservation:r1",
+      "reservation:r1",
+    ],
+    [`rework:o1|grx:reservation:r1|ne:${a}|vb:${a}|out:${b}`, "reservation:r1"],
+    [`rework:o1|grx:reservation:r1|rb:${a}|ne:${a}`, "reservation:r1"],
+    // The reviewer's probe: after the binding pair it is no retry the lifecycle wrote.
+    [`implement:v|vb:${a}|out:${b}|grx:reservation:r1`, "malformed"],
+    ["implement|grx:reservation:r1|zz:unknown", "malformed"],
+    ["implement|zz:unknown|grx:reservation:r1", "malformed"],
+    [`rework:o1|grx:reservation:r1|out:${b}|vb:${a}`, "malformed"],
+    ["implement|grx:reservation:r1|grx:reservation:r2", "malformed"],
+    ["implement|grx:", "malformed"],
+    ["implement|grx:has space", "malformed"],
+  ];
+  for (const [basis, expected] of cases) {
+    assert.strictEqual(FactoryStore.grantRetryOf(basis), expected, basis);
+  }
+});

@@ -1102,14 +1102,22 @@ const decodeReservation = Schema.decodeUnknownEffect(ReservationJson);
  * unprintable value. A malformed basis funds nothing.
  */
 export const grantRetryOf = (stageBasis: string | undefined) => {
-  const named = (stageBasis ?? "")
-    .split("|")
-    .slice(1)
-    .filter((suffix) => suffix.startsWith("grx:"))
-    .map((suffix) => suffix.slice("grx:".length));
-  if (named.length === 0) return undefined;
-  return named.length === 1 && /^[\x21-\x7e]+$/.test(named[0]!)
-    ? named[0]!
+  const suffixes = (stageBasis ?? "").split("|").slice(1);
+  const at = suffixes.findIndex((suffix) => suffix.startsWith("grx:"));
+  if (at === -1) return undefined;
+  const key = (suffix: string) => suffix.slice(0, suffix.indexOf(":") + 1);
+  // Only a resource or execution choice precedes it; only these, in this order, may follow it.
+  const after = ["rb:", "ne:", "vb:", "out:"];
+  const later = suffixes.slice(at + 1).map(key);
+  const value = suffixes[at]!.slice("grx:".length);
+  return suffixes.slice(0, at).every((suffix) => ["res:", "exe:"].includes(key(suffix))) &&
+    later.every(
+      (name, index) =>
+        after.includes(name) &&
+        (index === 0 || after.indexOf(later[index - 1]!) < after.indexOf(name)),
+    ) &&
+    /^[\x21-\x7e]+$/.test(value)
+    ? value
     : ("malformed" as const);
 };
 const encodeObservation = Schema.encodeEffect(ObservationJson);
