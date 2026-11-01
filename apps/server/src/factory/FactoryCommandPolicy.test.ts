@@ -342,7 +342,7 @@ it("Policy input: each item's relations and the work under way reach the policy 
       },
     ],
   });
-  assert.deepStrictEqual(input.capabilities, ["active-writes"]);
+  assert.deepStrictEqual(input.capabilities, ["active-writes", "pin-rebind"]);
   assert.deepStrictEqual(
     input.active.map((entry) => ("writes" in entry ? entry.writes : "absent")),
     [["src/dates.py", "src/io.py", "src/zones.py"], "absent"],
@@ -368,7 +368,7 @@ it("Policy input: each item's relations and the work under way reach the policy 
   );
   assert.include(input.active[0]!.item.body, "src/io.py");
   // T3 names what it derives itself, so a policy never asks a build that would drop the request.
-  assert.deepStrictEqual(input.capabilities, ["pin-rebind"]);
+  assert.deepStrictEqual(input.capabilities, ["active-writes", "pin-rebind"]);
 });
 
 it("Policy input: closed blockers carry their outcomes as facts; other items are unchanged", () => {

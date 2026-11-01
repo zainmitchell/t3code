@@ -27059,7 +27059,7 @@ it.effect(
           // Windows uses a mount point; the POSIX fixture uses a directory symlink.
           assert.strictEqual(
             NodeFS.lstatSync(alias).isSymbolicLink(),
-            process.platform !== "win32",
+            (yield* HostProcess.Platform) !== "win32",
           );
           assert.strictEqual(
             yield* fs.readFileString(path.join(alias, "units.json")),

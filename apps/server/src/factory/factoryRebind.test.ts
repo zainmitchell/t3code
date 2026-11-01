@@ -5,6 +5,7 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -264,7 +265,7 @@ it.layer(NodeServices.layer)("factoryRebind", (it) => {
             // Windows uses a mount point; the POSIX fixture uses a directory symlink.
             assert.strictEqual(
               NodeFS.lstatSync(NodePath.join(fixture.pinRoot, "alias")).isSymbolicLink(),
-              process.platform !== "win32",
+              (yield* HostProcess.Platform) !== "win32",
             );
           }
           if (link !== "final") {
