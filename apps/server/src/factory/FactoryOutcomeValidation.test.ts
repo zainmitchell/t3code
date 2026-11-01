@@ -1279,3 +1279,63 @@ it.effect(
       );
     }),
 );
+
+/** A repository whose head carries a text file, a nested text file, a link, a binary file and a renamed path. */
+const objectsRepository = Effect.acquireRelease(
+  Effect.sync(() => {
+    const cwd = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-factory-objects-"));
+    gitCli(cwd, "init", "-q", "-b", "main");
+    NodeFS.mkdirSync(NodePath.join(cwd, "btclink", "route"), { recursive: true });
+    NodeFS.writeFileSync(NodePath.join(cwd, "btclink", "route", "run.py"), "print('run')\n");
+    NodeFS.writeFileSync(NodePath.join(cwd, "with space.txt"), "spaced\n");
+    NodeFS.writeFileSync(NodePath.join(cwd, "binary.bin"), Buffer.from([0x89, 0x50, 0x00, 0x47]));
+    gitCli(cwd, "add", "-A");
+    // A symbolic-link object without creating a link on the host.
+    const blob = NodeChildProcess.execFileSync("git", ["hash-object", "-w", "--stdin"], {
+      cwd,
+      input: "../target",
+      encoding: "utf8",
+    }).trim();
+    gitCli(cwd, "update-index", "--add", "--cacheinfo", `120000,${blob},link.py`);
+    gitCli(cwd, "commit", "-q", "-m", "objects");
+    return {
+      cwd,
+      head: gitCli(cwd, "rev-parse", "HEAD"),
+      tree: gitCli(cwd, "rev-parse", "HEAD^{tree}"),
+    };
+  }),
+  ({ cwd }) => Effect.sync(() => NodeFS.rmSync(cwd, { recursive: true, force: true })),
+);
+
+it.live(
+  "E1: reads each pinned path at a commit as a hashed text blob, or names why it is not one",
+  () =>
+    Effect.gen(function* () {
+      const repository = yield* objectsRepository;
+      yield* Effect.gen(function* () {
+        const git = yield* FactoryGitReadback.FactoryGitReadback;
+        const read = yield* git.objectsAt({
+          projectId: configuration.projectId,
+          commit: repository.head,
+          paths: ["btclink/route/run.py", "with space.txt", "binary.bin", "link.py", "absent.py"],
+        });
+        const sha256 = (text: string) => NodeCrypto.createHash("sha256").update(text).digest("hex");
+        assert.strictEqual(read.tree, repository.tree);
+        assert.deepStrictEqual(read.objects, [
+          { path: "btclink/route/run.py", kind: "blob", sha256: sha256("print('run')\n") },
+          { path: "with space.txt", kind: "blob", sha256: sha256("spaced\n") },
+          { path: "binary.bin", kind: "other" },
+          { path: "link.py", kind: "link" },
+          { path: "absent.py", kind: "missing" },
+        ]);
+        const unknown = yield* git
+          .objectsAt({ projectId: configuration.projectId, commit: "0".repeat(40), paths: ["x"] })
+          .pipe(Effect.result);
+        assert.strictEqual(
+          unknown._tag,
+          "Failure",
+          "an unknown commit is an error, never 'missing'",
+        );
+      }).pipe(Effect.provide(layerReadback(repository.cwd)));
+    }).pipe(Effect.scoped),
+);
