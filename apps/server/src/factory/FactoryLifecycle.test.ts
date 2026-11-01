@@ -26646,3 +26646,90 @@ it.effect(
       ),
     ),
 );
+
+it.effect(
+  "Grant/E2: the reservations' stage bases record a funded retry, so a grant rewritten without `recoveries` (as 5c4dc43d rewrites a grant) funds no second one; revoking twice changes nothing",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* configureLifecycleFactory;
+          const sql = yield* SqlClient.SqlClient;
+          const factory = yield* FactoryLifecycle.FactoryLifecycle;
+          const build = yield* grantedBuild(7965);
+          yield* failFast(build);
+          yield* startsNothing;
+          yield* configureFactory(
+            lifecycleConfiguration({
+              stageExecution: {
+                implement: { ...buildExecution, runtimeMode: "approval-required" },
+              },
+            }),
+          );
+          const [retry] = yield* concurrentPasses;
+          const retryId = retry!.reservation.reservationId;
+          // The retry is rolled back before it reports, so the original failure stays the stage's latest;
+          // an older build then rewrites the grant, dropping the field it does not know.
+          yield* sql`UPDATE factory_reservations SET state = 'released', record_json = json_set(record_json, '$.state', 'released', '$.releasedReason', 'rolled_back') WHERE reservation_id = ${retryId}`;
+          yield* sql`UPDATE factory_grants SET record_json = json_remove(record_json, '$.recoveries')`;
+          assert.deepStrictEqual(admittedOnly(yield* advance("tracker_event", 3)), []);
+          assert.deepStrictEqual(admittedOnly(yield* restartedPass), []);
+          assert.strictEqual(yield* dispositionOf(7965), "awaiting_grant");
+          const [grant] = (yield* grantView(7965)).grants;
+          assert.isTrue(
+            yield* factory.revokeGrant({ factoryId, grantId: grant!.grantId, by: "owner" }),
+          );
+          assert.isFalse(
+            yield* factory.revokeGrant({ factoryId, grantId: grant!.grantId, by: "owner" }),
+          );
+          assert.deepStrictEqual(
+            (yield* grantView(7965)).grants.map((current) => [current.state, current.spentBy]),
+            [["revoked", [build.reservation.reservationId]]],
+          );
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Grant/E2: an owner-rejected failure, or a reservation released for any cause but its verified outcome, funds no retry",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* configureLifecycleFactory;
+          const sql = yield* SqlClient.SqlClient;
+          const changed = lifecycleConfiguration({
+            stageExecution: { implement: { ...buildExecution, runtimeMode: "approval-required" } },
+          });
+          const rejected = yield* grantedBuild(7966);
+          yield* failFast(rejected);
+          yield* startsNothing;
+          const [missing] = yield* missingResults(7966);
+          assert.isTrue(
+            yield* (yield* FactoryLifecycle.FactoryLifecycle).rejectOutcome({
+              factoryId,
+              outcomeId: missing!.outcomeId,
+              reason: "Not an environment failure.",
+              by: "owner",
+            }),
+          );
+          const disposed = yield* grantedBuild(7967);
+          yield* failFast(disposed);
+          yield* startsNothing;
+          yield* sql`UPDATE factory_reservations SET record_json = json_set(record_json, '$.releasedReason', 'owner_disposition') WHERE reservation_id = ${disposed.reservation.reservationId}`;
+          yield* configureFactory(changed);
+          assert.deepStrictEqual(
+            admittedOnly(yield* advance("tracker_event", 3)).filter((admission) =>
+              ["7966", "7967"].some((issue) => stageOf(admission)?.[0].endsWith(`#${issue}`)),
+            ),
+            [],
+          );
+          for (const issue of [7966, 7967]) {
+            assert.strictEqual(yield* dispositionOf(issue), "awaiting_grant");
+            assert.deepStrictEqual((yield* grantView(issue)).grants[0]!.recoveries, undefined);
+          }
+        }),
+      ),
+    ),
+);

@@ -6323,9 +6323,13 @@ const make = Effect.gen(function* () {
     readonly owner: string | undefined;
   }) {
     const failure = environmentFailures(input.events).get(input.stage.type);
-    if (failure === undefined) return undefined;
+    // An owner's rejection of the failure is the owner's own call on it: it funds nothing.
+    if (failure === undefined || failure.rejected !== undefined) return undefined;
     const outcome = yield* outcomeStore.get(failure.outcomeId);
-    const failedId = Option.isSome(outcome) ? outcome.value.origin.reservationId : undefined;
+    const failedId =
+      Option.isSome(outcome) && outcome.value.state === "verified"
+        ? outcome.value.origin.reservationId
+        : undefined;
     if (failedId === undefined) return undefined;
     const reservations = yield* store.listReservations(input.factoryId);
     const failed = reservations.find((reservation) => reservation.reservationId === failedId);
@@ -6338,11 +6342,14 @@ const make = Effect.gen(function* () {
       failed.taskKind !== input.stage.type ||
       !(failed.stageBasis ?? "").startsWith(stageBasis(input.stage)) ||
       failed.grantId === undefined ||
+      FactoryStore.grantRetryOf(failed.stageBasis) !== undefined ||
       reservations.some(
         (reservation) =>
-          reservation.itemKey === input.itemKey &&
-          reservation.state === "held" &&
-          reservation.reservationId !== input.owner,
+          (reservation.itemKey === input.itemKey &&
+            reservation.state === "held" &&
+            reservation.reservationId !== input.owner) ||
+          (reservation.origin === "admitted" &&
+            FactoryStore.grantRetryOf(reservation.stageBasis) === failedId),
       )
     ) {
       return undefined;

@@ -213,6 +213,12 @@ it("reads a bound verification's binding by key, and refuses a binding it cannot
       `rework:o1:env:0123456789ab:owner:${"e".repeat(16)}|vb:${vb}|out:${out}`,
       { specOutcomeId: "o1", bindingDigest: vb },
     ],
+    // A granted retry names the reservation it retries, pipe-led and before the binding.
+    [
+      `rework:o1:env:0123456789ab:${"d".repeat(32)}|res:ocr|exe:verifier|grx:reservation:factory:f:decision:${"9".repeat(64)}|ne:${ne}|vb:${vb}|out:${out}`,
+      { specOutcomeId: "o1", bindingDigest: vb },
+    ],
+    [`rework:o1|vb:${vb}|out:${out}|grx:reservation:r1`, "malformed"],
     [`rework:o1|vb:${vb}`, "malformed"],
     [`rework:o1|out:${out}`, "malformed"],
     [`rework:o1|vb:${vb}|vb:${vb}|out:${out}`, "malformed"],

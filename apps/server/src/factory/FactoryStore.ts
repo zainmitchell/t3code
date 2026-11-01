@@ -1093,6 +1093,23 @@ const encodeDisposition = Schema.encodeEffect(
 );
 const encodeReservation = Schema.encodeEffect(ReservationJson);
 const decodeReservation = Schema.decodeUnknownEffect(ReservationJson);
+
+/**
+ * The reservation a stage basis retries on its spent grant (`|grx:<reservation>`, pipe-led and
+ * before any `|vb:`/`|out:` pair), none, or "malformed" when it names more than one or an empty or
+ * unprintable value. A malformed basis funds nothing.
+ */
+export const grantRetryOf = (stageBasis: string | undefined) => {
+  const named = (stageBasis ?? "")
+    .split("|")
+    .slice(1)
+    .filter((suffix) => suffix.startsWith("grx:"))
+    .map((suffix) => suffix.slice("grx:".length));
+  if (named.length === 0) return undefined;
+  return named.length === 1 && /^[\x21-\x7e]+$/.test(named[0]!)
+    ? named[0]!
+    : ("malformed" as const);
+};
 const encodeObservation = Schema.encodeEffect(ObservationJson);
 const decodeObservation = Schema.decodeUnknownEffect(ObservationJson);
 const encodeObservationInput = Schema.encodeEffect(Schema.fromJsonString(ItemObservationInput));
@@ -1538,6 +1555,15 @@ const make = Effect.gen(function* () {
     return true;
   });
 
+  /** Whether a reservation of the item already retried `failed` on its grant, read from stage bases. */
+  const retriedOnGrant = Effect.fnUntraced(function* (factoryId: FactoryId, failed: string) {
+    const rows = yield* sql<{ readonly basis: string | null }>`
+      SELECT json_extract(record_json, '$.stageBasis') AS basis FROM factory_reservations
+      WHERE factory_id = ${factoryId} AND instr(json_extract(record_json, '$.stageBasis'), '|grx:') > 0
+    `;
+    return rows.some((row) => grantRetryOf(row.basis ?? undefined) === failed);
+  });
+
   /**
    * Funds one retry of the reservation `failed` on the unit it spent, in the caller's commit: only
    * while that reservation is released on its verified outcome, the grant is unrevoked and on the
@@ -1572,7 +1598,19 @@ const make = Effect.gen(function* () {
     `;
     if (rows[0] === undefined) return false;
     const failed = yield* decodeReservation(rows[0].record_json);
-    if (failed.state !== "released" || failed.releasedReason !== "outcome_verified") return false;
+    // The reservations' own stage bases are the record of which retries were funded: a build that
+    // rewrites the grant without `recoveries` cannot make a funded retry fundable again.
+    if (
+      failed.state !== "released" ||
+      failed.releasedReason !== "outcome_verified" ||
+      failed.origin !== "admitted" ||
+      failed.itemKey !== input.itemKey ||
+      failed.grantId !== input.grantId ||
+      grantRetryOf(failed.stageBasis) !== undefined ||
+      (yield* retriedOnGrant(input.factoryId, input.failed))
+    ) {
+      return false;
+    }
     yield* writeGrant({
       ...grant.value,
       recoveries: [
@@ -1698,12 +1736,13 @@ const make = Effect.gen(function* () {
         evidenceDigest: admission.grant.evidenceDigest,
         reservationId,
       };
-      // `|grx:` names the reservation whose environment failure this admission retries.
-      const failed = /\|grx:([^|]+)/.exec(admission.stageBasis ?? "")?.[1];
+      const failed = grantRetryOf(admission.stageBasis);
       const spent =
-        failed === undefined
-          ? yield* spendGrant(subject)
-          : yield* recoverGrant({ ...subject, failed });
+        failed === "malformed"
+          ? false
+          : failed === undefined
+            ? yield* spendGrant(subject)
+            : yield* recoverGrant({ ...subject, failed });
       if (!spent) return { type: "refused", refusal: "grant_unavailable" } as const;
     }
     const reservation: NativeReservation = {
