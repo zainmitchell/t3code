@@ -74,7 +74,7 @@ export class FactoryDeliveryUnknown extends Schema.TaggedError<FactoryDeliveryUn
     operation: Schema.String,
     write: Schema.String,
     reason: Schema.String,
-    cause: Schema.Defect(),
+    cause: Schema.optional(Schema.Defect()),
   },
 ) {
   override get message(): string {
@@ -97,6 +97,23 @@ export const FACTORY_RPC_TRANSPORT = {
 
 const isRpcClientError = Schema.is(RpcClientError.RpcClientError);
 const isDeliveryUnknown = Schema.is(FactoryDeliveryUnknown);
+const isFactoryCliError = Schema.is(FactoryCliError);
+
+/**
+ * A failure as the CLI prints it. The runtime prints an error with its cause chain, and a
+ * transport cause carries text the peer chose (a close reason), so what is shown keeps only the
+ * error's own bounded fields. The call has already audited and classified it with its cause.
+ */
+const shown = <E>(error: E) =>
+  isDeliveryUnknown(error)
+    ? new FactoryDeliveryUnknown({
+        operation: error.operation,
+        write: error.write,
+        reason: error.reason,
+      })
+    : isFactoryCliError(error) && error.cause !== undefined
+      ? new FactoryCliError({ operation: error.operation, reason: error.reason })
+      : error;
 
 /**
  * How the connection was lost, from bounded fields only. A ping timeout and a dropped socket share
@@ -385,7 +402,7 @@ const withHostAdmin = Effect.fn("factoryCli.withHostAdmin")(function* <A, E>(
           ),
         ),
       );
-});
+}, Effect.mapError(shown));
 
 /** The running server's owner methods, over its WebSocket, as any client reaches them. */
 export const makeClient = Effect.fn("factoryCli.makeClient")(function* (
