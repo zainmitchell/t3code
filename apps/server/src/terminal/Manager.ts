@@ -222,7 +222,11 @@ export class TerminalManager extends Context.Service<
 
     readonly closeIdle: (
       input:
-        | { readonly threadId: string; readonly terminalId?: string }
+        | {
+            readonly threadId: string;
+            readonly terminalId?: string;
+            readonly ignoreOutput?: never;
+          }
         // A contained shell's owner retiring it once its own command ended: output alone (a
         // prompt redraw) does not keep it; inputs, a new process or anything it runs still do.
         | { readonly threadId: string; readonly terminalId: string; readonly ignoreOutput: true },
@@ -3575,6 +3579,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     withThreadLock(
       input.threadId,
       Effect.gen(function* () {
+        if (input.ignoreOutput === true && !input.terminalId) return;
         const running = (yield* sessionsForThread(input.threadId)).filter(
           (session): session is TerminalSessionState & { pid: number } =>
             session.status === "running" &&

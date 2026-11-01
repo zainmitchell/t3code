@@ -1184,6 +1184,9 @@ it.layer(
         yield* manager.open(openInput({ terminalId: "plain" }));
         const [echoed, typed, busyShell, unnamed, plain] = ptyAdapter.processes;
         busy.add(busyShell!.pid);
+        // @ts-expect-error Output relaxation requires the owner's exact terminal.
+        yield* manager.closeIdle({ threadId: "thread-1", ignoreOutput: true });
+        expect(ptyAdapter.processes.every((process) => !process.killed)).toBe(true);
         // The prompt a shell redraws while it is checked, as a long prompt does at 120 columns.
         const redraw = (process: FakePtyProcess, terminalId: string) =>
           Effect.gen(function* () {
