@@ -28,14 +28,20 @@ const setup = (options: {
   readonly scope?: Record<string, unknown>;
   readonly approval?: "approve" | "reject" | "grant-without-units" | "none";
   readonly unreadable?: boolean;
+  /** The predecessor is reached through an in-root junction: as an ancestor, or in the file's own place. */
+  readonly link?: "ancestor" | "final";
 }) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "rebind-"));
+    // Each test owns its fixture root alone; a junction inside it is unlinked, never followed.
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => NodeFS.rmSync(root, { recursive: true, force: true })),
+    );
     const pinRoot = NodePath.join(root, "pins");
     const artifactRoot = NodePath.join(root, "artifacts");
-    NodeFS.mkdirSync(pinRoot, { recursive: true });
+    NodeFS.mkdirSync(NodePath.join(pinRoot, "real"), { recursive: true });
     const predecessor = options.predecessor ?? {
       commit: "b".repeat(40),
       objects: [
@@ -44,15 +50,31 @@ const setup = (options: {
       ],
     };
     const bytes = JSON.stringify(predecessor);
-    NodeFS.writeFileSync(NodePath.join(pinRoot, "units.json"), bytes);
-    const pin = { root: pinRoot, path: "units.json", sha256: sha256(bytes) };
+    NodeFS.writeFileSync(NodePath.join(pinRoot, "real", "units.json"), bytes);
+    let relative = "real/units.json";
+    if (options.link === "ancestor") {
+      NodeFS.symlinkSync(
+        NodePath.join(pinRoot, "real"),
+        NodePath.join(pinRoot, "alias"),
+        "junction",
+      );
+      relative = "alias/units.json";
+    } else if (options.link === "final") {
+      NodeFS.symlinkSync(
+        NodePath.join(pinRoot, "real"),
+        NodePath.join(pinRoot, "units.json"),
+        "junction",
+      );
+      relative = "units.json";
+    }
+    const pin = { root: pinRoot, path: relative, sha256: sha256(bytes) };
     const scope = {
       schema: "factory-correction-scope/1",
       itemKey,
       itemVersion,
       paths: ["btclink/route/run.py", "btclink/tests/test_pilot.py"],
       pinnedInputs: [
-        { path: `${pinRoot.replace(/\\/g, "/")}/units.json`, sha256: pin.sha256, by: "builder" },
+        { path: `${pinRoot.replace(/\\/g, "/")}/${relative}`, sha256: pin.sha256, by: "builder" },
       ],
       ...options.scope,
     };
@@ -147,7 +169,7 @@ it.layer(NodeServices.layer)("factoryRebind", (it) => {
         ]);
         assert.strictEqual(successor.commit, head);
         assert.strictEqual(
-          NodeFS.readFileSync(NodePath.join(fixture.pinRoot, "units.json"), "utf8"),
+          NodeFS.readFileSync(NodePath.join(fixture.pinRoot, "real", "units.json"), "utf8"),
           fixture.bytes,
         );
         assert.include(first.note, "deriving them accepts nothing");
@@ -155,7 +177,7 @@ it.layer(NodeServices.layer)("factoryRebind", (it) => {
         assert.isTrue("basis" in again);
         // Retry: the record is content-addressed, so a second derivation names the same bytes.
         assert.deepStrictEqual(yield* fixture.derive, first);
-      }),
+      }).pipe(Effect.scoped),
   );
 
   it.effect("E1: every unproven or unauthorized rebind refuses, and nothing is recorded", () =>
@@ -223,8 +245,32 @@ it.layer(NodeServices.layer)("factoryRebind", (it) => {
       }
       // A stale pin: the predecessor no longer has the bytes the decision names.
       const stale = yield* setup({});
-      NodeFS.writeFileSync(NodePath.join(stale.pinRoot, "units.json"), `${stale.bytes} `);
+      NodeFS.writeFileSync(NodePath.join(stale.pinRoot, "real", "units.json"), `${stale.bytes} `);
       assert.match(waits(yield* stale.derive), /not sha256/);
-    }),
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "E1: a predecessor reached through an in-root junction is refused before it is read",
+    () =>
+      Effect.gen(function* () {
+        for (const link of ["ancestor", "final"] as const) {
+          const fixture = yield* setup({ link });
+          if (link === "ancestor") {
+            // The alias resolves inside the root and its bytes match: containment alone would admit it.
+            assert.strictEqual(
+              sha256(NodeFS.readFileSync(NodePath.join(fixture.pinRoot, fixture.pin.path), "utf8")),
+              fixture.pin.sha256,
+            );
+          }
+          assert.match(waits(yield* fixture.derive), /link or reparse point/, link);
+          assert.deepStrictEqual(
+            fixture.reads,
+            [],
+            `${link}: no object is read for a linked predecessor`,
+          );
+          assert.isFalse(NodeFS.existsSync(NodePath.join(fixture.artifactRoot, "rebind")), link);
+        }
+      }).pipe(Effect.scoped),
   );
 });

@@ -26808,14 +26808,23 @@ it.effect(
 );
 
 /** A review admission that asks T3 to rebind a pinned input on the owner's approved correction scope. */
-const rebindFixture = (issueNumber: number, root: string) =>
+const rebindFixture = (
+  issueNumber: number,
+  root: string,
+  options: { readonly viaJunction?: boolean } = {},
+) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const pins = path.join(root, "pins");
     const outputs = path.join(root, "outputs");
-    yield* fs.makeDirectory(pins, { recursive: true });
+    yield* fs.makeDirectory(path.join(pins, "real"), { recursive: true });
     yield* fs.makeDirectory(outputs, { recursive: true });
+    // The reviewer's counterexample: an in-root alias (junction) whose target also lies inside the root.
+    const pinDir = options.viaJunction === true ? "alias" : "real";
+    if (options.viaJunction === true) {
+      NodeFS.symlinkSync(path.join(pins, "real"), path.join(pins, "alias"), "junction");
+    }
     const head = `e000${issueNumber}`;
     const predecessor = JSON.stringify({
       commit: "b".repeat(40),
@@ -26824,8 +26833,8 @@ const rebindFixture = (issueNumber: number, root: string) =>
         { path: "btclink/tests/test_a.py", sha256: sha256("test a") },
       ],
     });
-    yield* fs.writeFileString(path.join(pins, "units.json"), predecessor);
-    const pin = { root: pins, path: "units.json", sha256: sha256(predecessor) };
+    yield* fs.writeFileString(path.join(pins, "real", "units.json"), predecessor);
+    const pin = { root: pins, path: `${pinDir}/units.json`, sha256: sha256(predecessor) };
     const graph = yield* GitGraphFake;
     graph.files.set(
       head,
@@ -26841,7 +26850,7 @@ const rebindFixture = (issueNumber: number, root: string) =>
       }),
     );
     const itemKey = itemKeyFor(issueNumber);
-    const pinPath = `${pins.replaceAll("\\", "/")}/units.json`;
+    const pinPath = `${pins.replaceAll("\\", "/")}/${pinDir}/units.json`;
     const scopeFor = (itemVersion: string) =>
       canonical({
         schema: "factory-correction-scope/1",
@@ -26933,7 +26942,7 @@ it.effect(
           ]);
           assert.strictEqual(successor.commit, fixture.head);
           assert.strictEqual(
-            yield* fs.readFileString(path.join(fixture.pins, "units.json")),
+            yield* fs.readFileString(path.join(fixture.pins, "real", "units.json")),
             fixture.predecessor,
             "the predecessor is never touched",
           );
@@ -26993,13 +27002,39 @@ it.effect(
           const fixture = yield* rebindFixture(7982, root);
           yield* approveAndBuild(fixture, 7982);
           yield* fs.writeFileString(
-            path.join(fixture.pins, "units.json"),
+            path.join(fixture.pins, "real", "units.json"),
             `${fixture.predecessor} `,
           );
           assert.deepStrictEqual(admittedOnly(yield* advance("outcome", 2)), []);
           const record = yield* recordOf(7982);
           assert.strictEqual(record?.disposition, "nothing_proposed");
           assert.include(record?.detail ?? "", "not sha256");
+          assert.isFalse(yield* fs.exists(path.join(root, "rebind")));
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Rebind/E1: a predecessor reached through an in-root junction never rebinds: the review waits and records nothing",
+  () =>
+    runIsolated(
+      withScratch((root) =>
+        Effect.gen(function* () {
+          yield* configureLifecycleFactory;
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const fixture = yield* rebindFixture(7983, root, { viaJunction: true });
+          // The alias resolves inside the root and the bytes match: containment alone would admit it.
+          assert.strictEqual(
+            yield* fs.readFileString(path.join(fixture.pins, "alias", "units.json")),
+            fixture.predecessor,
+          );
+          yield* approveAndBuild(fixture, 7983);
+          assert.deepStrictEqual(admittedOnly(yield* advance("outcome", 2)), []);
+          const record = yield* recordOf(7983);
+          assert.strictEqual(record?.disposition, "nothing_proposed");
+          assert.include(record?.detail ?? "", "link or reparse point");
           assert.isFalse(yield* fs.exists(path.join(root, "rebind")));
         }),
       ),

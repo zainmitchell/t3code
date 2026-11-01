@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off - pins and successors are sha256 digests.
 import * as NodeCrypto from "node:crypto";
+import * as NodeFS from "node:fs";
 
 import * as Effect from "effect/Effect";
 import type * as FileSystem from "effect/FileSystem";
@@ -132,6 +133,32 @@ const approvedBy = (
   });
 };
 
+/**
+ * The first component below the root that is not a plain directory or regular file (a link, junction
+ * or other reparse point, or unreadable), read without following links, so an in-root alias is refused
+ * even when its target is inside the root. Metadata is read before the bytes: a swap between the two
+ * reads is not excluded by this API, so a derivation is reviewed, never trusted.
+ */
+const linkedComponent = Effect.fnUntraced(function* (
+  path: Path.Path,
+  root: string,
+  relative: string,
+) {
+  const parts = relative.split("/");
+  let current = path.resolve(root);
+  for (const [index, part] of parts.entries()) {
+    current = path.join(current, part);
+    const info = yield* Effect.tryPromise(() => NodeFS.promises.lstat(current)).pipe(Effect.option);
+    if (Option.isNone(info)) return `${part}: unreadable`;
+    if (info.value.isSymbolicLink()) return `${part}: link`;
+    const last = index === parts.length - 1;
+    if (last ? !info.value.isFile() : !info.value.isDirectory()) {
+      return `${part}: not a ${last ? "regular file" : "directory"}`;
+    }
+  }
+  return undefined;
+});
+
 const coordinator = (what: string, action: string): RebindResult => ({
   what,
   actor: "Root coordinator",
@@ -205,6 +232,13 @@ export const derivePinRebind = Effect.fnUntraced(function* (deps: RebindDeps, in
     }
     const file = path.resolve(input.pinRoot, pin.path);
     const inside = yield* deps.insideRoot(input.pinRoot, file);
+    const linked = inside ? yield* linkedComponent(path, input.pinRoot, pin.path) : undefined;
+    if (linked !== undefined) {
+      return coordinator(
+        `predecessor ${pin.path} is, or lies under, a link or reparse point (${linked}) inside the pin root`,
+        "pin the predecessor at its real path; a linked predecessor is never read",
+      );
+    }
     const bytes = inside ? yield* fs.readFile(file).pipe(Effect.option) : Option.none<Uint8Array>();
     if (Option.isNone(bytes) || sha256(bytes.value) !== pin.sha256) {
       return coordinator(
