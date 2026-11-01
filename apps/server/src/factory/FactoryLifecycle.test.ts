@@ -122,7 +122,7 @@ import * as FactoryCommandPolicy from "./FactoryCommandPolicy.ts";
 import * as FactoryGitReadback from "./FactoryGitReadback.ts";
 import * as FactoryLifecycle from "./FactoryLifecycle.ts";
 import * as FactoryOutcomeStore from "./FactoryOutcomeStore.ts";
-import { executionIdentity } from "./factoryOutcomes.ts";
+import { canonical, executionIdentity } from "./factoryOutcomes.ts";
 import * as FactoryEffects from "./FactoryEffects.ts";
 import * as FactoryIntegrator from "./FactoryIntegrator.ts";
 import * as FactoryOperationStore from "./FactoryOperationStore.ts";
@@ -1743,6 +1743,7 @@ const layerGitGraphFake = Layer.effect(
         read("objects-at", () => {
           const files = graph.files.get(resolve(input.commit)) ?? new Map();
           return {
+            commit: resolve(input.commit),
             tree: `tree-${resolve(input.commit)}`,
             objects: input.paths.map((path): FactoryGitReadback.FactoryGitObject => {
               const file = files.get(path);
@@ -26806,6 +26807,153 @@ it.effect(
     ),
 );
 
+/** A review admission that asks T3 to rebind a pinned input on the owner's approved correction scope. */
+const rebindFixture = (issueNumber: number, root: string) =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const pins = path.join(root, "pins");
+    const outputs = path.join(root, "outputs");
+    yield* fs.makeDirectory(pins, { recursive: true });
+    yield* fs.makeDirectory(outputs, { recursive: true });
+    const head = `e000${issueNumber}`;
+    const predecessor = JSON.stringify({
+      commit: "b".repeat(40),
+      objects: [
+        { path: "btclink/route/run.py", sha256: sha256("old run") },
+        { path: "btclink/tests/test_a.py", sha256: sha256("test a") },
+      ],
+    });
+    yield* fs.writeFileString(path.join(pins, "units.json"), predecessor);
+    const pin = { root: pins, path: "units.json", sha256: sha256(predecessor) };
+    const graph = yield* GitGraphFake;
+    graph.files.set(
+      head,
+      new Map<string, string | { readonly link: string }>([
+        ["btclink/route/run.py", "new run"],
+        ["btclink/tests/test_a.py", "test a"],
+      ]),
+    );
+    yield* configureFactory(
+      lifecycleConfiguration({
+        artifactRoot: root,
+        verification: { templateRoot: pins, outputBase: outputs, consumers: [], identities: {} },
+      }),
+    );
+    const itemKey = itemKeyFor(issueNumber);
+    const pinPath = `${pins.replaceAll("\\", "/")}/units.json`;
+    const scopeFor = (itemVersion: string) =>
+      canonical({
+        schema: "factory-correction-scope/1",
+        itemKey,
+        itemVersion,
+        paths: ["btclink/route/run.py"],
+        pinnedInputs: [{ path: pinPath, sha256: pin.sha256, by: "builder" }],
+      });
+    const propose: ProposeFn = (input) =>
+      Effect.gen(function* () {
+        if (input.observation.itemKey !== itemKey) return yield* stageRequest(input);
+        const evidence = scopeFor(input.observation.itemVersion);
+        const approved = input.reserved.some(
+          (decision) =>
+            decision.evidenceDigest === sha256(evidence) &&
+            decision.state === "resolved" &&
+            decision.resolution?.answer === "approve",
+        );
+        if (input.stage.type === "implement" && !approved) {
+          return {
+            type: "reserve",
+            reason: "Approve the correction scope.",
+            evidenceDigest: sha256(evidence),
+          };
+        }
+        const decision = yield* stageRequest(input);
+        return input.stage.type === "review" && decision !== undefined && !("type" in decision)
+          ? { ...decision, rebind: { evidence, pins: [pin] } }
+          : decision;
+      });
+    yield* usePolicy(propose);
+    yield* seedIssue(issueNumber);
+    return { head, pins, predecessor, itemKey };
+  });
+
+/** The owner approves the item's one pending scope request, and its corrected head is built. */
+const approveAndBuild = (
+  fixture: { readonly head: string; readonly itemKey: string },
+  issueNumber: number,
+) =>
+  Effect.gen(function* () {
+    const factory = yield* FactoryLifecycle.FactoryLifecycle;
+    assert.deepStrictEqual(yield* advance("tracker_event", 2), []);
+    const [request] = (yield* factory.readState({ factoryId })).reservedDecisions.filter(
+      (decision) => decision.itemKey === fixture.itemKey && decision.state === "pending",
+    );
+    assert.strictEqual(request?.kind, "gate");
+    assert.isTrue(
+      yield* factory.resolveReservedDecision({
+        factoryId,
+        decisionId: request!.decisionId,
+        answer: "approve",
+        by: "owner",
+      }),
+    );
+    const implement = admittedBy(yield* advance("owner_decision", 1));
+    assert.deepStrictEqual(stageOf(implement), [itemKeyFor(issueNumber), "implement"]);
+    yield* recordCommit(fixture.head, [lifecycleBase]);
+    yield* workStage(implement, {
+      outcome: "implemented",
+      subject: subjectFor(fixture.head, lifecycleBase),
+      summary: "Corrected.",
+    });
+  });
+
+it.effect(
+  "Rebind/E1: a review admitted on the owner's approved scope records the pin's successor beside its untouched predecessor",
+  () =>
+    runIsolated(
+      withScratch((root) =>
+        Effect.gen(function* () {
+          yield* configureLifecycleFactory;
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const fixture = yield* rebindFixture(7981, root);
+          yield* approveAndBuild(fixture, 7981);
+          const review = admittedBy(yield* advance("outcome"));
+          assert.deepStrictEqual(stageOf(review), [fixture.itemKey, "review"]);
+          const basis =
+            review.reservation.origin === "admitted" ? review.reservation.stageBasis : undefined;
+          assert.match(basis ?? "", new RegExp(`^review:${fixture.head}\\|rb:[0-9a-f]{32}$`));
+          const recorded = yield* fs.readDirectory(path.join(root, "rebind"));
+          assert.strictEqual(recorded.length, 1);
+          const successor = JSON.parse(
+            yield* fs.readFileString(path.join(root, "rebind", recorded[0]!)),
+          );
+          assert.deepStrictEqual(successor.delta, [
+            { from: sha256("old run"), path: "btclink/route/run.py", to: sha256("new run") },
+          ]);
+          assert.strictEqual(successor.commit, fixture.head);
+          assert.strictEqual(
+            yield* fs.readFileString(path.join(fixture.pins, "units.json")),
+            fixture.predecessor,
+            "the predecessor is never touched",
+          );
+          yield* workStage(review, {
+            outcome: "review_passed",
+            subject: subjectFor(fixture.head),
+            summary: "Reviewed the rebound pin.",
+          });
+          yield* advance("outcome", 2);
+          assert.deepStrictEqual(yield* itemHistory(7981), [
+            "implement",
+            "implemented",
+            "review",
+            "review_passed",
+          ]);
+        }),
+      ),
+    ),
+);
+
 it("Grant/E2: the retry marker is read only where the lifecycle writes it, before the no-edit and binding suffixes", () => {
   const a = "a".repeat(32);
   const b = "b".repeat(32);
@@ -26833,3 +26981,27 @@ it("Grant/E2: the retry marker is read only where the lifecycle writes it, befor
     assert.strictEqual(FactoryStore.grantRetryOf(basis), expected, basis);
   }
 });
+it.effect(
+  "Rebind/E1: a predecessor edited after the owner approved its pin keeps the review waiting and records nothing",
+  () =>
+    runIsolated(
+      withScratch((root) =>
+        Effect.gen(function* () {
+          yield* configureLifecycleFactory;
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const fixture = yield* rebindFixture(7982, root);
+          yield* approveAndBuild(fixture, 7982);
+          yield* fs.writeFileString(
+            path.join(fixture.pins, "units.json"),
+            `${fixture.predecessor} `,
+          );
+          assert.deepStrictEqual(admittedOnly(yield* advance("outcome", 2)), []);
+          const record = yield* recordOf(7982);
+          assert.strictEqual(record?.disposition, "nothing_proposed");
+          assert.include(record?.detail ?? "", "not sha256");
+          assert.isFalse(yield* fs.exists(path.join(root, "rebind")));
+        }),
+      ),
+    ),
+);

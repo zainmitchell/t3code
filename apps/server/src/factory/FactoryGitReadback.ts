@@ -38,13 +38,17 @@ export interface FactoryGitReadbackShape {
     readonly projectId: ProjectId;
     readonly branch: string;
   }) => Effect.Effect<boolean, FactoryGitReadbackError>;
-  /** Each path at the commit: a regular text file's sha256, or why it is not one. */
+  /** Each path at the commit (resolved to its full id): a regular text file's sha256, or why it is not one. */
   readonly objectsAt: (input: {
     readonly projectId: ProjectId;
     readonly commit: string;
     readonly paths: ReadonlyArray<string>;
   }) => Effect.Effect<
-    { readonly tree: string; readonly objects: ReadonlyArray<FactoryGitObject> },
+    {
+      readonly commit: string;
+      readonly tree: string;
+      readonly objects: ReadonlyArray<FactoryGitObject>;
+    },
     FactoryGitReadbackError
   >;
 }
@@ -133,6 +137,13 @@ export const layer = Layer.effect(
           `${input.commit}^{tree}`,
         ]);
         if (tree.exitCode !== 0) return yield* fail("objectsAt")(`no tree for ${input.commit}`);
+        const resolved = yield* run("objectsAt", input.projectId, [
+          "rev-parse",
+          "--verify",
+          "--quiet",
+          `${input.commit}^{commit}`,
+        ]);
+        if (resolved.exitCode !== 0) return yield* fail("objectsAt")(`no commit ${input.commit}`);
         const listing = yield* run("objectsAt", input.projectId, [
           "ls-tree",
           "-z",
@@ -179,7 +190,7 @@ export const layer = Layer.effect(
             );
           }
         }
-        return { tree: tree.stdout.trim(), objects };
+        return { commit: resolved.stdout.trim(), tree: tree.stdout.trim(), objects };
       }),
       branchExists: Effect.fn("FactoryGitReadback.branchExists")(function (input) {
         return Effect.flatMap(

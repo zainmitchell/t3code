@@ -98,6 +98,7 @@ const setup = (options: {
             );
           }
           return Effect.succeed({
+            commit: head,
             tree: "c".repeat(40),
             objects: paths.map((entry): FactoryGitObject => {
               const file = files[entry];

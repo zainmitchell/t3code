@@ -46,7 +46,11 @@ export interface RebindDeps {
     readonly commit: string;
     readonly paths: ReadonlyArray<string>;
   }) => Effect.Effect<
-    { readonly tree: string; readonly objects: ReadonlyArray<FactoryGitObject> },
+    {
+      readonly commit: string;
+      readonly tree: string;
+      readonly objects: ReadonlyArray<FactoryGitObject>;
+    },
     FactoryGitReadbackError
   >;
 }
@@ -177,8 +181,10 @@ export const derivePinRebind = Effect.fnUntraced(function* (deps: RebindDeps, in
       "adopt verification.templateRoot for pinned inputs",
     );
   }
-  if (!COMMIT.test(input.head))
-    return coordinator(`head ${input.head} is not an exact commit`, "rebind at a verified head");
+  // The head is an engine-verified commit, possibly abbreviated; the successor records its full id.
+  if (!/^[0-9a-f]{7,40}$/.test(input.head)) {
+    return coordinator(`head ${input.head} is not a commit`, "rebind at a verified head");
+  }
   const notes: Array<string> = [];
   const digests: Array<string> = [];
   for (const pin of request.pins) {
@@ -266,7 +272,7 @@ export const derivePinRebind = Effect.fnUntraced(function* (deps: RebindDeps, in
     const text = `${canonical({
       schema: PIN_SCHEMA,
       predecessor: { path: pin.path, sha256: pin.sha256 },
-      commit: input.head,
+      commit: read.success.commit,
       tree: read.success.tree,
       objects: successorObjects,
       delta,
@@ -292,7 +298,7 @@ export const derivePinRebind = Effect.fnUntraced(function* (deps: RebindDeps, in
     }
     digests.push(digest);
     notes.push(
-      `Pinned input ${pin.path}: predecessor sha256 ${pin.sha256} (unchanged); successor ${target} sha256 ${digest}, derived at ${input.head} (tree ${read.success.tree}); ${delta.length} changed object(s): ${delta.map((entry) => `${entry.path} ${entry.from.slice(0, 12)}->${entry.to.slice(0, 12)}`).join(", ") || "none"}.`,
+      `Pinned input ${pin.path}: predecessor sha256 ${pin.sha256} (unchanged); successor ${target} sha256 ${digest}, derived at ${read.success.commit} (tree ${read.success.tree}); ${delta.length} changed object(s): ${delta.map((entry) => `${entry.path} ${entry.from.slice(0, 12)}->${entry.to.slice(0, 12)}`).join(", ") || "none"}.`,
     );
   }
   const record = sha256(digests.join("\n"));

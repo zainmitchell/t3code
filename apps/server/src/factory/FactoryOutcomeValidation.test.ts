@@ -1321,6 +1321,7 @@ it.live(
         });
         const sha256 = (text: string) => NodeCrypto.createHash("sha256").update(text).digest("hex");
         assert.strictEqual(read.tree, repository.tree);
+        assert.strictEqual(read.commit, repository.head);
         assert.deepStrictEqual(read.objects, [
           { path: "btclink/route/run.py", kind: "blob", sha256: sha256("print('run')\n") },
           { path: "with space.txt", kind: "blob", sha256: sha256("spaced\n") },
