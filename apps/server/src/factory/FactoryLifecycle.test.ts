@@ -26721,7 +26721,7 @@ it.effect(
           yield* configureFactory(changed);
           assert.deepStrictEqual(
             admittedOnly(yield* advance("tracker_event", 3)).filter((admission) =>
-              ["7966", "7967"].some((issue) => stageOf(admission)?.[0].endsWith(`#${issue}`)),
+              ["7966", "7967"].some((issue) => stageOf(admission)?.[0]?.endsWith(`#${issue}`)),
             ),
             [],
           );
