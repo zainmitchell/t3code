@@ -23559,6 +23559,193 @@ it.effect.each(noEditRepairCases)("NoEdit/N2: at a rework, %s", ([, repair]) =>
   ),
 );
 
+/** How a no-edit unit that ran and was reported fails review, and what its rework then proposes. */
+interface NoEditReviewRepairCase {
+  readonly issue: number;
+  readonly firstNoEdit?: false;
+  readonly rework?: (requirement: NoEditRequirement) => NoEditRequirement;
+  readonly reworkExecution?: string;
+  /** The issue's text changes after the correction, before its rework is decided. */
+  readonly editedAfter?: true;
+  /** Absent, the rework is admitted; else the wait names this. */
+  readonly refused?: string;
+}
+
+const noEditReviewRepairCases: ReadonlyArray<readonly [string, NoEditReviewRepairCase]> = [
+  // The review judged the unit's own run, and its correction repairs that run.
+  ["a repair of the run its review failed runs the unit once more", { issue: 7921 }],
+  [
+    "a reviewed build that was never a no-edit unit is not repaired as one",
+    {
+      issue: 7922,
+      firstNoEdit: false,
+      refused: "it is not the no-edit unit whose failure its correction answers",
+    },
+  ],
+  [
+    "a changed requirement is another unit",
+    {
+      issue: 7923,
+      rework: (requirement) => ({ ...requirement, checks: [...requirement.checks, "vp lint"] }),
+      refused: "it is not the no-edit unit whose failure its correction answers",
+    },
+  ],
+  [
+    "another execution is not the repair of the reviewed one",
+    { issue: 7924, reworkExecution: "builder", refused: "does not run on the execution" },
+  ],
+  [
+    "an item changed since the review is not the unit it judged",
+    { issue: 7925, editedAfter: true, refused: "the item changed since the no-edit unit failed" },
+  ],
+];
+
+it.effect.each(noEditReviewRepairCases)("NoEdit/N3: after a failed review, %s", ([, repair]) =>
+  runIsolated(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fs.realPath(yield* fs.makeTempDirectoryScoped());
+        const execution = {
+          modelSelection: rosterSelection,
+          runtimeMode: "full-access" as const,
+          interactionMode: "default" as const,
+        };
+        yield* configureLifecycleFactory;
+        yield* configureFactory(
+          lifecycleConfiguration({
+            artifactRoot: root,
+            executionChoices: { verifier: execution, builder: execution },
+          }),
+        );
+        const candidate = "c".repeat(40);
+        yield* recordCommit(candidate, [lifecycleBase]);
+        const requirement: NoEditRequirement = {
+          schema: "factory-noedit/1",
+          candidate,
+          base: candidate,
+          ownedFiles: [],
+          checks: ["vp test run src/a.test.ts"],
+          execution: "verifier",
+          instructionRevision: "a265216f",
+          clauseBinding: "parent 6 clause C02",
+        };
+        const reworked = repair.rework?.(requirement) ?? requirement;
+        yield* usePolicy((input) =>
+          Effect.map(stageRequest(input), (decision) => {
+            if (decision === undefined || !("taskKind" in decision)) return decision;
+            const unit =
+              input.stage.type === "rework"
+                ? reworked
+                : input.stage.type === "implement" && repair.firstNoEdit !== false
+                  ? requirement
+                  : undefined;
+            return unit === undefined
+              ? { ...decision, execution: "verifier" }
+              : {
+                  ...decision,
+                  execution:
+                    input.stage.type === "rework"
+                      ? (repair.reworkExecution ?? "verifier")
+                      : "verifier",
+                  noEdit: unit,
+                  workspaceStrategy: { type: "worktree" as const, baseRef: unit.candidate },
+                };
+          }),
+        );
+        yield* seedIssue(repair.issue, { body: "Verify the importer as landed." });
+        const build = admittedBy(yield* advance("tracker_event", 1));
+        if (repair.firstNoEdit === false) {
+          yield* workStage(build, {
+            outcome: "implemented",
+            summary: "Built.",
+            subject: subjectFor(candidate, lifecycleBase),
+          });
+        } else {
+          // The unit runs and reports a receipt T3 verifies natively.
+          const log = path.join(root, `${repair.issue}-check.log`);
+          yield* fs.writeFileString(log, "1 passed\n");
+          const receipt = path.join(root, `${repair.issue}-receipt.json`);
+          const receiptText = JSON.stringify({
+            schema: "factory-noedit-receipt/1",
+            requirement,
+            itemKey: itemKeyFor(repair.issue),
+            itemVersion: admittedVersion(build),
+            results: [
+              {
+                check: requirement.checks[0],
+                exitCode: 0,
+                log: { path: log, sha256: sha256("1 passed\n") },
+              },
+            ],
+          });
+          yield* fs.writeFileString(receipt, receiptText);
+          yield* workStage(build, {
+            outcome: "implemented",
+            summary: "All checks ran at the unchanged candidate.",
+            subject: subjectFor(candidate, candidate),
+            artifacts: [
+              { path: receipt, sha256: sha256(receiptText) },
+              { path: log, sha256: sha256("1 passed\n") },
+            ],
+          });
+        }
+        // Its review finds the run bound to the wrong rules revision.
+        const review = admittedBy(yield* advance("outcome"));
+        assert.deepStrictEqual(stageOf(review), [itemKeyFor(repair.issue), "review"]);
+        yield* workStage(review, {
+          outcome: "review_failed",
+          summary: "The run is bound to another rules revision.",
+          failure: "receipt instructionRevision does not match the admitted brief",
+          subject: subjectFor(candidate),
+        });
+        const correct = admittedBy(yield* advance("outcome"));
+        assert.deepStrictEqual(stageOf(correct), [itemKeyFor(repair.issue), "correct"]);
+        yield* workStage(correct, {
+          outcome: "correction_spec",
+          summary:
+            "Action class: execution_binding_repair\nfailure class: harness\nRepair only the run binding on the unchanged candidate.",
+          subject: { repository: claimRepository, baseCommit: candidate, headCommit: candidate },
+        });
+        if (repair.editedAfter === true) {
+          (yield* GitHubFake).issues.get(issueKey(claimRepository, repair.issue))!.body =
+            "Verify the importer as landed, and its export.";
+        }
+
+        if (repair.refused !== undefined) {
+          const starts = (yield* startedTurns).length;
+          for (const trigger of ["outcome", "tracker_event", "clock", "restart"] as const) {
+            assert.deepStrictEqual(admittedOnly(yield* advance(trigger, 2)), []);
+          }
+          assert.strictEqual((yield* startedTurns).length, starts);
+          assert.include((yield* recordOf(repair.issue))?.detail ?? "", repair.refused);
+          return;
+        }
+
+        // The same unit runs once more at its rework, on its candidate and execution.
+        const rework = admittedBy(yield* advance("outcome"));
+        assert.deepStrictEqual(stageOf(rework), [itemKeyFor(repair.issue), "rework"]);
+        if (rework.reservation.origin !== "admitted") return assert.fail("expected an admission");
+        assert.isTrue(rework.reservation.stageBasis?.endsWith(noEditBasis(requirement)));
+        assert.strictEqual(rework.reservation.executionChoice, "verifier");
+        for (const trigger of ["clock", "restart"] as const) {
+          assert.deepStrictEqual(admittedOnly(yield* advance(trigger, 2)), []);
+        }
+        assert.deepStrictEqual(yield* itemHistory(repair.issue), [
+          "implement",
+          "implemented",
+          "review",
+          "review_failed",
+          "correct",
+          "correction_spec",
+          "rework",
+        ]);
+      }),
+    ),
+  ),
+);
+
 it.effect(
   "Resources/R1: a named resource is held by one reservation at a time; the next waits naming it and starts once",
   () =>

@@ -4340,6 +4340,44 @@ const make = Effect.gen(function* () {
    * that base must read back now on the line T3 integrates onto. What cannot be read is not ready.
    */
   /**
+   * The implementation a failed review judged: the item's latest implementation before it, of the
+   * head it reviewed, both verified on this item and neither rejected. Undefined otherwise.
+   */
+  const reviewedImplementation = Effect.fnUntraced(function* (
+    candidate: Candidate,
+    review: Extract<Candidate["events"][number], { readonly type: "outcome" }>,
+  ) {
+    const rejected = new Set(
+      candidate.events.flatMap((event) => (event.type === "rejected" ? [event.outcomeId] : [])),
+    );
+    if (review.head === undefined || rejected.has(review.outcomeId)) return undefined;
+    const implementation = candidate.events.findLast(
+      (event) =>
+        event.type === "outcome" &&
+        event.kind === "implemented" &&
+        event.seq < review.seq &&
+        !rejected.has(event.outcomeId),
+    );
+    if (implementation?.type !== "outcome" || implementation.head !== review.head) return undefined;
+    for (const [outcomeId, kind] of [
+      [review.outcomeId, "review_failed"],
+      [implementation.outcomeId, "implemented"],
+    ] as const) {
+      const outcome = yield* outcomeStore.get(outcomeId);
+      if (
+        Option.isNone(outcome) ||
+        outcome.value.state !== "verified" ||
+        outcome.value.report.outcome !== kind ||
+        outcome.value.itemKey !== candidate.itemKey ||
+        outcome.value.report.subject?.headCommit !== review.head
+      ) {
+        return undefined;
+      }
+    }
+    return implementation.outcomeId;
+  });
+
+  /**
    * Why a no-edit unit may not run again at a rework, if it may not. Only a repair of its run
    * runs it again: a verified correction declaring an execution_binding_repair, or a harness
    * failure needing no source change, answering this item's own failure of exactly this unit
@@ -4367,16 +4405,26 @@ const make = Effect.gen(function* () {
     const answered = candidate.events.find(
       (event) =>
         event.type === "outcome" &&
-        event.kind === "failed" &&
+        (event.kind === "failed" || event.kind === "review_failed") &&
         event.failureDigest !== undefined &&
         event.failureDigest === correction.value.corrects,
     );
-    const failed =
-      answered?.type === "outcome" ? yield* outcomeStore.get(answered.outcomeId) : Option.none();
+    // A failed review is answered on the run it judged: the implementation that produced its head.
+    const ran =
+      answered?.type !== "outcome"
+        ? undefined
+        : answered.kind === "failed"
+          ? answered.outcomeId
+          : yield* reviewedImplementation(candidate, answered);
+    const failed = ran === undefined ? Option.none() : yield* outcomeStore.get(ran);
     const reservationId = Option.isSome(failed) ? failed.value.origin.reservationId : undefined;
     const earlier =
       reservationId === undefined ? Option.none() : yield* store.getReservation(reservationId);
-    if (Option.isNone(earlier) || earlier.value.origin !== "admitted") {
+    if (
+      Option.isNone(earlier) ||
+      earlier.value.origin !== "admitted" ||
+      earlier.value.itemKey !== candidate.itemKey
+    ) {
       return "its correction answers no failure of this item's own stage";
     }
     if (earlier.value.stageBasis?.includes(noEditBasis(requirement)) !== true) {
