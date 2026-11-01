@@ -220,10 +220,13 @@ export class TerminalManager extends Context.Service<
     /** Omit terminalId to close all sessions for the thread. */
     readonly close: (input: TerminalCloseInput) => Effect.Effect<void, TerminalError>;
 
-    readonly closeIdle: (input: {
-      readonly threadId: string;
-      readonly terminalId?: string;
-    }) => Effect.Effect<void>;
+    readonly closeIdle: (
+      input:
+        | { readonly threadId: string; readonly terminalId?: string }
+        // A contained shell's owner retiring it once its own command ended: output alone (a
+        // prompt redraw) does not keep it; inputs, a new process or anything it runs still do.
+        | { readonly threadId: string; readonly terminalId: string; readonly ignoreOutput: true },
+    ) => Effect.Effect<void>;
 
     readonly subscribe: (
       listener: (event: TerminalEvent) => Effect.Effect<void>,
@@ -242,9 +245,16 @@ interface TerminalSubprocessInspectResult {
   readonly processIds: ReadonlyArray<number>;
 }
 
+/** A shell started in its run's container: the pty runs the custody wrapper, which runs the shell. */
+interface ContainedLaunch {
+  readonly wrapper: string;
+  readonly shell: string;
+}
+
 interface TerminalSubprocessInspector {
   (
     terminalPid: number,
+    contained?: ContainedLaunch | null,
   ): Effect.Effect<TerminalSubprocessInspectResult, TerminalSubprocessCheckError>;
 }
 
@@ -300,6 +310,7 @@ interface TerminalSessionState {
   rows: number;
   process: PtyAdapter.PtyProcess | null;
   shell: string | null;
+  contained: ContainedLaunch | null;
   unsubscribeData: (() => void) | null;
   unsubscribeExit: (() => void) | null;
   hasRunningSubprocess: boolean;
@@ -740,9 +751,40 @@ function deriveSubprocessInspectResult(
   snapshot: TerminalProcessTableSnapshot,
   terminalPid: number,
   platform: NodeJS.Platform,
+  contained: ContainedLaunch | null = null,
 ): TerminalSubprocessInspectResult {
   const commandName = (pid: number) =>
     normalizeChildCommandName(snapshot.commandById.get(pid) ?? "", platform);
+  if (contained !== null) {
+    // Judged from the shell the wrapper runs, with the wrapper counted. Only the wrapper named as
+    // started, running exactly that shell, can read idle; anything this snapshot cannot place is busy.
+    const sameName = (pid: number, command: string) => {
+      const seen = commandName(pid);
+      const expected = normalizeChildCommandName(command, platform);
+      return (
+        seen !== null &&
+        expected !== null &&
+        (platform === "win32" ? seen.toLowerCase() === expected.toLowerCase() : seen === expected)
+      );
+    };
+    const children = snapshot.childrenByParent.get(terminalPid) ?? [];
+    const shellPid = children.length === 1 ? children[0]! : undefined;
+    if (
+      !sameName(terminalPid, contained.wrapper) ||
+      shellPid === undefined ||
+      !sameName(shellPid, contained.shell)
+    ) {
+      return {
+        hasRunningSubprocess: true,
+        childCommand: null,
+        processIds: [terminalPid, ...children],
+      };
+    }
+    const inner = deriveSubprocessInspectResult(snapshot, shellPid, platform);
+    return inner.hasRunningSubprocess
+      ? { ...inner, processIds: [terminalPid, ...inner.processIds] }
+      : inner;
+  }
   const shellName = commandName(terminalPid);
   // Async prompt themes fork childless shell helpers that are not user commands.
   const childPid = (snapshot.childrenByParent.get(terminalPid) ?? []).find(
@@ -1643,8 +1685,10 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
             inspector: Result.map(
               snapshot,
               (table): TerminalSubprocessInspector =>
-                (terminalPid) =>
-                  Effect.succeed(deriveSubprocessInspectResult(table, terminalPid, platform)),
+                (terminalPid, contained) =>
+                  Effect.succeed(
+                    deriveSubprocessInspectResult(table, terminalPid, platform, contained ?? null),
+                  ),
             ),
             snapshotSucceeded,
             queryElapsedMs,
@@ -2281,6 +2325,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
         cleanupProcessHandles(session);
         session.process = null;
         session.pid = null;
+        session.contained = null;
         session.hasRunningSubprocess = false;
         session.childCommandLabel = null;
         session.status = "exited";
@@ -2353,6 +2398,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
       cleanupProcessHandles(session);
       session.process = null;
       session.pid = null;
+      session.contained = null;
       session.hasRunningSubprocess = false;
       session.childCommandLabel = null;
       session.status = "exited";
@@ -2380,7 +2426,12 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     index = 0,
     lastError: PtyAdapter.PtySpawnError | null = null,
   ): Effect.fn.Return<
-    { process: PtyAdapter.PtyProcess; shell: string; shellLabel: string },
+    {
+      process: PtyAdapter.PtyProcess;
+      shell: string;
+      shellLabel: string;
+      contained: ContainedLaunch | null;
+    },
     PtyAdapter.PtySpawnError
   > {
     if (index >= shellCandidates.length) {
@@ -2475,6 +2526,10 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
         process: attempt.success,
         shell: candidate.shell,
         shellLabel: formatShellCandidate(candidate),
+        contained:
+          ticket === undefined
+            ? null
+            : { wrapper: ticket.command, shell: contained ?? scoped.command },
       };
     }
     if (ticket !== undefined) yield* ticket.cancel;
@@ -2504,6 +2559,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     yield* modifyManagerState((state) => {
       session.status = "starting";
       session.shell = null;
+      session.contained = null;
       session.cwd = input.cwd;
       session.worktreePath = input.worktreePath ?? null;
       session.cols = input.cols;
@@ -2579,6 +2635,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
             yield* modifyManagerState((state) => {
               session.process = ptyProcess;
               session.shell = spawnResult.shell;
+              session.contained = spawnResult.contained;
               session.pid = processPid;
               session.status = "running";
               // onExit may replay an exit immediately; accept it before subscribing.
@@ -2627,6 +2684,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
         cleanupProcessHandles(session);
         session.status = "error";
         session.pid = null;
+        session.contained = null;
         session.process = null;
         session.hasRunningSubprocess = false;
         session.childCommandLabel = null;
@@ -2761,7 +2819,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
       let mark = candidate.mark;
       const previous = quietSessions.get(session);
       quietSessions.delete(session);
-      const inspectResult = yield* subprocessInspector(terminalPid).pipe(
+      const inspectResult = yield* subprocessInspector(terminalPid, session.contained).pipe(
         Effect.asSome,
         Effect.catch((reason) =>
           Effect.logWarning("failed to check terminal subprocess activity", {
@@ -2956,6 +3014,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
         rows,
         process: null,
         shell: null,
+        contained: null,
         unsubscribeData: null,
         unsubscribeExit: null,
         hasRunningSubprocess: false,
@@ -3523,8 +3582,12 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
             (input.terminalId === undefined || session.terminalId === input.terminalId),
         );
         if (running.length === 0) return;
+        const outputOnly = "ignoreOutput" in input && input.ignoreOutput;
         const marks = new Map(
-          running.map((session) => [session.terminalId, terminalActivityMark(session)]),
+          running.map((session) => [
+            session.terminalId,
+            { mark: terminalActivityMark(session), inputs: session.inputCount, pid: session.pid },
+          ]),
         );
         // Inspect now so commands started after the last poll still protect their terminals.
         const { inspector: inspectorResult } = yield* acquireSubprocessInspector(
@@ -3534,13 +3597,19 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
         yield* Effect.forEach(
           running,
           (session) =>
-            inspector(session.pid).pipe(
-              Effect.flatMap((result) =>
-                result.hasRunningSubprocess ||
-                terminalActivityMark(session) !== marks.get(session.terminalId)
+            inspector(session.pid, session.contained).pipe(
+              Effect.flatMap((result) => {
+                const before = marks.get(session.terminalId)!;
+                const unchanged =
+                  outputOnly && session.contained !== null
+                    ? session.status === "running" &&
+                      session.pid === before.pid &&
+                      session.inputCount === before.inputs
+                    : terminalActivityMark(session) === before.mark;
+                return result.hasRunningSubprocess || !unchanged
                   ? Effect.void
-                  : closeSession(input.threadId, session.terminalId, false),
-              ),
+                  : closeSession(input.threadId, session.terminalId, false);
+              }),
             ),
           { discard: true },
         );

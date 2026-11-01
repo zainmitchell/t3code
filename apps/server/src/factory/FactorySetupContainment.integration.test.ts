@@ -1,3 +1,4 @@
+import * as NodeChildProcess from "node:child_process";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
@@ -236,7 +237,7 @@ const layerFor = (
         logsDir: `${directory}/terminals`,
         ptyAdapter,
         shellResolver: () => shell,
-        processTable: Effect.succeed([]),
+        processTable: hostProcessTable,
       }),
     ),
   ).pipe(
@@ -470,6 +471,40 @@ const failingOnce = (_port: number, directory: string) => {
   return `if (-not (Test-Path '${marker}')) { New-Item -ItemType File '${marker}' | Out-Null; & '${process.execPath}' -e 'process.exit(3)' }`;
 };
 
+/** A setup that succeeds, as a bootstrap does before its verifier starts. */
+const succeeding = () => `& '${process.execPath}' -e 'process.exit(0)'`;
+
+/**
+ * The host's whole process table, read as the server's own fallback reads it. A fake or empty
+ * table hides how a contained shell sits under its custody wrapper; a failed read is a defect.
+ */
+const hostProcessTable = Effect.promise(
+  () =>
+    new Promise<ReadonlyArray<{ pid: number; ppid: number; name: string }>>((resolve, reject) =>
+      NodeChildProcess.execFile(
+        "powershell.exe",
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId)|$($_.ParentProcessId)|$($_.Name)" }',
+        ],
+        { maxBuffer: 16 * 1024 * 1024, windowsHide: true },
+        (error, stdout) =>
+          error
+            ? reject(error)
+            : resolve(
+                stdout.split(/\r?\n/).flatMap((line) => {
+                  const [pid, ppid, name = ""] = line.trim().split("|", 3);
+                  return Number(pid) > 0 && Number.isInteger(Number(ppid))
+                    ? [{ pid: Number(pid), ppid: Number(ppid), name }]
+                    : [];
+                }),
+              ),
+      ),
+    ),
+);
+
 const withRepository = <A, E, R>(
   body: (
     milestones: Effect.Success<typeof makeMilestones>,
@@ -640,6 +675,60 @@ describe.runIf(HostProcess.Platform.defaultValue() === "win32")(
               yield* milestones.ended("leaf");
             }),
           { shell: "t3-no-such-shell.exe" },
+        ),
+    );
+
+    it.live(
+      "a contained setup that succeeded retires its own shell, so nothing of it holds the container when its provider starts",
+      () =>
+        withRepository(
+          () =>
+            Effect.gen(function* () {
+              const store = yield* FactoryStore.FactoryStore;
+              const generations = yield* FactoryExecutionGenerations.FactoryExecutionGenerations;
+              const terminals = yield* TerminalManager.TerminalManager;
+              const { threadId, runId, reservationId } = yield* launchedExecution("succeeded");
+              const setupTerminals: Array<string> = [];
+              yield* terminals.subscribe((event) =>
+                Effect.sync(() => {
+                  if (event.threadId === threadId && event.type === "started") {
+                    setupTerminals.push(event.terminalId);
+                  }
+                }),
+              );
+              const ownerId = PreparationOwnerId.make("owner:succeeded:1");
+              yield* store.openWorkspaceObligation({
+                runId,
+                reservationId,
+                threadId,
+                commandId: FactoryClaimStore.preparationCommandId(runId),
+                ownerId,
+              });
+              const generation = yield* generations.openIntent({ runId, reservationId, threadId });
+              yield* generations.hold(generation);
+
+              // The setup runs in its container, succeeds, and the run leaves preparation.
+              const prepared = yield* prepareOwned(threadId, runId, ownerId);
+              assert.strictEqual(prepared.status, "starting");
+              yield* prepared.handle.ended;
+              assert.strictEqual(setupTerminals.length, 1);
+              const shell = yield* Effect.exit(
+                terminals.getShell({ threadId, terminalId: setupTerminals[0]! }),
+              );
+              assert.isTrue(Exit.isFailure(shell), "the succeeded setup's own shell was retired");
+              // With it gone, nothing of the setup is left in the container the provider joins.
+              const own = yield* generations.observe([runId]).pipe(
+                Effect.map((facts) => facts.get(runId)),
+                Effect.repeat({
+                  until: (facts) => facts?.type === "quiet",
+                  times: 40,
+                  // oxlint-disable-next-line t3code/no-real-time-wait-in-tests -- a job object signals nothing when a member exits; passes re-read its count, as the lifecycle's do.
+                  schedule: Schedule.spaced("250 millis"),
+                }),
+              );
+              assert.deepStrictEqual(own, { type: "quiet", providerJoined: false });
+            }),
+          { command: succeeding, async: false },
         ),
     );
 

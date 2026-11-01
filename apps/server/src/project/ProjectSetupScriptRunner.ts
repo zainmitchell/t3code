@@ -586,12 +586,15 @@ export const make = Effect.gen(function* () {
 
     // A failed setup's shell stays open for its owner to look into. A contained one is a member of
     // its run's container, so left open it would hold the run until someone closed it; the shell is
-    // this call's own, so only it goes, and only while nothing runs in it.
+    // this call's own, so only it goes, and only while nothing runs in it. Once a contained script
+    // reported success, the prompt it redraws after the sentinel is output only, never use.
     const completion = observed?.completion.pipe(
       Effect.tap(({ exitCode }) =>
-        exitCode === 0 || contained
-          ? terminalManager.closeIdle({ threadId: input.threadId, terminalId })
-          : Effect.void,
+        exitCode === 0 && contained
+          ? terminalManager.closeIdle({ threadId: input.threadId, terminalId, ignoreOutput: true })
+          : exitCode === 0 || contained
+            ? terminalManager.closeIdle({ threadId: input.threadId, terminalId })
+            : Effect.void,
       ),
     );
 

@@ -1053,6 +1053,248 @@ it.layer(
       }),
   );
 
+  // A contained terminal's pty runs the custody wrapper ("join" here), which runs the shell.
+  const containedWindowsPowerShell =
+    "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+  const resolveOnlyWindowsPowerShell = (command: string) =>
+    command.toLowerCase().endsWith("powershell.exe") ? containedWindowsPowerShell : undefined;
+  type ProcessRow = { readonly pid: number; readonly ppid: number; readonly name: string };
+  const wrapperRow = (pid: number): ProcessRow => ({ pid, ppid: 1, name: "join" });
+  const shellRow = (pid: number): ProcessRow => ({
+    pid: pid + 1,
+    ppid: pid,
+    name: "powershell.exe",
+  });
+
+  it.effect.each([
+    ["its wrapper's own idle shell", true, (pid: number) => [wrapperRow(pid), shellRow(pid)], true],
+    [
+      "a shell running a command",
+      true,
+      (pid: number) => [
+        wrapperRow(pid),
+        shellRow(pid),
+        { pid: pid + 2, ppid: pid + 1, name: "node.exe" },
+      ],
+      false,
+    ],
+    ["a wrapper running no shell", true, (pid: number) => [wrapperRow(pid)], false],
+    [
+      "a wrapper running two processes",
+      true,
+      (pid: number) => [
+        wrapperRow(pid),
+        shellRow(pid),
+        { pid: pid + 3, ppid: pid, name: "powershell.exe" },
+      ],
+      false,
+    ],
+    [
+      "a wrapper running another program",
+      true,
+      (pid: number) => [wrapperRow(pid), { pid: pid + 1, ppid: pid, name: "cmd.exe" }],
+      false,
+    ],
+    ["a wrapper the snapshot lacks", true, () => [], false],
+    [
+      "a wrapper under another name",
+      true,
+      (pid: number) => [{ pid, ppid: 1, name: "other" }, shellRow(pid)],
+      false,
+    ],
+    [
+      "an uncontained idle shell",
+      false,
+      (pid: number) => [{ pid, ppid: 1, name: "pwsh.exe" }],
+      true,
+    ],
+    [
+      "an uncontained shell running a command",
+      false,
+      (pid: number) => [
+        { pid, ppid: 1, name: "pwsh.exe" },
+        { pid: pid + 2, ppid: pid, name: "node.exe" },
+      ],
+      false,
+    ],
+    ["an uncontained shell the snapshot lacks", false, () => [], true],
+  ] as const)("closeIdle closes %s only when it is idle", ([, contained, rows, closed]) =>
+    Effect.gen(function* () {
+      let table: ReadonlyArray<ProcessRow> = [];
+      const { manager, ptyAdapter } = yield* createManager(5, {
+        shellResolver: () => "pwsh.exe",
+        env: { SystemRoot: "C:\\Windows" },
+        subprocessPollIntervalMs: 60_000,
+        processTable: Effect.sync(() => table),
+      }).pipe(Effect.provide(layerWithHostPlatform("win32")));
+      yield* manager
+        .open(openInput({ terminalId: "setup" }))
+        .pipe(
+          Effect.provideService(
+            CurrentExecutionJoin,
+            contained ? Option.some(generationJoin([])) : Option.none(),
+          ),
+          Effect.provideService(SpawnExecutableResolution, resolveOnlyWindowsPowerShell),
+        );
+      const [terminal] = ptyAdapter.processes;
+      expect(ptyAdapter.spawnInputs[0]?.shell).toBe(contained ? "join" : "pwsh.exe");
+      table = rows(terminal!.pid);
+      yield* manager.closeIdle({ threadId: "thread-1", terminalId: "setup" });
+      expect(terminal!.killed).toBe(closed);
+    }),
+  );
+
+  it.effect(
+    "retires a contained terminal on output alone only for the terminal its owner names, never on input",
+    () =>
+      Effect.gen(function* () {
+        const ptyAdapter = new FakePtyAdapter();
+        let duringCheck: (pid: number) => Effect.Effect<void> = () => Effect.void;
+        const busy = new Set<number>();
+        const { manager } = yield* createManager(5, {
+          ptyAdapter,
+          shellResolver: () => "pwsh.exe",
+          env: { SystemRoot: "C:\\Windows" },
+          subprocessPollIntervalMs: 60_000,
+          subprocessInspector: (pid) =>
+            duringCheck(pid).pipe(
+              Effect.as({
+                hasRunningSubprocess: busy.has(pid),
+                childCommand: null,
+                processIds: [],
+              }),
+            ),
+        }).pipe(Effect.provide(layerWithHostPlatform("win32")));
+        const outputs = yield* Queue.unbounded<string>();
+        const unsubscribe = yield* manager.subscribe((event) =>
+          event.type === "output"
+            ? Queue.offer(outputs, event.terminalId).pipe(Effect.asVoid)
+            : Effect.void,
+        );
+        yield* Effect.addFinalizer(() => Effect.sync(unsubscribe));
+        const openContained = (terminalId: string) =>
+          manager
+            .open(openInput({ terminalId }))
+            .pipe(
+              Effect.provideService(CurrentExecutionJoin, Option.some(generationJoin([]))),
+              Effect.provideService(SpawnExecutableResolution, resolveOnlyWindowsPowerShell),
+            );
+        for (const terminalId of ["echoed", "typed", "busy", "unnamed"])
+          yield* openContained(terminalId);
+        yield* manager.open(openInput({ terminalId: "plain" }));
+        const [echoed, typed, busyShell, unnamed, plain] = ptyAdapter.processes;
+        busy.add(busyShell!.pid);
+        // The prompt a shell redraws while it is checked, as a long prompt does at 120 columns.
+        const redraw = (process: FakePtyProcess, terminalId: string) =>
+          Effect.gen(function* () {
+            process.emitData("\x1b[29;120H07cbeed71430b>");
+            while ((yield* Queue.take(outputs)) !== terminalId) {}
+          });
+        duringCheck = (pid) =>
+          pid === echoed!.pid
+            ? redraw(echoed!, "echoed")
+            : pid === plain!.pid
+              ? redraw(plain!, "plain")
+              : pid === typed!.pid
+                ? manager
+                    .write({ threadId: "thread-1", terminalId: "typed", data: "make build\r" })
+                    .pipe(Effect.orDie)
+                : Effect.void;
+
+        for (const terminalId of ["echoed", "typed", "busy", "plain"]) {
+          yield* manager.closeIdle({ threadId: "thread-1", terminalId, ignoreOutput: true });
+        }
+        expect(
+          [echoed, typed, busyShell, unnamed, plain].map((process) => process!.killed),
+        ).toEqual([true, false, false, false, false]);
+      }),
+  );
+
+  it.effect(
+    "a contained setup that succeeded retires its own shell though its prompt redraws while it is checked",
+    () =>
+      Effect.gen(function* () {
+        let table: ReadonlyArray<ProcessRow> = [];
+        let duringCheck: Effect.Effect<void> = Effect.void;
+        const { manager, ptyAdapter, baseDir } = yield* createManager(5, {
+          shellResolver: () => "pwsh.exe",
+          env: { SystemRoot: "C:\\Windows" },
+          subprocessPollIntervalMs: 60_000,
+          processTable: Effect.suspend(() => duringCheck).pipe(
+            Effect.andThen(Effect.sync(() => table)),
+          ),
+        }).pipe(Effect.provide(layerWithHostPlatform("win32")));
+        const typedInto = yield* Queue.unbounded<string>();
+        const redrawn = yield* Deferred.make<void>();
+        const unsubscribe = yield* manager.subscribe((event) =>
+          event.type === "output" && event.data.includes("07cbeed71430b>")
+            ? Deferred.succeed(redrawn, undefined).pipe(Effect.asVoid)
+            : Effect.void,
+        );
+        yield* Effect.addFinalizer(() => Effect.sync(unsubscribe));
+        const runner = yield* ProjectSetupScriptRunner.make.pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              Layer.succeed(
+                TerminalManager.TerminalManager,
+                TerminalManager.TerminalManager.of({
+                  ...manager,
+                  write: (input) =>
+                    manager
+                      .write(input)
+                      .pipe(Effect.tap(() => Queue.offer(typedInto, input.terminalId))),
+                }),
+              ),
+              Layer.mock(ProjectService.ProjectService)({}),
+              Layer.mock(ProjectionStore.ProjectionStoreV2)({
+                getThreadShell: () => Effect.succeed(null),
+              }),
+              ServerSettings.layerTest(),
+            ),
+          ),
+        );
+        const started = yield* runner
+          .runForThread({
+            threadId: "thread-1",
+            worktreePath: baseDir,
+            project: {
+              id: ProjectId.make("project-1"),
+              workspaceRoot: baseDir,
+              scripts: [
+                {
+                  id: "setup",
+                  name: "Setup",
+                  command: "vp i",
+                  icon: "configure",
+                  runOnWorktreeCreate: true,
+                },
+              ],
+            },
+            observeCompletion: {},
+          })
+          .pipe(
+            Effect.provideService(CurrentExecutionJoin, Option.some(generationJoin([]))),
+            Effect.provideService(SpawnExecutableResolution, resolveOnlyWindowsPowerShell),
+          );
+        assert(started.status === "started" && started.completion !== undefined);
+        expect(yield* Queue.take(typedInto)).toBe(started.terminalId);
+        const shell = ptyAdapter.processes.at(-1)!;
+        table = [wrapperRow(shell.pid), shellRow(shell.pid)];
+        // The prompt arrives in two pieces; the second lands while the shell is being checked.
+        duringCheck = Effect.gen(function* () {
+          duringCheck = Effect.void;
+          shell.emitData("\x1b[29;120H07cbeed71430b>");
+          yield* Deferred.await(redrawn);
+        });
+        const token = /__T3_SETUP_DONE___(\w+):/.exec(shell.writes[0]!)![1];
+        shell.emitData(
+          `\r\n__T3_SETUP_DONE___${token}:0\r\nPS C:\\worktrees\\t3-factory-connector-na-6920`,
+        );
+        expect((yield* started.completion).exitCode).toBe(0);
+        expect(shell.killed).toBe(true);
+      }),
+  );
+
   it.effect("closes only a thread's idle shells, ignoring a helper forked from the shell", () =>
     Effect.gen(function* () {
       const { manager, ptyAdapter } = yield* createManager(5, {
