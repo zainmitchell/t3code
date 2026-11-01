@@ -121,6 +121,7 @@ import * as FactoryCommandPolicy from "./FactoryCommandPolicy.ts";
 import * as FactoryGitReadback from "./FactoryGitReadback.ts";
 import * as FactoryLifecycle from "./FactoryLifecycle.ts";
 import * as FactoryOutcomeStore from "./FactoryOutcomeStore.ts";
+import { executionIdentity } from "./factoryOutcomes.ts";
 import * as FactoryEffects from "./FactoryEffects.ts";
 import * as FactoryIntegrator from "./FactoryIntegrator.ts";
 import * as FactoryOperationStore from "./FactoryOperationStore.ts";
@@ -17646,6 +17647,10 @@ const failFast = (admission: FactoryLifecycle.FactoryAdmissionResult) =>
     completeLatestRun(execution.threadId, "failed"),
   );
 
+/** A worker whose turn completes without a report: no failure of its environment. */
+const endsWithoutResult = (admission: FactoryLifecycle.FactoryAdmissionResult) =>
+  Effect.flatMap(startStage(admission), (execution) => completeLatestRun(execution.threadId));
+
 const ownerComment = (issueNumber: number, body: string) =>
   Effect.map(GitHubFake, (fake) => {
     fake.issues.get(issueKey(claimRepository, issueNumber))!.comments.push({
@@ -17671,13 +17676,13 @@ it.effect(
             failure: "Verification failed: the 17/03 row is skipped.",
             summary: "Verification failed.",
           });
-          // Each correction's worker fails at once, as one does on an account at its usage limit.
+          // Each correction's worker ends its turn without a result.
           const correct = admittedBy(yield* advance("outcome"));
           assert.deepStrictEqual(stageOf(correct), [item, "correct"]);
-          yield* failFast(correct);
+          yield* endsWithoutResult(correct);
           const retry = admittedBy(yield* advance("outcome"));
           assert.deepStrictEqual(stageOf(retry), [item, "correct"]);
-          yield* failFast(retry);
+          yield* endsWithoutResult(retry);
           // The same attempt failing the same way is the same decision: nothing refills.
           const starts = (yield* startedTurns).length;
           assert.deepStrictEqual(admittedOnly(yield* advance("outcome", 3)), []);
@@ -17736,9 +17741,9 @@ it.effect(
             failure: "Verification failed: the 17/03 row is skipped.",
             summary: "Verification failed.",
           });
-          yield* failFast(admittedBy(yield* advance("outcome")));
+          yield* endsWithoutResult(admittedBy(yield* advance("outcome")));
           const retried = admittedBy(yield* advance("outcome"));
-          yield* failFast(retried);
+          yield* endsWithoutResult(retried);
           assert.deepStrictEqual(admittedOnly(yield* advance("outcome", 2)), []);
           // Stalled: the owner is asked about the correction attempt that just ended without a result.
           const outcomes = yield* FactoryOutcomeStore.FactoryOutcomeStore;
@@ -17769,7 +17774,7 @@ it.effect(
           const again = admittedBy(yield* advance("owner_decision"));
           assert.deepStrictEqual(stageOf(again), [item, "correct"]);
           // Each rejection is one more attempt, not a new refill.
-          yield* failFast(again);
+          yield* endsWithoutResult(again);
           assert.deepStrictEqual(admittedOnly(yield* advance("outcome", 3)), []);
           // Stalled again, the owner is asked again, on the attempt that just ended, and can retry once more.
           const open = (yield* factoryCards(ownerThreadId)).filter(
@@ -17800,9 +17805,9 @@ const stalledCorrection = (issueNumber: number) =>
       failure: "Verification failed: the 17/03 row is skipped.",
       summary: "Verification failed.",
     });
-    yield* failFast(admittedBy(yield* advance("outcome")));
+    yield* endsWithoutResult(admittedBy(yield* advance("outcome")));
     const retried = admittedBy(yield* advance("outcome"));
-    yield* failFast(retried);
+    yield* endsWithoutResult(retried);
     assert.deepStrictEqual(admittedOnly(yield* advance("outcome", 2)), []);
     const outcomes = yield* FactoryOutcomeStore.FactoryOutcomeStore;
     const [ended] = yield* outcomes.listForOrigin(retried.reservation.reservationId);
@@ -17950,43 +17955,325 @@ it.effect(
     ),
 );
 
+/** The lifecycle factory's build execution, as configured. */
+const buildExecution = {
+  modelSelection: rosterSelection,
+  runtimeMode: "full-access",
+  interactionMode: "default",
+} satisfies FactoryLifecycle.FactoryConfigurationInput["execution"];
+
+/** The admitted decisions of two passes that run at once. */
+const concurrentPasses = Effect.gen(function* () {
+  const factory = yield* FactoryLifecycle.FactoryLifecycle;
+  const results = yield* Effect.all(
+    [
+      factory.reconcile({ factoryId, trigger: "clock" }),
+      factory.reconcile({ factoryId, trigger: "tracker_event" }),
+    ],
+    { concurrency: "unbounded" },
+  );
+  yield* runEffects;
+  return admittedOnly(
+    results.flatMap((result) => (result.type === "collected" ? result.admissions : [])),
+  );
+});
+
+/** A restarted server's first pass: a new lifecycle over the same stores, nothing in memory. */
+const restartedPass = Effect.gen(function* () {
+  const scope = yield* Scope.make();
+  const restarted = yield* freshLifecycle(scope);
+  const result = yield* restarted.reconcile({ factoryId, trigger: "restart" });
+  yield* Scope.close(scope, Exit.void);
+  yield* runEffects;
+  return result.type === "collected" ? admittedOnly(result.admissions) : [];
+});
+
+/** The item's missing results, as T3 recorded them. */
+const missingResults = (issueNumber: number) =>
+  Effect.gen(function* () {
+    const outcomes = yield* FactoryOutcomeStore.FactoryOutcomeStore;
+    const events = yield* outcomes.itemEvents({ factoryId, itemKey: itemKeyFor(issueNumber) });
+    const missing = [];
+    for (const event of events) {
+      if (event.type !== "outcome" || !event.outcomeId.startsWith("no-result:")) continue;
+      missing.push(Option.getOrThrow(yield* outcomes.get(event.outcomeId)));
+    }
+    return missing;
+  });
+
+/** Nothing starts over outcome and clock passes, and no worker turn begins. */
+const startsNothing = Effect.gen(function* () {
+  const starts = (yield* startedTurns).length;
+  assert.deepStrictEqual(admittedOnly(yield* advance("outcome", 3)), []);
+  assert.deepStrictEqual(admittedOnly(yield* advance("clock", 3)), []);
+  assert.strictEqual((yield* startedTurns).length, starts);
+});
+
+/** Whether the item's last pass left it waiting on the execution its stage failed in. */
+const waitsOnEnvironment = (issueNumber: number) =>
+  Effect.map(
+    recordOf(issueNumber),
+    (record) =>
+      record?.disposition === "nothing_proposed" && record.reasonClass === "awaiting_environment",
+  );
+
 it.effect(
-  "Lifecycle/N22: implement and rework that keep ending without a result are corrected once, however many specs; a real failure still is",
+  "Environment/#107: a build that fails in its environment is never corrected, and waits while its execution is unchanged",
   () =>
     runIsolated(
       Effect.scoped(
         Effect.gen(function* () {
           yield* configureLifecycleFactory;
           yield* seedIssue(7943);
-          const item = `github:${claimRepository}#7943`;
-          // Corrections succeed, as on another account; every build fails at once.
           yield* failFast(admittedBy(yield* advance("tracker_event", 1)));
-          const correct = admittedBy(yield* advance("outcome"));
-          assert.deepStrictEqual(stageOf(correct), [item, "correct"]);
-          yield* workStage(correct, { outcome: "correction_spec", summary: "Build it." });
-          yield* failFast(admittedBy(yield* advance("outcome")));
-          const recorrect = admittedBy(yield* advance("outcome"));
-          assert.deepStrictEqual(stageOf(recorrect), [item, "correct"]);
-          yield* workStage(recorrect, { outcome: "correction_spec", summary: "Report a result." });
-          yield* failFast(admittedBy(yield* advance("outcome")));
-          // The rework failing the same way again is the same failure: no new correction.
+          yield* startsNothing;
+          assert.deepStrictEqual(yield* itemHistory(7943), ["implement", "failed"]);
+          assert.isTrue(yield* waitsOnEnvironment(7943));
+          // The failure is bound to the attempt and to the execution it ran on.
+          const [missing] = yield* missingResults(7943);
+          assert.deepStrictEqual(
+            [missing?.report.failureClass, missing?.report.failedOn],
+            ["environment", executionIdentity(buildExecution)],
+          );
+          // New text and changes to executions the build does not use are no change of its own.
+          yield* ownerComment(7943, "Owner: please try the build again.");
+          yield* configureFactory(
+            lifecycleConfiguration({
+              stageExecution: {
+                review: { ...buildExecution, interactionMode: "plan" },
+                triage: { ...buildExecution, runtimeMode: "approval-required" },
+              },
+              executionChoices: { builder: { ...buildExecution, interactionMode: "plan" } },
+            }),
+          );
+          assert.deepStrictEqual(admittedOnly(yield* advance("tracker_event", 3)), []);
+          yield* startsNothing;
+          assert.isTrue(yield* waitsOnEnvironment(7943));
+          assert.deepStrictEqual(yield* itemHistory(7943), ["implement", "failed"]);
+        }),
+      ),
+    ),
+);
+
+it.effect.each([
+  ["runtime", { ...buildExecution, runtimeMode: "approval-required" }],
+  ["interaction", { ...buildExecution, interactionMode: "plan" }],
+] as const)(
+  "Environment/#107: a %s change to the build's execution runs it once more, across concurrent passes and a restart, and its result moves the item on; the same edit of its ended thread does not",
+  ([mode, changed]) =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* configureLifecycleFactory;
+          yield* seedIssue(7944);
+          const item = `github:${claimRepository}#7944`;
+          const build = admittedBy(yield* advance("tracker_event", 1));
+          yield* failFast(build);
+          // Edited after its run ended and before collection: not the execution it ran on.
+          const threadId = admittedExecution(build).threadId;
+          yield* (yield* Orchestrator.OrchestratorV2).dispatch(
+            mode === "runtime"
+              ? {
+                  type: "thread.runtime-mode.set",
+                  commandId: CommandId.make("edit-ended-build"),
+                  threadId,
+                  runtimeMode: changed.runtimeMode,
+                }
+              : {
+                  type: "thread.interaction-mode.set",
+                  commandId: CommandId.make("edit-ended-build"),
+                  threadId,
+                  interactionMode: changed.interactionMode,
+                },
+          );
+          yield* startsNothing;
+          assert.isTrue(yield* waitsOnEnvironment(7944));
+          const [missing] = yield* missingResults(7944);
+          assert.strictEqual(missing?.report.failedOn, executionIdentity(buildExecution));
+          yield* configureFactory(
+            lifecycleConfiguration({ stageExecution: { implement: changed } }),
+          );
           const starts = (yield* startedTurns).length;
-          assert.deepStrictEqual(admittedOnly(yield* advance("outcome", 3)), []);
+          const [retry, ...others] = yield* concurrentPasses;
+          assert.deepStrictEqual(others, []);
+          assert.deepStrictEqual(stageOf(retry!), [item, "implement"]);
+          const basis =
+            retry!.reservation.origin === "admitted" ? retry!.reservation.stageBasis : undefined;
+          assert.match(
+            basis ?? "",
+            new RegExp(`^implement:env:[0-9a-f]{12}:${executionIdentity(changed)}$`),
+          );
           assert.deepStrictEqual(admittedOnly(yield* advance("clock", 3)), []);
-          assert.strictEqual((yield* startedTurns).length, starts);
-          // A person's comment is new evidence: one more correction, whose rework then reports a
-          // real failure, which is corrected as any is.
-          yield* ownerComment(7943, "Owner: the builders' account is back.");
-          const asked = admittedBy(yield* advance("tracker_event"));
-          assert.deepStrictEqual(stageOf(asked), [item, "correct"]);
-          yield* workStage(asked, { outcome: "correction_spec", summary: "Build it, now." });
-          const rework = admittedBy(yield* advance("outcome"));
-          yield* workStage(rework, {
-            outcome: "failed",
-            failure: "Verification failed: the importer counts a row twice.",
-            summary: "Verification failed.",
+          assert.deepStrictEqual(yield* restartedPass, []);
+          assert.strictEqual((yield* startedTurns).length, starts + 1);
+          // The retry reports: the item goes to review, never to a correction of its source.
+          yield* recordCommit("e0007944", [lifecycleBase]);
+          yield* workStage(retry!, {
+            outcome: "implemented",
+            subject: subjectFor("e0007944", lifecycleBase),
+            summary: "Built on the repaired execution.",
           });
-          assert.deepStrictEqual(stageOf(admittedBy(yield* advance("outcome"))), [item, "correct"]);
+          assert.deepStrictEqual(stageOf(admittedBy(yield* advance("outcome"))), [item, "review"]);
+          assert.deepStrictEqual(yield* itemHistory(7944), [
+            "implement",
+            "failed",
+            "implement",
+            "implemented",
+            "review",
+          ]);
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Environment/#107: the execution a decision names is the one judged, not the unused default; a repeat failure waits again",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* configureLifecycleFactory;
+          const builder = { ...buildExecution, interactionMode: "plan" } as const;
+          yield* usePolicy((input) =>
+            Effect.map(stageRequest(input), (decision) =>
+              input.stage.type === "implement" && decision !== undefined && "taskKind" in decision
+                ? { ...decision, execution: "builder" }
+                : decision,
+            ),
+          );
+          yield* configureFactory(lifecycleConfiguration({ executionChoices: { builder } }));
+          yield* seedIssue(7945);
+          const item = `github:${claimRepository}#7945`;
+          yield* failFast(admittedBy(yield* advance("tracker_event", 1)));
+          yield* startsNothing;
+          const [missing] = yield* missingResults(7945);
+          assert.strictEqual(missing?.report.failedOn, executionIdentity(builder));
+          // Only the unused defaults change.
+          const other = { ...buildExecution, runtimeMode: "approval-required" } as const;
+          yield* configureFactory(
+            lifecycleConfiguration({
+              execution: other,
+              stageExecution: { implement: other },
+              executionChoices: { builder },
+            }),
+          );
+          yield* startsNothing;
+          assert.isTrue(yield* waitsOnEnvironment(7945));
+          // The named execution changes: one more build, which fails the same way and waits.
+          const repaired = { ...builder, runtimeMode: "approval-required" } as const;
+          yield* configureFactory(
+            lifecycleConfiguration({ executionChoices: { builder: repaired } }),
+          );
+          const retry = admittedBy(yield* advance("clock", 1));
+          assert.deepStrictEqual(stageOf(retry), [item, "implement"]);
+          yield* failFast(retry);
+          yield* startsNothing;
+          assert.isTrue(yield* waitsOnEnvironment(7945));
+          assert.deepStrictEqual(
+            (yield* missingResults(7945)).map((outcome) => outcome.report.failedOn),
+            [executionIdentity(builder), executionIdentity(repaired)],
+          );
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Environment/#107: the owner's rejection of the failure runs it once more on the same execution, and an owner hold still holds",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* configureLifecycleFactory;
+          yield* seedIssue(7946);
+          const item = `github:${claimRepository}#7946`;
+          yield* failFast(admittedBy(yield* advance("tracker_event", 1)));
+          yield* startsNothing;
+          const [missing] = yield* missingResults(7946);
+          // The provider's credential is repaired, which T3 cannot see; its owner says so.
+          yield* usePolicy(reserveBeforeStart);
+          const factory = yield* FactoryLifecycle.FactoryLifecycle;
+          assert.isTrue(
+            yield* factory.rejectOutcome({
+              factoryId,
+              outcomeId: missing!.outcomeId,
+              reason: "The builders' credential is repaired.",
+              by: "session:owner:1",
+            }),
+          );
+          // The owner's start gate is unanswered: nothing starts beside it.
+          yield* startsNothing;
+          assert.strictEqual(yield* dispositionOf(7946), "reserved_decision");
+          yield* usePolicy(stageRequest);
+          const retry = admittedBy(yield* advance("owner_decision", 1));
+          assert.deepStrictEqual(stageOf(retry), [item, "implement"]);
+          yield* failFast(retry);
+          yield* startsNothing;
+          assert.isTrue(yield* waitsOnEnvironment(7946));
+          assert.notInclude(yield* itemHistory(7946), "correct");
+        }),
+      ),
+    ),
+);
+
+it.effect.each(["runtime", "owner"] as const)(
+  "Environment/#107: a correction that failed in its environment, run again after a %s repair, still corrects its failure",
+  (repair) =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* configureLifecycleFactory;
+          yield* seedIssue(7948);
+          const item = itemKeyFor(7948);
+          yield* workStage(admittedBy(yield* advance("tracker_event", 1)), {
+            outcome: "failed",
+            failure: "The importer drops the header row.",
+            summary: "Source fails.",
+          });
+          const correction = admittedBy(yield* advance("outcome"));
+          assert.deepStrictEqual(stageOf(correction), [item, "correct"]);
+          yield* failFast(correction);
+          yield* startsNothing;
+          assert.isTrue(yield* waitsOnEnvironment(7948));
+          if (repair === "runtime") {
+            yield* configureFactory(
+              lifecycleConfiguration({
+                stageExecution: {
+                  correct: { ...buildExecution, runtimeMode: "approval-required" },
+                },
+              }),
+            );
+          } else {
+            const [missing] = yield* missingResults(7948);
+            const factory = yield* FactoryLifecycle.FactoryLifecycle;
+            assert.isTrue(
+              yield* factory.rejectOutcome({
+                factoryId,
+                outcomeId: missing!.outcomeId,
+                reason: "The correctors' credential is repaired.",
+                by: "session:owner:1",
+              }),
+            );
+          }
+          const retry = admittedBy(yield* advance("clock", 1));
+          assert.deepStrictEqual(stageOf(retry), [item, "correct"]);
+          yield* workStage(retry, { outcome: "correction_spec", summary: "Keep the header row." });
+          const next = admittedOnly(yield* advance("outcome"));
+          const events = yield* (yield* FactoryOutcomeStore.FactoryOutcomeStore).itemEvents({
+            factoryId,
+            itemKey: item,
+          });
+          assert.deepStrictEqual(
+            events.flatMap((event) =>
+              event.type === "outcome" && event.kind === "correction_spec" ? [event.corrects] : [],
+            ),
+            events.flatMap((event) =>
+              event.type === "outcome" && event.kind === "failed" && event.stage === "implement"
+                ? [event.failureDigest]
+                : [],
+            ),
+          );
+          assert.deepStrictEqual(next.map(stageOf), [[item, "rework"]]);
         }),
       ),
     ),
@@ -18002,7 +18289,7 @@ it.effect(
           yield* seedIssue(7944);
           const item = `github:${claimRepository}#7944`;
           // The first version: a build that ended without a result, corrected, then built, reviewed and closed.
-          yield* failFast(admittedBy(yield* advance("tracker_event", 1)));
+          yield* endsWithoutResult(admittedBy(yield* advance("tracker_event", 1)));
           yield* workStage(admittedBy(yield* advance("outcome")), {
             outcome: "correction_spec",
             summary: "Build it.",
@@ -18024,7 +18311,7 @@ it.effect(
           (yield* GitHubFake).issues.get(issueKey(claimRepository, 7944))!.state = "open";
           const next = admittedBy(yield* advance("tracker_event", 1));
           assert.deepStrictEqual(stageOf(next), [item, "implement"]);
-          yield* failFast(next);
+          yield* endsWithoutResult(next);
           const corrected = admittedBy(yield* advance("outcome"));
           assert.deepStrictEqual(stageOf(corrected), [item, "correct"]);
         }),
@@ -23837,6 +24124,59 @@ it.effect(
             itemKeyFor(7981),
             "implement",
           ]);
+          assert.deepStrictEqual(admittedOnly(yield* advance("restart", 3)), []);
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Prepare/E3: editing a failed preparation's ended thread is not another execution; only the configured one changing is",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* configureLifecycleFactory;
+          yield* usePolicy((input) =>
+            input.stage.type === "implement" &&
+            input.triageDecisionKey !== undefined &&
+            !input.outcomes.some((outcome) => outcome.decisionKey === input.triageDecisionKey)
+              ? triageRequest(input)
+              : Effect.succeed({ type: "none" as const, reason: "prepared" }),
+          );
+          yield* seedIssue(7963, { body: "Index the ledger." });
+          const triage = admittedBy(yield* advance("tracker_event", 1));
+          const execution = yield* startStage(triage);
+          yield* completeLatestRun(execution.threadId, "failed");
+          // Its ended thread is switched to another runtime before T3 next decides it.
+          yield* (yield* Orchestrator.OrchestratorV2).dispatch({
+            type: "thread.runtime-mode.set",
+            commandId: CommandId.make("edit-ended-preparation"),
+            threadId: execution.threadId,
+            runtimeMode: "approval-required",
+          });
+          assert.deepStrictEqual(admittedOnly(yield* advance("outcome", 3)), []);
+          assert.deepStrictEqual(admittedOnly(yield* advance("clock", 3)), []);
+          assert.include(
+            (yield* recordOf(7963))?.detail ?? "",
+            "the execution it would prepare on is the one it failed on",
+          );
+          if (triage.reservation.origin !== "admitted") return assert.fail("expected an admission");
+          const failed = Option.getOrThrow(
+            yield* (yield* FactoryOutcomeStore.FactoryOutcomeStore).get(
+              `no-result:${triage.reservation.reservationId}`,
+            ),
+          );
+          // The failure is bound to the execution it was admitted with, not to its thread now.
+          assert.strictEqual(failed.report.failedOn, executionIdentity(buildExecution));
+          // The configured preparer changing to that runtime is the change: one preparation on it.
+          yield* configureFactory(
+            lifecycleConfiguration({
+              stageExecution: { triage: { ...buildExecution, runtimeMode: "approval-required" } },
+            }),
+          );
+          const retry = admittedBy(yield* advance("clock", 3));
+          assert.deepStrictEqual(stageOf(retry), [itemKeyFor(7963), "triage"]);
           assert.deepStrictEqual(admittedOnly(yield* advance("restart", 3)), []);
         }),
       ),

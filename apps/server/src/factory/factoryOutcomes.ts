@@ -33,7 +33,12 @@ import type * as FactoryExecutionGenerations from "./FactoryExecutionGenerations
 import type * as FactoryGitReadback from "./FactoryGitReadback.ts";
 import type * as FactoryOperationStore from "./FactoryOperationStore.ts";
 import * as FactoryOutcomeStore from "./FactoryOutcomeStore.ts";
-import { AGENT_STAGES, expectedOutcomes, type FactoryStageType } from "./factoryStages.ts";
+import {
+  AGENT_STAGES,
+  correctedFailure,
+  expectedOutcomes,
+  type FactoryStageType,
+} from "./factoryStages.ts";
 import type * as FactoryStore from "./FactoryStore.ts";
 
 const sha256 = (text: string) => NodeCrypto.createHash("sha256").update(text).digest("hex");
@@ -57,6 +62,16 @@ export const canonical = (value: unknown): string =>
         )
       : inner,
   );
+
+/** An execution as it runs: its model selection with options, runtime and interaction mode. */
+export const executionIdentity = (execution: {
+  readonly modelSelection: unknown;
+  readonly runtimeMode: string;
+  readonly interactionMode: string;
+}) =>
+  sha256(
+    canonical([execution.modelSelection, execution.runtimeMode, execution.interactionMode]),
+  ).slice(0, 32);
 
 /** The marker an outcome's tracker record carries, found before any write. */
 const reportMarker = (outcomeId: string) => `<!-- t3-factory-report:${outcomeId} -->`;
@@ -288,8 +303,8 @@ export const makeFactoryOutcomes = (deps: FactoryOutcomeDependencies) => {
         canonical([reservation.reservationId, execution.runId, reportDigest]),
       ).slice(0, 40);
       const corrects =
-        stage === "correct" && reservation.stageBasis?.startsWith("correct:") === true
-          ? coreBasis(reservation.stageBasis).slice("correct:".length).split(":retry:")[0]
+        stage === "correct" && reservation.stageBasis !== undefined
+          ? correctedFailure(reservation.stageBasis)
           : undefined;
       const inserted = yield* outcomes.insertReported({
         outcomeId,
@@ -728,14 +743,27 @@ export const makeFactoryOutcomes = (deps: FactoryOutcomeDependencies) => {
       ),
       ...rejected.map((reason) => `Its report was rejected: ${reason}`),
     ].join(" ");
+    // An execution that never started or whose run did not complete failed in its environment.
+    // It is bound to the execution snapshot it was admitted with, never to its thread's modes,
+    // which change after it ends; a reservation admitted without that snapshot names none.
     const environment =
       rejected.length === 0 &&
       (preparationFailures(projection).size > 0 || runs.some((run) => run.status !== "completed"));
+    const { runtimeMode, interactionMode } = reservation;
     const outcomeReport: FactoryOutcomeStore.FactoryOutcomeReport = {
       outcome: "failed",
       failure,
       summary: "No result was reported.",
       ...(environment ? { failureClass: "environment" as const } : {}),
+      ...(environment && runtimeMode !== undefined && interactionMode !== undefined
+        ? {
+            failedOn: executionIdentity({
+              modelSelection: reservation.modelSelection,
+              runtimeMode,
+              interactionMode,
+            }),
+          }
+        : {}),
     };
     // The same stage ending without a result on the same footing is the same failure, however
     // often it repeats, so a fast-failing worker cannot refill it (HSA #94). A review or

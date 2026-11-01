@@ -38,6 +38,8 @@ export const FactoryItemEventRecord = Schema.Union([
     evidenceDigest: Schema.optional(Schema.String),
     failureDigest: Schema.optional(Schema.String),
     corrects: Schema.optional(Schema.String),
+    /** T3's own missing result of an attempt that failed in its environment, on this execution. */
+    environment: Schema.optional(Schema.Struct({ execution: Schema.optional(Schema.String) })),
   }),
   Schema.Struct({
     type: Schema.Literal("rejected"),

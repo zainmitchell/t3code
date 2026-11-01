@@ -72,6 +72,7 @@ import { entryView } from "./factoryEntry.ts";
 import {
   canonical,
   candidateBaseProblem,
+  executionIdentity,
   makeFactoryOutcomes,
   subjectOf,
 } from "./factoryOutcomes.ts";
@@ -136,6 +137,7 @@ import {
 import { forkParked } from "../serverActivation.ts";
 import {
   AGENT_STAGES,
+  environmentFailures,
   type FactoryStage,
   type FactoryStageType,
   isFactoryStage,
@@ -520,16 +522,6 @@ const choiceBasis = (decision: {
   ((decision.resources ?? []).length === 0 && decision.noEdit === undefined)
     ? ""
     : `|exe:${encodeURIComponent(decision.execution)}`;
-
-/** An execution as it runs: its model selection with options, runtime and interaction mode. */
-const executionIdentity = (execution: {
-  readonly modelSelection: unknown;
-  readonly runtimeMode: string;
-  readonly interactionMode: string;
-}) =>
-  sha256(
-    canonical([execution.modelSelection, execution.runtimeMode, execution.interactionMode]),
-  ).slice(0, 32);
 
 /** The stage-basis suffix naming the single-capacity resources a decision holds. */
 const resourceBasis = (resources: ReadonlyArray<string> | undefined) =>
@@ -4609,10 +4601,13 @@ const make = Effect.gen(function* () {
    * membership; the policy's word that they are met counts for nothing. Its plan, or one wait.
    */
   /**
-   * The identity of the execution a failed preparation actually ran on: its thread's model
-   * selection (options included), runtime and interaction mode. Undefined when it cannot be read.
+   * The identity of the execution a failed preparation actually ran on: the one its missing result
+   * recorded from its admission. A record from before that names none, so its thread's model
+   * selection (options included), runtime and interaction mode stand in. Undefined when neither
+   * can be read.
    */
   const executionRanBy = Effect.fnUntraced(function* (failed: FactoryPolicyOutcome) {
+    if (failed.report.failedOn !== undefined) return failed.report.failedOn;
     const reservationId = failed.origin.reservationId;
     if (reservationId === undefined) return undefined;
     const reservation = yield* store.getReservation(reservationId).pipe(Effect.option);
@@ -5279,6 +5274,45 @@ const make = Effect.gen(function* () {
         return { disposition: "stage_mismatch" };
       }
     }
+    // An attempt that failed in its environment runs again only on the execution this decision
+    // chooses when that differs, once per failure, or once on its owner's rejection of it. Before
+    // anything below records a binding or asks for a grant.
+    let environmentRetry = "";
+    const failedIn = isFactoryStage(decision.taskKind)
+      ? environmentFailures(candidate.events).get(stage.type)
+      : undefined;
+    if (failedIn !== undefined) {
+      const failure = `:env:${sha256(failedIn.outcomeId).slice(0, 12)}`;
+      const chosen =
+        decision.execution === undefined
+          ? FactoryStore.executionFor(configuration, stage.type)
+          : configuration.executionChoices?.[decision.execution];
+      const now = chosen === undefined ? undefined : executionIdentity(chosen);
+      if (failedIn.rejected !== undefined) {
+        environmentRetry = `${failure}:owner:${failedIn.rejected.slice(0, 16)}`;
+      } else if (
+        failedIn.execution !== undefined &&
+        now !== undefined &&
+        failedIn.execution !== now
+      ) {
+        environmentRetry = `${failure}:${now}`;
+      } else if (now !== undefined) {
+        // A name the configuration lacks (no `now`) is admission's to refuse.
+        return {
+          disposition: "nothing_proposed",
+          detail: waitText({
+            issue: subject.issueNumber,
+            what: `its last ${stage.type} failed in its environment (${failedIn.outcomeId}) on ${failedIn.execution === undefined ? "an execution T3 could not read" : "the execution it would run on now"}`,
+            actor: "the operator of that execution (its provider credential, model or runtime)",
+            action: `change that execution's model, options, runtime or interaction mode, or reject outcome ${failedIn.outcomeId} once its provider is repaired`,
+            consequence: `no ${stage.type} starts on the environment it failed in, and its source is not corrected for it`,
+            resume:
+              "the execution it is decided on differs from the one it failed on, or that rejection",
+          }),
+          reasonClass: "awaiting_environment",
+        };
+      }
+    }
     if (decision.prepared !== undefined) {
       const stale = yield* preparedStale(configuration, candidate, decision, decision.prepared);
       if (stale !== undefined) {
@@ -5430,7 +5464,7 @@ const make = Effect.gen(function* () {
             stage: {
               type: stage.type,
               // The binding's output root stays last: the store reads it at the end.
-              basis: `${stageBasis(stage)}${resourceBasis(decision.resources)}${choiceBasis(decision)}${noEdit?.basis ?? ""}${bound?.basis ?? ""}`,
+              basis: `${stageBasis(stage)}${environmentRetry}${resourceBasis(decision.resources)}${choiceBasis(decision)}${noEdit?.basis ?? ""}${bound?.basis ?? ""}`,
             },
             ...(candidate.owner === undefined ? {} : { continues: candidate.owner.reservationId }),
             ...(grant === undefined ? {} : { grant }),

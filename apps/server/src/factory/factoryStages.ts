@@ -75,6 +75,11 @@ export type ItemEvent =
       readonly failureDigest?: string;
       /** For a correction spec, the failure digest its decision was admitted to correct. */
       readonly corrects?: string;
+      /**
+       * For T3's own missing result of an attempt that failed in its provider environment: the
+       * identity of the execution it ran on, when T3 could read it. No verdict on the work.
+       */
+      readonly environment?: { readonly execution?: string };
     }
   | {
       /** The owner explicitly rejected an outcome; it is never consumed again. */
@@ -239,7 +244,9 @@ export const nextStage = (events: ReadonlyArray<ItemEvent>): FactoryStage => {
         correctRetry = undefined;
         break;
       case "failed":
-        if (event.failureDigest === undefined) break;
+        // An attempt that failed in its environment leaves the stage where it was; its retry is
+        // the lifecycle's to gate on the execution (`environmentFailures`).
+        if (event.failureDigest === undefined || event.environment !== undefined) break;
         // A review or correction that produced nothing is retried; it is no verdict on the work.
         if (event.stage === "review") {
           reviewRetry = { digest: event.failureDigest, outcomeId: event.outcomeId };
@@ -340,6 +347,51 @@ export const nextStage = (events: ReadonlyArray<ItemEvent>): FactoryStage => {
   return reopenOf === undefined ? { type: "implement" } : { type: "implement", reopenOf };
 };
 
+/** An agent stage whose latest attempt failed in its provider environment, with no verdict since. */
+export interface EnvironmentFailure {
+  readonly outcomeId: string;
+  /** The identity of the execution it failed on; unknown when T3 could not read it. */
+  readonly execution?: string;
+  /** The owner rejected that failure: one more attempt, whatever the execution. */
+  readonly rejected?: string;
+}
+
+/**
+ * Each agent stage whose latest attempt failed in its environment. Any later lifecycle result
+ * ends the lifecycle stages' failures, a later triage result ends triage's, a reopen ends all.
+ */
+export const environmentFailures = (
+  events: ReadonlyArray<ItemEvent>,
+): ReadonlyMap<FactoryStageType, EnvironmentFailure> => {
+  const failures = new Map<FactoryStageType, EnvironmentFailure>();
+  for (const event of [...events].toSorted((left, right) => left.seq - right.seq)) {
+    if (event.type === "reopened") {
+      failures.clear();
+    } else if (event.type === "rejected") {
+      for (const [stage, failure] of failures) {
+        if (failure.outcomeId === event.outcomeId) {
+          failures.set(stage, { ...failure, rejected: event.failureDigest });
+        }
+      }
+    } else if (event.type === "outcome" && event.stage !== undefined) {
+      if (event.stage === "triage") {
+        failures.delete("triage");
+      } else if (event.kind !== "ticket_opened") {
+        for (const stage of failures.keys()) if (stage !== "triage") failures.delete(stage);
+      }
+      if (event.kind === "failed" && event.environment !== undefined) {
+        failures.set(event.stage, {
+          outcomeId: event.outcomeId,
+          ...(event.environment.execution === undefined
+            ? {}
+            : { execution: event.environment.execution }),
+        });
+      }
+    }
+  }
+  return failures;
+};
+
 /**
  * The exact basis a stage decision is made from: the same stage on the same basis is the same
  * decision, however often it is proposed.
@@ -360,6 +412,19 @@ export const stageBasis = (stage: Exclude<FactoryStage, { readonly type: "done" 
       return `close:${stage.integrationOutcomeId}`;
   }
 };
+
+/**
+ * The failure digest a `correct:` stage basis corrects, whatever retry, environment or `|`-led
+ * binding suffix follows it: the digest is sha256 hex, so it never holds a `:` or `|`.
+ */
+export const correctedFailure = (basis: string): string | undefined =>
+  basis.startsWith("correct:") ? basis.slice("correct:".length).split(/[:|]/)[0] : undefined;
+
+/** The `:env:` suffix the lifecycle puts after a stage basis to run it again after an environment failure. */
+const ENVIRONMENT_RETRY = /:env:[0-9a-f]{12}:(?:owner:[0-9a-f]{16}|[0-9a-f]{32})$/;
+
+/** A stage basis's core (before any `|` suffix) without its environment retry. */
+export const withoutEnvironmentRetry = (core: string) => core.replace(ENVIRONMENT_RETRY, "");
 
 /** The outcomes a stage may end in; workers report the agent stages' ones. */
 export const expectedOutcomes: Record<FactoryStageType, ReadonlyArray<FactoryOutcomeKind>> = {

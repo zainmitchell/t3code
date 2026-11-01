@@ -47,6 +47,7 @@ import { admittedBinding, deriveVerificationBinding, makeInsideRoot } from "./Fa
 import * as FactoryOutcomeStore from "./FactoryOutcomeStore.ts";
 import type { Landing } from "./factoryCoordination.ts";
 import { subjectOf } from "./factoryOutcomes.ts";
+import { withoutEnvironmentRetry } from "./factoryStages.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 
@@ -186,7 +187,10 @@ export const boundVerificationOf = (stageBasis: string | undefined) => {
   const keys = suffixes.map((suffix) => suffix.slice(0, suffix.indexOf(":") + 1));
   if (!keys.includes("vb:") && !keys.includes("out:")) return undefined;
   const [binding = "", output = ""] = suffixes.slice(-2);
-  const specOutcomeId = core.startsWith("rework:") ? core.slice("rework:".length) : "";
+  // A rework run again after an environment failure is still the rework of its spec.
+  const specOutcomeId = core.startsWith("rework:")
+    ? withoutEnvironmentRetry(core.slice("rework:".length))
+    : "";
   return specOutcomeId === "" ||
     keys.filter((key) => key === "vb:").length !== 1 ||
     keys.filter((key) => key === "out:").length !== 1 ||

@@ -1,6 +1,13 @@
 import { assert, describe, it } from "@effect/vitest";
 
-import { type ItemEvent, nextStage, PARENT_CLOSURE, stageBasis } from "./factoryStages.ts";
+import {
+  correctedFailure,
+  environmentFailures,
+  type ItemEvent,
+  nextStage,
+  PARENT_CLOSURE,
+  stageBasis,
+} from "./factoryStages.ts";
 
 let seq = 0;
 const admitted = (stage: Extract<ItemEvent, { type: "admitted" }>["stage"]): ItemEvent => ({
@@ -452,4 +459,70 @@ describe("a rejected review result (BTC #106)", () => {
     events.push(outcome("integrated", { stage: "integrate" }), rejected(passed));
     assert.strictEqual(nextStage(events).type, "close");
   });
+});
+
+describe("an attempt that failed in its environment (connector #107)", () => {
+  const environment = (stage: "implement" | "rework" | "review" | "triage", execution = "e1") =>
+    outcome("failed", { stage, failureDigest: `no-result:${stage}`, environment: { execution } });
+
+  it("leaves its stage where it was instead of correcting or retrying it", () => {
+    const implement = [admitted("implement"), environment("implement")];
+    assert.deepStrictEqual(nextStage(implement), { type: "implement" });
+    assert.deepStrictEqual(environmentFailures(implement).get("implement")?.execution, "e1");
+    const events: Array<ItemEvent> = [
+      admitted("implement"),
+      outcome("implemented", { head: "h1" }),
+      admitted("review"),
+      environment("review"),
+    ];
+    const implemented = events[1]!.type === "outcome" ? events[1]!.outcomeId : "";
+    assert.deepStrictEqual(nextStage(events), {
+      type: "review",
+      outcomeId: implemented,
+      head: "h1",
+    });
+    events.push(
+      admitted("review"),
+      outcome("review_failed", { head: "h1", failureDigest: "f1" }),
+      admitted("correct"),
+      outcome("correction_spec", { corrects: "f1" }),
+      admitted("rework"),
+      environment("rework", "e2"),
+    );
+    assert.strictEqual(nextStage(events).type, "rework");
+    assert.deepStrictEqual([...environmentFailures(events).keys()], ["rework"]);
+  });
+
+  it("ends at the next result of its kind, a rejection marks it, a reopen clears it", () => {
+    const events: Array<ItemEvent> = [admitted("implement"), environment("triage")];
+    const triage = environmentFailures(events).get("triage")!;
+    events.push(environment("implement"));
+    // A lifecycle result never ends triage's failure, nor triage's a lifecycle stage's.
+    events.push(outcome("unit_proposed", { stage: "triage" }));
+    assert.deepStrictEqual([...environmentFailures(events).keys()], ["implement"]);
+    events.push({ type: "rejected", seq: ++seq, outcomeId: triage.outcomeId, failureDigest: "x" });
+    assert.isUndefined(environmentFailures(events).get("implement")?.rejected);
+    const failed = environmentFailures(events).get("implement")!;
+    events.push({ type: "rejected", seq: ++seq, outcomeId: failed.outcomeId, failureDigest: "r1" });
+    assert.strictEqual(environmentFailures(events).get("implement")?.rejected, "r1");
+    events.push(outcome("implemented", { stage: "implement", head: "h2" }));
+    assert.strictEqual(environmentFailures(events).size, 0);
+    events.push(environment("review"), { type: "reopened", seq: ++seq, closureOutcomeId: "c" });
+    assert.strictEqual(environmentFailures(events).size, 0);
+  });
+});
+
+it("a correction basis names the failure it corrects, whatever retry, environment or binding suffix follows (connector #123)", () => {
+  const failure = "f".repeat(64);
+  for (const basis of [
+    `correct:${failure}`,
+    `correct:${failure}:retry:${"a".repeat(64)}`,
+    `correct:${failure}:env:0123456789ab:${"b".repeat(32)}`,
+    `correct:${failure}:env:0123456789ab:owner:${"c".repeat(16)}`,
+    `correct:${failure}|res:importer`,
+    `correct:${failure}:env:0123456789ab:${"b".repeat(32)}|exe:builder`,
+  ]) {
+    assert.strictEqual(correctedFailure(basis), failure);
+  }
+  assert.isUndefined(correctedFailure(`rework:${failure}`));
 });

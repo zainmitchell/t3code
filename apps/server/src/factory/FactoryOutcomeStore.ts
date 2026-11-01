@@ -46,6 +46,8 @@ export const FactoryOutcomeReport = Schema.Struct({
    * its run did not complete, and no report was rejected. Its work was never judged.
    */
   failureClass: Schema.optional(Schema.Literal("environment")),
+  /** For an environment failure: the identity of the execution it ran on, when T3 read it. */
+  failedOn: Schema.optional(Schema.String),
   /** The correction ticket T3 opened for a verification-only item's spec. */
   ticket: Schema.optional(Schema.Struct({ repository: Schema.String, number: Schema.Int })),
   integration: Schema.optional(
@@ -512,6 +514,15 @@ const make = Effect.gen(function* () {
                 ? {}
                 : { failureDigest: outcome.failureDigest }),
               ...(outcome.corrects === undefined ? {} : { corrects: outcome.corrects }),
+              // Only T3's own record classes a failure as its environment's, never a report.
+              ...(outcome.origin.type === "native" && outcome.report.failureClass === "environment"
+                ? {
+                    environment:
+                      outcome.report.failedOn === undefined
+                        ? {}
+                        : { execution: outcome.report.failedOn },
+                  }
+                : {}),
             });
             return true;
           }),
@@ -669,6 +680,14 @@ const make = Effect.gen(function* () {
                   ? {}
                   : { failureDigest: record.failureDigest }),
                 ...(record.corrects === undefined ? {} : { corrects: record.corrects }),
+                ...(record.environment === undefined
+                  ? {}
+                  : {
+                      environment:
+                        record.environment.execution === undefined
+                          ? {}
+                          : { execution: record.environment.execution },
+                    }),
               });
               break;
             }

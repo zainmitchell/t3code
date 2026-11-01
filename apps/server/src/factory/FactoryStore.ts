@@ -404,6 +404,9 @@ const AdmittedReservation = Schema.Struct({
   configRevision: PositiveInt,
   packetDigest: Bounded,
   modelSelection: ModelSelection,
+  /** The modes it was started with; absent on a reservation an older build admitted. */
+  runtimeMode: Schema.optional(RuntimeMode),
+  interactionMode: Schema.optional(ProviderInteractionMode),
   execution: ExecutionBinding,
   /** A later lifecycle stage: the reservation whose claim owns the item. */
   continues: Schema.optional(FactoryReservationId),
@@ -604,6 +607,9 @@ export interface ReserveExecutionInput {
   readonly runId: RunId;
   readonly taskNodeId: NodeId;
   readonly modelSelection: ModelSelection;
+  /** The admitted execution's start modes, which its failure is bound to. */
+  readonly runtimeMode?: RuntimeMode;
+  readonly interactionMode?: ProviderInteractionMode;
   readonly origin:
     | { readonly type: "admission"; readonly admission: OrchestrationV2FactoryAdmission }
     | {
@@ -1659,6 +1665,8 @@ const make = Effect.gen(function* () {
       configRevision: admission.configRevision,
       packetDigest: admission.packetDigest,
       modelSelection: input.modelSelection,
+      ...(input.runtimeMode === undefined ? {} : { runtimeMode: input.runtimeMode }),
+      ...(input.interactionMode === undefined ? {} : { interactionMode: input.interactionMode }),
       execution: {
         commandId: input.commandId,
         threadId: input.executionThreadId,

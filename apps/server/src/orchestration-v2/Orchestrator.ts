@@ -7913,6 +7913,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         runId,
         taskNodeId: idAllocator.derive.rootNode({ runId }),
         modelSelection: command.modelSelection,
+        runtimeMode: command.runtimeMode,
+        interactionMode: command.interactionMode,
         origin: { type: "admission", admission: command.admission },
       });
     }
@@ -7942,6 +7944,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       ) {
         executions.push({
           ...binding,
+          runtimeMode: command.runtimeMode,
+          interactionMode: command.interactionMode,
           origin: { type: "admission", admission: command.admission },
         });
         continue;

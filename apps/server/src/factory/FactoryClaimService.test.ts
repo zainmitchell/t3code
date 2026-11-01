@@ -204,6 +204,15 @@ it("reads a bound verification's binding by key, and refuses a binding it cannot
       { specOutcomeId: "o1", bindingDigest: vb },
     ],
     [`rework:o1|exe:verifier|vb:${vb}|out:${out}`, { specOutcomeId: "o1", bindingDigest: vb }],
+    // A rework run again after an environment failure binds the same spec.
+    [
+      `rework:o1:env:0123456789ab:${"d".repeat(32)}|vb:${vb}|out:${out}`,
+      { specOutcomeId: "o1", bindingDigest: vb },
+    ],
+    [
+      `rework:o1:env:0123456789ab:owner:${"e".repeat(16)}|vb:${vb}|out:${out}`,
+      { specOutcomeId: "o1", bindingDigest: vb },
+    ],
     [`rework:o1|vb:${vb}`, "malformed"],
     [`rework:o1|out:${out}`, "malformed"],
     [`rework:o1|vb:${vb}|vb:${vb}|out:${out}`, "malformed"],
