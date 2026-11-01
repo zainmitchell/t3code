@@ -123,6 +123,7 @@ import * as FactoryGitReadback from "./FactoryGitReadback.ts";
 import * as FactoryLifecycle from "./FactoryLifecycle.ts";
 import * as FactoryOutcomeStore from "./FactoryOutcomeStore.ts";
 import { canonical, executionIdentity } from "./factoryOutcomes.ts";
+import { createVolumeJunction } from "./reparse.fixture.ts";
 import * as FactoryEffects from "./FactoryEffects.ts";
 import * as FactoryIntegrator from "./FactoryIntegrator.ts";
 import * as FactoryOperationStore from "./FactoryOperationStore.ts";
@@ -26811,7 +26812,7 @@ it.effect(
 const rebindFixture = (
   issueNumber: number,
   root: string,
-  options: { readonly viaJunction?: boolean } = {},
+  options: { readonly viaJunction?: boolean | "volume" } = {},
 ) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -26821,8 +26822,11 @@ const rebindFixture = (
     yield* fs.makeDirectory(path.join(pins, "real"), { recursive: true });
     yield* fs.makeDirectory(outputs, { recursive: true });
     // The reviewer's counterexample: an in-root alias (junction) whose target also lies inside the root.
-    const pinDir = options.viaJunction === true ? "alias" : "real";
-    if (options.viaJunction === true) {
+    const pinDir = options.viaJunction ? "alias" : "real";
+    if (options.viaJunction === "volume") {
+      // A mount point addressed by volume GUID: Node's lstat sees a plain directory.
+      createVolumeJunction(path.join(pins, "real"), path.join(pins, "alias"));
+    } else if (options.viaJunction === true) {
       NodeFS.symlinkSync(path.join(pins, "real"), path.join(pins, "alias"), "junction");
     }
     const head = `e000${issueNumber}`;
@@ -27033,6 +27037,34 @@ it.effect(
           yield* approveAndBuild(fixture, 7983);
           assert.deepStrictEqual(admittedOnly(yield* advance("outcome", 2)), []);
           const record = yield* recordOf(7983);
+          assert.strictEqual(record?.disposition, "nothing_proposed");
+          assert.include(record?.detail ?? "", "link or reparse point");
+          assert.isFalse(yield* fs.exists(path.join(root, "rebind")));
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Rebind/E1: a predecessor reached through a volume-GUID mount point, which lstat reports as a plain directory, never rebinds",
+  () =>
+    runIsolated(
+      withScratch((root) =>
+        Effect.gen(function* () {
+          yield* configureLifecycleFactory;
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const fixture = yield* rebindFixture(7984, root, { viaJunction: "volume" });
+          const alias = path.join(fixture.pins, "alias");
+          // Node sees no link, and the alias resolves inside the root with matching bytes.
+          assert.isFalse(NodeFS.lstatSync(alias).isSymbolicLink());
+          assert.strictEqual(
+            yield* fs.readFileString(path.join(alias, "units.json")),
+            fixture.predecessor,
+          );
+          yield* approveAndBuild(fixture, 7984);
+          assert.deepStrictEqual(admittedOnly(yield* advance("outcome", 2)), []);
+          const record = yield* recordOf(7984);
           assert.strictEqual(record?.disposition, "nothing_proposed");
           assert.include(record?.detail ?? "", "link or reparse point");
           assert.isFalse(yield* fs.exists(path.join(root, "rebind")));

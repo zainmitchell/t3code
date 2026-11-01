@@ -13,6 +13,7 @@ import * as Path from "effect/Path";
 import { FactoryGitReadbackError, type FactoryGitObject } from "./FactoryGitReadback.ts";
 import { makeInsideRoot } from "./FactoryLifecycle.ts";
 import { derivePinRebind, type RebindApproval } from "./factoryRebind.ts";
+import { createVolumeJunction } from "./reparse.fixture.ts";
 
 const sha256 = (text: string) => NodeCrypto.createHash("sha256").update(text).digest("hex");
 const head = "a".repeat(40);
@@ -29,7 +30,7 @@ const setup = (options: {
   readonly approval?: "approve" | "reject" | "grant-without-units" | "none";
   readonly unreadable?: boolean;
   /** The predecessor is reached through an in-root junction: as an ancestor, or in the file's own place. */
-  readonly link?: "ancestor" | "final";
+  readonly link?: "ancestor" | "final" | "volume";
 }) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -52,7 +53,10 @@ const setup = (options: {
     const bytes = JSON.stringify(predecessor);
     NodeFS.writeFileSync(NodePath.join(pinRoot, "real", "units.json"), bytes);
     let relative = "real/units.json";
-    if (options.link === "ancestor") {
+    if (options.link === "volume") {
+      createVolumeJunction(NodePath.join(pinRoot, "real"), NodePath.join(pinRoot, "alias"));
+      relative = "alias/units.json";
+    } else if (options.link === "ancestor") {
       NodeFS.symlinkSync(
         NodePath.join(pinRoot, "real"),
         NodePath.join(pinRoot, "alias"),
@@ -254,9 +258,15 @@ it.layer(NodeServices.layer)("factoryRebind", (it) => {
     "E1: a predecessor reached through an in-root junction is refused before it is read",
     () =>
       Effect.gen(function* () {
-        for (const link of ["ancestor", "final"] as const) {
+        for (const link of ["ancestor", "final", "volume"] as const) {
           const fixture = yield* setup({ link });
-          if (link === "ancestor") {
+          if (link === "volume") {
+            // Node reports the mount point as a plain directory: lstat alone would not refuse it.
+            assert.isFalse(
+              NodeFS.lstatSync(NodePath.join(fixture.pinRoot, "alias")).isSymbolicLink(),
+            );
+          }
+          if (link !== "final") {
             // The alias resolves inside the root and its bytes match: containment alone would admit it.
             assert.strictEqual(
               sha256(NodeFS.readFileSync(NodePath.join(fixture.pinRoot, fixture.pin.path), "utf8")),

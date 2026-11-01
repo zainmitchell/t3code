@@ -145,7 +145,19 @@ const linkedComponent = Effect.fnUntraced(function* (
   relative: string,
 ) {
   const parts = relative.split("/");
+  // The OS's own final path for an opened handle (GetFinalPathNameByHandle on Windows): a component
+  // that redirects anywhere, whatever its reparse tag, resolves away from its lexical place. Node's
+  // lstat alone misses mount points it cannot express as links (volume-GUID junctions).
+  const finalPath = (target: string) =>
+    Effect.try(() => NodeFS.realpathSync.native(target)).pipe(Effect.option);
+  // Windows paths compare case-insensitively; elsewhere a case change is another entry.
+  const same = (left: string, right: string) =>
+    path.sep === "\\"
+      ? path.normalize(left).toLowerCase() === path.normalize(right).toLowerCase()
+      : path.normalize(left) === path.normalize(right);
   let current = path.resolve(root);
+  let resolved = yield* finalPath(current);
+  if (Option.isNone(resolved)) return "the pin root: unreadable";
   for (const [index, part] of parts.entries()) {
     current = path.join(current, part);
     const info = yield* Effect.tryPromise(() => NodeFS.promises.lstat(current)).pipe(Effect.option);
@@ -155,6 +167,10 @@ const linkedComponent = Effect.fnUntraced(function* (
     if (last ? !info.value.isFile() : !info.value.isDirectory()) {
       return `${part}: not a ${last ? "regular file" : "directory"}`;
     }
+    const actual = yield* finalPath(current);
+    if (Option.isNone(actual)) return `${part}: unreadable`;
+    if (!same(actual.value, path.join(resolved.value, part))) return `${part}: reparse point`;
+    resolved = actual;
   }
   return undefined;
 });
