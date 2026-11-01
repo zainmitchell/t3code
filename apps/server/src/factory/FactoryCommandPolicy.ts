@@ -42,6 +42,12 @@ const PolicyDecision = Schema.Union([
     workspace: Schema.optional(OrchestrationV2ThreadLaunchWorkspaceStrategy),
     /** A supervised decision: it starts only by spending the owner's grant for this request. */
     grant: Schema.optional(Schema.Struct({ reason: Bounded(2_000), evidence: Bounded(200_000) })),
+    /**
+     * The repository paths this admission may write, as its authorizing decision bounds them. T3
+     * records them on the admission and shows them to later passes while it runs, so other work is
+     * kept clear of them. Coordination only: T3 does not confine what the worker writes.
+     */
+    writes: Schema.optional(Schema.Array(Bounded(512)).check(Schema.isMaxLength(200))),
     /** One of the configuration's named executions, such as a builder effort. */
     execution: Schema.optional(Bounded(200)),
     /**
@@ -360,6 +366,8 @@ export const policyInput = (
   schema: "t3-factory-policy-input/2",
   factoryId: input.configuration.factoryId,
   policyRevision: input.configuration.policyRevision,
+  /** Facts this T3 supplies; `active-writes`: every running native admission shows the writes it recorded. */
+  capabilities: ["active-writes"],
   items: input.items.map((item) => ({
     decisionKey: item.decisionKey,
     ...(item.triageDecisionKey === undefined ? {} : { triageDecisionKey: item.triageDecisionKey }),
@@ -392,8 +400,27 @@ export const policyInput = (
     stage: entry.stage,
     custody: entry.custody,
     item: issueFacts(entry.itemKey, entry.issue),
+    ...(entry.writes === undefined ? {} : { writes: entry.writes }),
   })),
 });
+
+/**
+ * The writes an admission declares, canonical and sorted, or why they cannot be read: each a
+ * repository-relative path of plain segments (no drive, root, `.`/`..`, backslash or empty part),
+ * named once.
+ */
+export const declaredWrites = (
+  writes: ReadonlyArray<string>,
+): { readonly writes: ReadonlyArray<string> } | { readonly invalid: string } => {
+  const segment = /^[A-Za-z0-9._@+-]+$/;
+  for (const path of writes) {
+    if (!path.split("/").every((part) => segment.test(part) && part !== "." && part !== "..")) {
+      return { invalid: `write ${JSON.stringify(path)} is not a canonical repository path` };
+    }
+  }
+  if (new Set(writes).size !== writes.length) return { invalid: "a write is named twice" };
+  return { writes: [...writes].toSorted() };
+};
 
 const policyFailure = (reason: string): FactoryLifecycle.FactoryPolicyFailure => ({
   type: "policy_failed",
@@ -551,6 +578,11 @@ export const layer = Layer.effect(
           return reservation;
         }
         case "admit": {
+          const declared =
+            decision.writes === undefined ? undefined : declaredWrites(decision.writes);
+          if (declared !== undefined && "invalid" in declared) {
+            return policyFailure(`policy admission writes: ${declared.invalid}`);
+          }
           const stage = item.stage.type;
           const text = `${decision.brief}\n\n${reportFooter(item, configuration.artifactRoot, pin.executable)}`;
           const request: FactoryLifecycle.FactoryAdmissionRequest = {
@@ -582,6 +614,7 @@ export const layer = Layer.effect(
             ...(decision.resources === undefined || decision.resources.length === 0
               ? {}
               : { resources: [...new Set(decision.resources)].toSorted() }),
+            ...(declared === undefined ? {} : { writes: declared.writes }),
             ...(decision.grant === undefined
               ? {}
               : {

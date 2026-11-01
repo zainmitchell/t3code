@@ -331,9 +331,22 @@ it("Policy input: each item's relations and the work under way reach the policy 
         stage: "rework",
         custody: "native",
         issue: { ...issue, body: "## Owned files\n- `src/dates.py`\n- `src/io.py`" },
+        // The writes its running admission recorded, which may exceed what the body declares.
+        writes: ["src/dates.py", "src/io.py", "src/zones.py"],
+      },
+      {
+        itemKey: FactoryItemKey.make("github:example-org/alpha#15"),
+        stage: "implement",
+        custody: "native",
+        issue,
       },
     ],
   });
+  assert.deepStrictEqual(input.capabilities, ["active-writes"]);
+  assert.deepStrictEqual(
+    input.active.map((entry) => ("writes" in entry ? entry.writes : "absent")),
+    [["src/dates.py", "src/io.py", "src/zones.py"], "absent"],
+  );
   assert.deepStrictEqual(
     input.items.map((entry) => [entry.item.author, entry.item.blockedBy, entry.item.parent]),
     [
@@ -348,7 +361,10 @@ it("Policy input: each item's relations and the work under way reach the policy 
       entry.stage,
       entry.custody,
     ]),
-    [["github:example-org/alpha#14", 14, "rework", "native"]],
+    [
+      ["github:example-org/alpha#14", 14, "rework", "native"],
+      ["github:example-org/alpha#15", 15, "implement", "native"],
+    ],
   );
   assert.include(input.active[0]!.item.body, "src/io.py");
 });
@@ -749,4 +765,27 @@ it("Policy answer: a parent closure names adopted or prepared criteria as its po
   assert.isTrue(
     Option.isNone(decode(answer({ prepared: { ...prepared, bytes: "x".repeat(1_000_001) } }))),
   );
+});
+
+it("Policy answer: an admission's writes are canonical repository paths, named once, or the decision fails", () => {
+  const cases: ReadonlyArray<readonly [ReadonlyArray<string>, unknown]> = [
+    [
+      ["src/b.py", ".github/workflows/ci.yml", "src/a.py"],
+      { writes: [".github/workflows/ci.yml", "src/a.py", "src/b.py"] },
+    ],
+    [[], { writes: [] }],
+    [["src/a.py", "src/a.py"], "invalid"],
+    [["../escape.py"], "invalid"],
+    [["src/../x.py"], "invalid"],
+    [["/abs.py"], "invalid"],
+    [["C:/drive.py"], "invalid"],
+    [[String.raw`src\win.py`], "invalid"],
+    [["src//empty.py"], "invalid"],
+    [["./src/a.py"], "invalid"],
+    [["src/a b.py"], "invalid"],
+  ];
+  for (const [writes, expected] of cases) {
+    const read = FactoryCommandPolicy.declaredWrites(writes);
+    assert.deepStrictEqual("invalid" in read ? "invalid" : read, expected, writes.join(","));
+  }
 });

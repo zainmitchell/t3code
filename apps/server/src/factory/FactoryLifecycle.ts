@@ -422,6 +422,8 @@ export interface FactoryAdmissionRequest {
     readonly stage: string;
     readonly evidenceDigest: string;
   };
+  /** The repository paths its authorizing decision lets it write: canonical, sorted, distinct. */
+  readonly writes?: ReadonlyArray<string>;
 }
 
 export type FactoryAdmissionRefusal =
@@ -652,6 +654,11 @@ export interface FactoryPolicyActive {
   readonly stage: FactoryStageType;
   readonly custody: "native" | "legacy" | "foreign";
   readonly issue: TrackerIssue;
+  /**
+   * The writes its running native admissions recorded, when every one of them recorded writes; absent
+   * otherwise, so a policy keeps the item's own declared unit as its lane and widens nothing.
+   */
+  readonly writes?: ReadonlyArray<string>;
 }
 
 /** T3's own stage (integration, closure) may go ahead: every product gate for it holds. */
@@ -2761,6 +2768,7 @@ const make = Effect.gen(function* () {
             ...(input.stage === undefined ? {} : { stageBasis: input.stage.basis }),
             ...(input.continues === undefined ? {} : { continues: input.continues }),
             ...(input.grant === undefined ? {} : { grant: input.grant }),
+            ...(input.writes === undefined ? {} : { writes: [...input.writes] }),
             ...(collected === undefined
               ? {}
               : {
@@ -3585,6 +3593,22 @@ const make = Effect.gen(function* () {
           : [],
       ),
     );
+    // Every held admission of the item must have recorded its writes, or none are shown for it.
+    const runningWrites = (itemKey: FactoryItemKey) => {
+      const admitted = reservations.filter(
+        (reservation) =>
+          reservation.itemKey === itemKey &&
+          reservation.origin === "admitted" &&
+          reservation.state === "held",
+      );
+      if (admitted.length === 0) return undefined;
+      const writes = new Set<string>();
+      for (const reservation of admitted) {
+        if (reservation.origin !== "admitted" || reservation.writes === undefined) return undefined;
+        for (const path of reservation.writes) writes.add(path);
+      }
+      return [...writes].toSorted();
+    };
     const transferRows = yield* transfers.list(factoryId);
     const transferOf = latestTransfers(transferRows);
     // A running stage does the work of the text it was admitted on, whatever the issue says now.
@@ -3738,11 +3762,13 @@ const make = Effect.gen(function* () {
             observationId: observation.observationId,
           });
         }
+        const writes = runningWrites(itemKey);
         show({
           itemKey,
           stage: isFactoryStage(running.taskKind) ? running.taskKind : stage.type,
           custody: "native",
           issue: weighed,
+          ...(writes === undefined ? {} : { writes }),
         });
         if (running.origin === "admitted" && running.quarantine !== undefined) {
           note(
@@ -3838,7 +3864,9 @@ const make = Effect.gen(function* () {
     }
     for (const [itemKey, read] of readAs) {
       const custody = custodyOn.get(itemKey);
-      if (custody !== undefined) show({ itemKey, custody, ...read });
+      const writes = custody === "native" ? runningWrites(itemKey) : undefined;
+      if (custody !== undefined)
+        show({ itemKey, custody, ...read, ...(writes === undefined ? {} : { writes }) });
     }
     const active = [...shown.values()];
     // The policy sees work under way only as this pass read it: custody already held when the

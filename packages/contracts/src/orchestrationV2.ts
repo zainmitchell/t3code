@@ -3428,6 +3428,11 @@ export const OrchestrationV2FactoryAdmission = Schema.Struct({
     Schema.Struct({ grantId: FactoryKey, stage: FactoryKey, evidenceDigest: FactoryKey }),
   ),
   /**
+   * The repository paths the decision lets this admission write, recorded with it and shown to
+   * later passes while it runs. Coordination only: nothing confines what the worker writes.
+   */
+  writes: Schema.optional(Schema.Array(FactoryKey).check(Schema.isMaxLength(200))),
+  /**
    * The held factory custody the decision was made beside, rechecked at commit: any other custody
    * held by then, other than a descendant of this, refuses the decision.
    */

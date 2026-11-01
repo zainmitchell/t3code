@@ -26733,3 +26733,57 @@ it.effect(
       ),
     ),
 );
+
+/** A policy whose implement decisions declare `writes` for the issues it names; others declare none. */
+const proposeWrites =
+  (writes: Readonly<Record<number, ReadonlyArray<string>>>): ProposeFn =>
+  (input) =>
+    Effect.map(stageRequest(input), (decision) => {
+      const issue = Number(/#(\d+)$/.exec(input.observation.itemKey)?.[1]);
+      return decision !== undefined && !("type" in decision) && writes[issue] !== undefined
+        ? { ...decision, writes: writes[issue] }
+        : decision;
+    });
+
+it.effect(
+  "Writes/E3: an admission's declared writes are recorded with it and shown to every later pass while it runs, across a restart; one that declared none shows none",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* configureLifecycleFactory;
+          yield* configureFactory(lifecycleConfiguration({ pools: pool(3) }));
+          const writes = ["tracker/scripts/47_email_originals.py", "tracker/tests/test_195.py"];
+          yield* usePolicy(proposeWrites({ 7971: writes }));
+          yield* seedIssue(7971);
+          const granted = admittedBy(yield* advance("tracker_event", 1));
+          const factory = yield* FactoryLifecycle.FactoryLifecycle;
+          const recorded = (yield* factory.readState({ factoryId })).reservations.find(
+            (reservation) => reservation.reservationId === granted.reservation.reservationId,
+          );
+          assert.deepStrictEqual(
+            recorded?.origin === "admitted" ? recorded.writes : "none",
+            writes,
+          );
+          yield* seedIssue(7972);
+          admittedBy(yield* advance("tracker_event", 1));
+          yield* seedIssue(7973);
+          yield* advance("tracker_event", 1);
+          const shown = (yield* PolicyFake).active
+            .at(-1)
+            ?.map((entry) => [entry.itemKey, entry.custody, entry.writes]);
+          assert.deepStrictEqual(shown, [
+            [itemKeyFor(7971), "native", writes],
+            [itemKeyFor(7972), "native", undefined],
+          ]);
+          yield* seedIssue(7974);
+          yield* restartedPass;
+          assert.deepStrictEqual(
+            (yield* PolicyFake).active.at(-1)?.find((entry) => entry.itemKey === itemKeyFor(7971))
+              ?.writes,
+            writes,
+          );
+        }),
+      ),
+    ),
+);

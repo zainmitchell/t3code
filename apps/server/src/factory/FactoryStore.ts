@@ -420,6 +420,8 @@ const AdmittedReservation = Schema.Struct({
   stageBasis: Schema.optional(Bounded),
   /** The observation the decision was admitted on, so a later change under it is recorded. */
   observationId: Schema.optional(FactoryObservationId),
+  /** The paths its decision lets it write, recorded with the admission (coordination, not confinement). */
+  writes: Schema.optional(Schema.Array(Bounded)),
   /** The finite grant the decision spent, if it was supervised. */
   grantId: Schema.optional(Bounded),
   /** The serving process that admitted it; see `FactoryStore.servingId`. */
@@ -1774,6 +1776,7 @@ const make = Effect.gen(function* () {
       ...(admission.stageBasis === undefined ? {} : { stageBasis: admission.stageBasis }),
       observationId: admission.observationId,
       ...(admission.grant === undefined ? {} : { grantId: admission.grant.grantId }),
+      ...(admission.writes === undefined ? {} : { writes: [...admission.writes] }),
       ...(resources.length === 0 ? {} : { resources }),
       ...(executionChoice === undefined ? {} : { executionChoice }),
     };
