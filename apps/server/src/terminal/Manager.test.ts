@@ -813,12 +813,10 @@ it.layer(
       expect(members).toEqual([ptyAdapter.processes[0]!.pid]);
 
       // No shell at all: nothing starts in the container rather than a helper that cannot start one.
-      yield* manager
-        .open(openInput({ terminalId: "setup-2" }))
-        .pipe(
-          Effect.provideService(CurrentExecutionJoin, Option.some(generationJoin(members))),
-          Effect.provideService(SpawnExecutableResolution, () => undefined),
-        );
+      yield* manager.open(openInput({ terminalId: "setup-2" })).pipe(
+        Effect.provideService(CurrentExecutionJoin, Option.some(generationJoin(members))),
+        Effect.provideService(SpawnExecutableResolution, () => undefined),
+      );
       const shell = yield* Effect.exit(
         manager.getShell({ threadId: "thread-1", terminalId: "setup-2" }),
       );

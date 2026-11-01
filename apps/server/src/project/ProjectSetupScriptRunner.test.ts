@@ -181,6 +181,51 @@ describe("ProjectSetupScriptRunner", () => {
     }),
   );
 
+  it.effect(
+    "a shell that ends before the script says how it ended and why T3 could not start it, never the script's output",
+    () =>
+      Effect.gen(function* () {
+        const { completion, emit } = yield* setup({
+          shell: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        });
+        yield* emit({ ...event, type: "output", data: "API_TOKEN=hunter2\r\n" });
+        // The container's launcher writes its reason without a newline, in color, then exits.
+        yield* emit({
+          ...event,
+          type: "output",
+          data: "\x1b[31mt3-custody: cannot start pwsh.exe (2)\x1b]0;title\x07\x1b[0m",
+        });
+        yield* emit({ ...event, type: "exited", exitCode: 127, exitSignal: null });
+        const ended = yield* completion;
+        expect(ended).toMatchObject({
+          exitCode: null,
+          shellExit: { exitCode: 127, launcherMessage: "t3-custody: cannot start pwsh.exe (2)" },
+        });
+        expect(JSON.stringify(ended)).not.toContain("hunter2");
+      }),
+  );
+
+  it.effect.each(["sentinel", "closed"] as const)(
+    "a shell that ends after %s keeps what was settled first",
+    (first) =>
+      Effect.gen(function* () {
+        const { completion, writes, emit } = yield* setup({
+          shell: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        });
+        const token = /__T3_SETUP_DONE___(\w+):/.exec(yield* Queue.take(writes))![1];
+        yield* emit(
+          first === "sentinel"
+            ? { ...event, type: "output", data: `\r\n__T3_SETUP_DONE___${token}:4\r\nPS> ` }
+            : { ...event, type: "closed" },
+        );
+        yield* emit({ ...event, type: "exited", exitCode: 9, exitSignal: null });
+        const ended = yield* completion;
+        expect([ended.exitCode, ended.shellExit]).toEqual(
+          first === "sentinel" ? [4, undefined] : [null, { exitCode: null }],
+        );
+      }),
+  );
+
   it.effect.each([false, true])(
     "does not type into a shell that exits during startup (before shell lookup: %s)",
     (beforeShellLookup) =>

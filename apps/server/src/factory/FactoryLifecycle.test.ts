@@ -43,6 +43,7 @@ import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
 import * as NodeURL from "node:url";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as DateTime from "effect/DateTime";
@@ -18211,6 +18212,175 @@ it.effect(
           yield* startsNothing;
           assert.isTrue(yield* waitsOnEnvironment(7946));
           assert.notInclude(yield* itemHistory(7946), "correct");
+        }),
+      ),
+    ),
+);
+
+/** A blocking setup script whose shell could not start in its container. */
+const setupEndsWithoutExitCode = (workspace: string) =>
+  Effect.map(PreparationFake, (fake) => {
+    fake.setup = {
+      status: "started",
+      scriptId: "bootstrap",
+      scriptName: "Bootstrap",
+      scriptCommand: "bootstrap",
+      terminalId: "setup-bootstrap",
+      cwd: workspace,
+      async: false,
+      completion: Effect.succeed({
+        exitCode: null,
+        durationMs: 1,
+        shellExit: { exitCode: 127, launcherMessage: "t3-custody: cannot start pwsh.exe (2)" },
+      }),
+    };
+  });
+
+const serverRun = (id: string, startedAt: number) => ({
+  id: id.repeat(32).slice(0, 32),
+  startedAt,
+});
+
+/** A server run starting now; what happens in it from here on is later than its start. */
+const laterServerRun = (id: string) =>
+  Effect.gen(function* () {
+    const run = serverRun(id, (yield* Clock.currentTimeMillis) + 1);
+    yield* TestClock.adjust("1 second");
+    return run;
+  });
+
+const inServerRun = <A, E, R>(run: ReturnType<typeof serverRun>, effect: Effect.Effect<A, E, R>) =>
+  Effect.provideService(effect, FactoryLifecycle.FactoryServerRun, run);
+
+/** An implemented build whose review, bound to a worktree, fails its setup and never starts. */
+const reviewSetupFails = (issueNumber: number, run: ReturnType<typeof serverRun>) =>
+  Effect.gen(function* () {
+    yield* configureLifecycleFactory;
+    yield* usePolicy(stageRequestInWorktrees);
+    yield* seedIssue(issueNumber);
+    const implement = admittedBy(yield* inServerRun(run, advance("tracker_event", 1)));
+    const head = `c${issueNumber}001`;
+    yield* recordCommit(head, [lifecycleBase]);
+    yield* setupEndsWithoutExitCode(yield* FactoryWorkspace);
+    yield* inServerRun(
+      run,
+      workStage(implement, {
+        outcome: "implemented",
+        subject: subjectFor(head, lifecycleBase),
+        summary: `Implemented ${issueNumber}.`,
+      }),
+    );
+    const review = admittedBy(yield* inServerRun(run, advance("outcome")));
+    assert.deepStrictEqual(stageOf(review), [itemKeyFor(issueNumber), "review"]);
+    yield* inServerRun(run, startsNothing);
+    return head;
+  });
+
+it.effect(
+  "Environment/startup: a stage whose workspace preparation failed before its agent started waits in that server run, runs once in each later one, and moves on once preparation works",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const item = itemKeyFor(7951);
+          const first = serverRun("a", 0);
+          const head = yield* reviewSetupFails(7951, first);
+          const turns = (yield* startedTurns).length;
+          assert.deepStrictEqual(yield* itemHistory(7951), [
+            "implement",
+            "implemented",
+            "review",
+            "failed",
+          ]);
+          // The record as serving T3 writes it: an environment failure bound to the review's
+          // execution, with nothing about its workspace preparation.
+          const [missing] = yield* missingResults(7951);
+          assert.deepStrictEqual(
+            [missing?.report.failureClass, missing?.report.failedOn],
+            ["environment", executionIdentity(buildExecution)],
+          );
+          // In the run it failed in it waits on its workspace preparation, not on a provider,
+          // however often it is collected or the lifecycle is rebuilt.
+          const waiting = yield* recordOf(7951);
+          assert.deepStrictEqual(
+            [waiting?.disposition, waiting?.reasonClass],
+            ["nothing_proposed", "awaiting_environment"],
+            waiting?.detail,
+          );
+          assert.include(waiting?.detail ?? "", "workspace preparation");
+          assert.include(
+            waiting?.detail ?? "",
+            "Setup script ended before it finished: its shell exited with 127 (t3-custody: cannot start pwsh.exe (2)).",
+          );
+          assert.deepStrictEqual(yield* inServerRun(first, restartedPass), []);
+          assert.strictEqual((yield* recordOf(7951))?.detail, waiting?.detail);
+
+          // A later server run (a deploy or a restart) runs it once, across concurrent passes and
+          // a rebuilt lifecycle; its setup still fails, and it waits again in that run.
+          const second = yield* laterServerRun("b");
+          const [retry, ...others] = yield* inServerRun(second, concurrentPasses);
+          assert.deepStrictEqual(others, []);
+          assert.deepStrictEqual(stageOf(retry!), [item, "review"]);
+          const basis =
+            retry!.reservation.origin === "admitted" ? retry!.reservation.stageBasis : undefined;
+          assert.match(basis ?? "", new RegExp(`:env:[0-9a-f]{12}:${second.id}$`));
+          yield* inServerRun(second, startsNothing);
+          assert.deepStrictEqual(yield* inServerRun(second, restartedPass), []);
+          assert.isTrue(yield* waitsOnEnvironment(7951));
+          assert.strictEqual((yield* missingResults(7951)).length, 2);
+          assert.strictEqual((yield* startedTurns).length, turns);
+
+          // Preparation is repaired; the next server run's review starts and its verdict lands.
+          (yield* PreparationFake).setup = { status: "no-script" };
+          const third = yield* laterServerRun("c");
+          const repaired = admittedBy(yield* inServerRun(third, advance("clock", 1)));
+          assert.deepStrictEqual(stageOf(repaired), [item, "review"]);
+          yield* inServerRun(
+            third,
+            workStage(repaired, {
+              outcome: "review_passed",
+              subject: subjectFor(head, lifecycleBase),
+              summary: "Reviewed once its workspace could be prepared.",
+            }),
+          );
+          assert.strictEqual((yield* startedTurns).length, turns + 1);
+          yield* inServerRun(third, advance("outcome"));
+          assert.includeMembers(yield* itemHistory(7951), ["review_passed"]);
+          assert.notInclude(yield* itemHistory(7951), "correct");
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Environment/startup: a later server run releases only workspace preparation failures, never a provider failure or another item",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const first = serverRun("d", 0);
+          // One item's review never started: its setup failed.
+          yield* reviewSetupFails(7953, first);
+          assert.isTrue(yield* waitsOnEnvironment(7953));
+          // Another item's build started, and its provider run failed.
+          yield* seedIssue(7952);
+          const build = admittedBy(yield* inServerRun(first, advance("tracker_event", 1)));
+          assert.deepStrictEqual(stageOf(build), [itemKeyFor(7952), "implement"]);
+          yield* inServerRun(first, failFast(build));
+          yield* inServerRun(first, startsNothing);
+          assert.isTrue(yield* waitsOnEnvironment(7952));
+          const providerWait = (yield* recordOf(7952))?.detail;
+          assert.include(providerWait ?? "", "provider credential, model or runtime");
+
+          // A later run runs only the review that never started; the provider failure still
+          // waits for its execution to change, with the same request.
+          const second = yield* laterServerRun("e");
+          const released = admittedOnly(yield* inServerRun(second, advance("clock", 3)));
+          assert.deepStrictEqual(released.map(stageOf), [[itemKeyFor(7953), "review"]]);
+          assert.deepStrictEqual(yield* inServerRun(second, restartedPass), []);
+          assert.isTrue(yield* waitsOnEnvironment(7952));
+          assert.strictEqual((yield* recordOf(7952))?.detail, providerWait);
+          assert.deepStrictEqual(yield* itemHistory(7952), ["implement", "failed"]);
         }),
       ),
     ),

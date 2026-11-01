@@ -62,7 +62,12 @@ import {
   validateHelperInvocations,
 } from "./factoryClaimPolicy.ts";
 import * as FactoryClaimStore from "./FactoryClaimStore.ts";
-import { type FactoryCustody, owedWakes, readExecutionCustody } from "./factoryCustody.ts";
+import {
+  type FactoryCustody,
+  owedWakes,
+  preparationFailures,
+  readExecutionCustody,
+} from "./factoryCustody.ts";
 import * as FactoryStore from "./FactoryStore.ts";
 import * as FactoryExecutionGenerations from "./FactoryExecutionGenerations.ts";
 import * as FactoryTracker from "./FactoryTracker.ts";
@@ -137,6 +142,7 @@ import {
 import { forkParked } from "../serverActivation.ts";
 import {
   AGENT_STAGES,
+  type EnvironmentFailure,
   environmentFailures,
   type FactoryStage,
   type FactoryStageType,
@@ -1105,6 +1111,21 @@ interface CollectorToken {
 
 const sha256 = (content: string | Uint8Array) =>
   NodeCrypto.createHash("sha256").update(content).digest("hex");
+
+/**
+ * This server process's run: its id and the time the process started. Fixed for the process, so
+ * a service rebuilt or a pass repeated in it is the same run; a new deploy or restart is not.
+ */
+export const FactoryServerRun = Context.Reference<{
+  readonly id: string;
+  readonly startedAt: number;
+}>("t3/factory/FactoryServerRun", {
+  defaultValue: () => processRun,
+});
+const processRun = {
+  id: NodeCrypto.randomBytes(16).toString("hex"),
+  startedAt: Math.floor(performance.timeOrigin),
+};
 
 const makeDecisionKey = Schema.decodeSync(FactoryDecisionKey);
 const makeItemKey = Schema.decodeSync(FactoryItemKey);
@@ -4667,6 +4688,42 @@ const make = Effect.gen(function* () {
     return Option.isNone(projection) ? undefined : executionIdentity(projection.value.thread);
   });
 
+  /**
+   * A failed attempt's workspace preparation failure, when its own run proves it failed there
+   * before any provider turn: failed, never started, with no turn of its own and a recorded
+   * preparation failure. Anything unread or otherwise is undefined, and judged as a provider's.
+   */
+  const workspacePreparationFailure = Effect.fnUntraced(function* (failure: EnvironmentFailure) {
+    const recorded = Option.flatten(yield* outcomeStore.get(failure.outcomeId).pipe(Effect.option));
+    if (Option.isNone(recorded) || recorded.value.origin.type !== "native") return undefined;
+    const reservationId = recorded.value.origin.reservationId;
+    if (reservationId === undefined) return undefined;
+    const reservation = Option.flatten(
+      yield* store.getReservation(reservationId).pipe(Effect.option),
+    );
+    if (Option.isNone(reservation) || reservation.value.origin !== "admitted") return undefined;
+    const { threadId, runId } = reservation.value.execution;
+    const projection = yield* projections.getThreadProjection(threadId).pipe(Effect.option);
+    if (Option.isNone(projection)) return undefined;
+    const { runs, attempts, providerTurns } = projection.value;
+    const run = runs.find((candidate) => candidate.id === runId);
+    const message = preparationFailures(projection.value).get(runId);
+    const attemptIds = new Set(
+      attempts.filter((attempt) => attempt.runId === runId).map((attempt) => attempt.id),
+    );
+    if (
+      run === undefined ||
+      run.status !== "failed" ||
+      run.startedAt !== null ||
+      run.completedAt === null ||
+      message === undefined ||
+      providerTurns.some((turn) => turn.runAttemptId !== null && attemptIds.has(turn.runAttemptId))
+    ) {
+      return undefined;
+    }
+    return { message, failedAt: DateTime.toEpochMillis(run.completedAt) };
+  });
+
   const closeParent = Effect.fnUntraced(function* (
     configuration: FactoryStore.FactoryConfiguration,
     candidate: Candidate,
@@ -5323,8 +5380,9 @@ const make = Effect.gen(function* () {
       }
     }
     // An attempt that failed in its environment runs again only on the execution this decision
-    // chooses when that differs, once per failure, or once on its owner's rejection of it. Before
-    // anything below records a binding or asks for a grant.
+    // chooses when that differs, once per failure, or once on its owner's rejection of it; one
+    // whose workspace preparation failed before its provider started, also once in each later
+    // server run. Before anything below records a binding or asks for a grant.
     let environmentRetry = "";
     const failedIn = isFactoryStage(decision.taskKind)
       ? environmentFailures(candidate.events).get(stage.type)
@@ -5346,19 +5404,39 @@ const make = Effect.gen(function* () {
         environmentRetry = `${failure}:${now}`;
       } else if (now !== undefined) {
         // A name the configuration lacks (no `now`) is admission's to refuse.
-        return {
-          disposition: "nothing_proposed",
-          detail: waitText({
-            issue: subject.issueNumber,
-            what: `its last ${stage.type} failed in its environment (${failedIn.outcomeId}) on ${failedIn.execution === undefined ? "an execution T3 could not read" : "the execution it would run on now"}`,
-            actor: "the operator of that execution (its provider credential, model or runtime)",
-            action: `change that execution's model, options, runtime or interaction mode, or reject outcome ${failedIn.outcomeId} once its provider is repaired`,
-            consequence: `no ${stage.type} starts on the environment it failed in, and its source is not corrected for it`,
-            resume:
-              "the execution it is decided on differs from the one it failed on, or that rejection",
-          }),
-          reasonClass: "awaiting_environment",
-        };
+        const preparation = yield* workspacePreparationFailure(failedIn);
+        const run = yield* FactoryServerRun;
+        if (preparation !== undefined && preparation.failedAt < run.startedAt) {
+          environmentRetry = `${failure}:${run.id}`;
+        } else if (preparation !== undefined) {
+          return {
+            disposition: "nothing_proposed",
+            detail: waitText({
+              issue: subject.issueNumber,
+              what: `its last ${stage.type} (${failedIn.outcomeId}) never started: its workspace preparation failed in this server run (${preparation.message.slice(0, 400)})`,
+              actor:
+                "the operator of this T3 host (its T3 server, the project's setup script or the tools it runs)",
+              action: `repair the workspace preparation; the ${stage.type} runs once more when the T3 server next starts, or on rejection of outcome ${failedIn.outcomeId}`,
+              consequence: `no ${stage.type} starts on the preparation it failed in, and its source is not corrected for it`,
+              resume: "a later T3 server run, a change of its execution, or that rejection",
+            }),
+            reasonClass: "awaiting_environment",
+          };
+        } else {
+          return {
+            disposition: "nothing_proposed",
+            detail: waitText({
+              issue: subject.issueNumber,
+              what: `its last ${stage.type} failed in its environment (${failedIn.outcomeId}) on ${failedIn.execution === undefined ? "an execution T3 could not read" : "the execution it would run on now"}`,
+              actor: "the operator of that execution (its provider credential, model or runtime)",
+              action: `change that execution's model, options, runtime or interaction mode, or reject outcome ${failedIn.outcomeId} once its provider is repaired`,
+              consequence: `no ${stage.type} starts on the environment it failed in, and its source is not corrected for it`,
+              resume:
+                "the execution it is decided on differs from the one it failed on, or that rejection",
+            }),
+            reasonClass: "awaiting_environment",
+          };
+        }
       }
     }
     if (decision.prepared !== undefined) {

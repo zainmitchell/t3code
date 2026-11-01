@@ -15,6 +15,7 @@ import {
 } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as PtyAdapter from "@t3tools/shared/PtyAdapter";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
@@ -102,6 +103,7 @@ const layerFor = (
   setupCommand: string,
   setupAsync: boolean,
   holders: Array<ExecutionContainment.ContainmentHolder>,
+  shell: string,
 ) => {
   const layerDatabase = SqlitePersistence.layerMemory;
   const layerSettings = ServerSettings.layerTest({ worktreesDirectory: `${directory}/worktrees` });
@@ -233,7 +235,7 @@ const layerFor = (
       TerminalManager.makeWithOptions({
         logsDir: `${directory}/terminals`,
         ptyAdapter,
-        shellResolver: () => "powershell.exe",
+        shellResolver: () => shell,
         processTable: Effect.succeed([]),
       }),
     ),
@@ -477,6 +479,7 @@ const withRepository = <A, E, R>(
   setup: {
     readonly command?: (port: number, directory: string) => string;
     readonly async?: boolean;
+    readonly shell?: string;
   } = {},
 ) =>
   Effect.scoped(
@@ -502,7 +505,18 @@ const withRepository = <A, E, R>(
         yield* git(["add", "tracked.txt"]);
         yield* git(["commit", "-m", "base"]);
         return yield* body(milestones, holders, repo);
-      }).pipe(Effect.provide(layerFor(directory, repo, command, setup.async ?? true, holders)));
+      }).pipe(
+        Effect.provide(
+          layerFor(
+            directory,
+            repo,
+            command,
+            setup.async ?? true,
+            holders,
+            setup.shell ?? "powershell.exe",
+          ),
+        ),
+      );
     }),
   ).pipe(Effect.provide(NodeServices.layer));
 
@@ -584,6 +598,48 @@ describe.runIf(HostProcess.Platform.defaultValue() === "win32")(
               reasons: ["never_started"],
             });
           }),
+        ),
+    );
+
+    it.live(
+      "a contained setup asked for a shell this host lacks runs, with its work, in a shell it has",
+      () =>
+        withRepository(
+          (milestones, holders) =>
+            Effect.gen(function* () {
+              const generations = yield* FactoryExecutionGenerations.FactoryExecutionGenerations;
+              const terminals = yield* TerminalManager.TerminalManager;
+              const started: Array<{ threadId: string; terminalId: string }> = [];
+              const shellEnded = yield* Deferred.make<void>();
+              yield* terminals.subscribe((event) =>
+                event.type === "started"
+                  ? Effect.sync(() => {
+                      started.push(event);
+                    })
+                  : event.type === "exited"
+                    ? Deferred.succeed(shellEnded, undefined).pipe(Effect.asVoid)
+                    : Effect.void,
+              );
+              const prepared = yield* runningSetup("missing-shell");
+              const ran = yield* Effect.raceFirst(
+                milestones.arrived("setup").pipe(Effect.as(true)),
+                Deferred.await(shellEnded).pipe(Effect.as(false)),
+              );
+              assert.isTrue(ran, "the setup's shell ended before its script ran");
+              yield* milestones.arrived("leaf");
+              // The shell, its script and the script's detached child are the container's.
+              const own = (yield* generations.observe([prepared.runId])).get(prepared.runId);
+              assert.isAtLeast(own?.type === "live" ? own.members : 0, 3);
+              const setup = started.find((terminal) => terminal.threadId === prepared.threadId);
+              const shell = yield* terminals.getShell(setup!);
+              assert.match(shell, /(pwsh|powershell)\.exe$/i);
+              const [holder] = holders;
+              process.kill(holder!.pid);
+              yield* holder!.exited;
+              yield* milestones.ended("setup");
+              yield* milestones.ended("leaf");
+            }),
+          { shell: "t3-no-such-shell.exe" },
         ),
     );
 

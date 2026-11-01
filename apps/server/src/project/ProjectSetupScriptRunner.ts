@@ -41,7 +41,18 @@ export interface ProjectSetupScriptRunnerResultStarted {
 export interface ProjectSetupScriptCompletion {
   readonly exitCode: number | null;
   readonly durationMs: number;
+  /** The shell ended before the script did: how it ended, and T3's launcher's reason if it gave one. */
+  readonly shellExit?: { readonly exitCode: number | null; readonly launcherMessage?: string };
 }
+
+/** How a setup run ended, as its owner and the factory read it. */
+export const setupCompletionText = ({ exitCode, shellExit }: ProjectSetupScriptCompletion) => {
+  if (exitCode !== null || shellExit === undefined) {
+    return `exited with ${exitCode ?? "no exit code"}`;
+  }
+  const reason = shellExit.launcherMessage === undefined ? "" : ` (${shellExit.launcherMessage})`;
+  return `ended before it finished: its shell exited with ${shellExit.exitCode ?? "no exit code"}${reason}`;
+};
 
 export interface ProjectSetupScriptOutputLine {
   readonly line: string;
@@ -137,6 +148,9 @@ export class ProjectSetupScriptRunner extends Context.Service<
 const COMPLETION_SENTINEL_PREFIX = "__T3_SETUP_DONE__";
 const OUTPUT_LINE_MAX_LENGTH = 400;
 const PARTIAL_LINE_MAX_LENGTH = 4_096;
+// The container's launcher (`process/custody`) says why it could not start the shell; only its
+// lines reach a failure record, never the script's own output.
+const LAUNCHER_PREFIX = "t3-custody: ";
 
 function completionSentinel(token: string): string {
   return `${COMPLETION_SENTINEL_PREFIX}_${token}:`;
@@ -219,14 +233,22 @@ export const make = Effect.gen(function* () {
       const promptReturned = yield* Deferred.make<void>();
       let lineBuffer = "";
       let settled = false;
+      let launcherMessage: string | undefined;
 
-      const settle = (exitCode: number | null) =>
+      const settle = (
+        exitCode: number | null,
+        shellExit?: ProjectSetupScriptCompletion["shellExit"],
+      ) =>
         Effect.suspend(() => {
           if (settled) return Effect.void;
           settled = true;
           return Clock.currentTimeMillis.pipe(
             Effect.flatMap((nowMs) =>
-              Deferred.succeed(done, { exitCode, durationMs: nowMs - startedAtMs }),
+              Deferred.succeed(done, {
+                exitCode,
+                durationMs: nowMs - startedAtMs,
+                ...(shellExit === undefined ? {} : { shellExit }),
+              }),
             ),
             Effect.asVoid,
           );
@@ -240,6 +262,9 @@ export const make = Effect.gen(function* () {
             return settle(Number.isFinite(parsed) ? parsed : null);
           }
           const cleaned = stripTerminalControl(rawLine).trimEnd();
+          if (cleaned.startsWith(LAUNCHER_PREFIX)) {
+            launcherMessage = cleaned.slice(0, OUTPUT_LINE_MAX_LENGTH);
+          }
           if (
             cleaned.length === 0 ||
             cleaned.includes(input.sentinel) ||
@@ -275,7 +300,20 @@ export const make = Effect.gen(function* () {
           );
         }
         if (event.type === "exited" || event.type === "closed") {
-          return settle(null).pipe(Effect.andThen(Deferred.succeed(promptReturned, undefined)));
+          // The last line may have no newline; it may hold the sentinel or the launcher's reason.
+          const partial = lineBuffer;
+          lineBuffer = "";
+          return handleLine(partial).pipe(
+            Effect.andThen(
+              Effect.suspend(() =>
+                settle(null, {
+                  exitCode: event.type === "exited" ? event.exitCode : null,
+                  ...(launcherMessage === undefined ? {} : { launcherMessage }),
+                }),
+              ),
+            ),
+            Effect.andThen(Deferred.succeed(promptReturned, undefined)),
+          );
         }
         return Effect.void;
       });

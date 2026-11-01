@@ -700,16 +700,13 @@ const make = Effect.gen(function* () {
         if (setup.completion) {
           const awaitCompletion = Effect.gen(function* () {
             const completion = yield* setup.completion!;
+            const ended = ProjectSetupScriptRunner.setupCompletionText(completion);
             yield* setupTracker.stage(threadId, "setup-script", {
               status: completion.exitCode === 0 ? "done" : "failed",
-              detail: `exited with ${completion.exitCode ?? "no exit code"}`,
+              detail: ended,
             });
             if (completion.exitCode !== 0 && !setup.async)
-              return yield* mapError(
-                input,
-                "run-setup-script",
-                threadId,
-              )(`Setup script exited with ${completion.exitCode ?? "no exit code"}.`);
+              return yield* mapError(input, "run-setup-script", threadId)(`Setup script ${ended}.`);
           });
           if (setup.async) {
             awaitAsyncSetup = awaitCompletion.pipe(
