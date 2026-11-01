@@ -367,6 +367,8 @@ it("Policy input: each item's relations and the work under way reach the policy 
     ],
   );
   assert.include(input.active[0]!.item.body, "src/io.py");
+  // T3 names what it derives itself, so a policy never asks a build that would drop the request.
+  assert.deepStrictEqual(input.capabilities, ["pin-rebind"]);
 });
 
 it("Policy input: closed blockers carry their outcomes as facts; other items are unchanged", () => {

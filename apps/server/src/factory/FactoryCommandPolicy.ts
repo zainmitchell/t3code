@@ -380,7 +380,7 @@ export const policyInput = (
    * Facts this T3 supplies. `active-writes`: a running native item shows its recorded writes, or none
    * when any of its running admissions recorded none, which means its scope is unknown, never narrow.
    */
-  capabilities: ["active-writes"],
+  capabilities: ["active-writes", "pin-rebind"],
   items: input.items.map((item) => ({
     decisionKey: item.decisionKey,
     ...(item.triageDecisionKey === undefined ? {} : { triageDecisionKey: item.triageDecisionKey }),
