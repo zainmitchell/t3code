@@ -1,4 +1,3 @@
-import * as NodeChildProcess from "node:child_process";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
@@ -232,14 +231,16 @@ const layerFor = (
   );
   const layerTerminals = Layer.effect(
     TerminalManager.TerminalManager,
-    Effect.flatMap(PtyAdapter.PtyAdapter, (ptyAdapter) =>
-      TerminalManager.makeWithOptions({
+    Effect.gen(function* () {
+      const ptyAdapter = yield* PtyAdapter.PtyAdapter;
+      const runner = yield* ProcessRunner.ProcessRunner;
+      return yield* TerminalManager.makeWithOptions({
         logsDir: `${directory}/terminals`,
         ptyAdapter,
         shellResolver: () => shell,
-        processTable: hostProcessTable,
-      }),
-    ),
+        processTable: hostProcessTable(runner),
+      });
+    }),
   ).pipe(
     Layer.provide(NodePtyAdapter.layer),
     Layer.provide(ProcessRunner.layer),
@@ -475,35 +476,34 @@ const failingOnce = (_port: number, directory: string) => {
 const succeeding = () => `& '${process.execPath}' -e 'process.exit(0)'`;
 
 /**
- * The host's whole process table, read as the server's own fallback reads it. A fake or empty
- * table hides how a contained shell sits under its custody wrapper; a failed read is a defect.
+ * The host's whole process table, read through the server's own process runner as its fallback
+ * reads it. A fake or empty table hides how a contained shell sits under its custody wrapper.
  */
-const hostProcessTable = Effect.promise(
-  () =>
-    new Promise<ReadonlyArray<{ pid: number; ppid: number; name: string }>>((resolve, reject) =>
-      NodeChildProcess.execFile(
-        "powershell.exe",
-        [
-          "-NoProfile",
-          "-NonInteractive",
-          "-Command",
-          'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId)|$($_.ParentProcessId)|$($_.Name)" }',
-        ],
-        { maxBuffer: 16 * 1024 * 1024, windowsHide: true },
-        (error, stdout) =>
-          error
-            ? reject(error)
-            : resolve(
-                stdout.split(/\r?\n/).flatMap((line) => {
-                  const [pid, ppid, name = ""] = line.trim().split("|", 3);
-                  return Number(pid) > 0 && Number.isInteger(Number(ppid))
-                    ? [{ pid: Number(pid), ppid: Number(ppid), name }]
-                    : [];
-                }),
-              ),
+const hostProcessTable = (runner: ProcessRunner.ProcessRunner["Service"]) =>
+  runner
+    .run({
+      command: "powershell.exe",
+      args: [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId)|$($_.ParentProcessId)|$($_.Name)" }',
+      ],
+      timeout: "60 seconds",
+      maxOutputBytes: 16 * 1024 * 1024,
+    })
+    .pipe(
+      Effect.map((result) =>
+        result.stdout.split(/\r?\n/).flatMap((line) => {
+          const [pid, ppid, name = ""] = line.trim().split("|", 3);
+          return Number(pid) > 0 && Number.isInteger(Number(ppid))
+            ? [{ pid: Number(pid), ppid: Number(ppid), name }]
+            : [];
+        }),
       ),
-    ),
-);
+      // A host whose table cannot be read is a broken fixture, never an empty one.
+      Effect.orDie,
+    );
 
 const withRepository = <A, E, R>(
   body: (
