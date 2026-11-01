@@ -261,6 +261,13 @@ export const FactoryGrant = Schema.Struct({
   issuedAt: Schema.String,
   /** The reservations that spent it, in order. */
   spentBy: Schema.Array(Schema.String),
+  /**
+   * Retries a spent unit funded after the reservation that spent it failed in its environment:
+   * at most one per spending reservation, never one of a retry. `spentBy` is left as it was.
+   */
+  recoveries: Schema.optional(
+    Schema.Array(Schema.Struct({ failed: Schema.String, reservation: Schema.String })),
+  ),
   revoked: Schema.optional(Schema.Struct({ by: Schema.String, at: Schema.String })),
 });
 export type FactoryGrant = typeof FactoryGrant.Type;
@@ -1531,6 +1538,51 @@ const make = Effect.gen(function* () {
     return true;
   });
 
+  /**
+   * Funds one retry of the reservation `failed` on the unit it spent, in the caller's commit: only
+   * while that reservation is released on its verified outcome, the grant is unrevoked and on the
+   * exact subject, and neither `failed` nor any retry of it has been funded this way before.
+   */
+  const recoverGrant = Effect.fnUntraced(function* (input: {
+    readonly grantId: string;
+    readonly factoryId: FactoryId;
+    readonly itemKey: FactoryItemKey;
+    readonly stage: string;
+    readonly evidenceDigest: string;
+    readonly failed: string;
+    readonly reservationId: FactoryReservationId;
+  }) {
+    const grant = yield* readGrant(input.grantId);
+    if (
+      Option.isNone(grant) ||
+      grant.value.state === "revoked" ||
+      grant.value.factoryId !== input.factoryId ||
+      grant.value.itemKey !== input.itemKey ||
+      grant.value.stage !== input.stage ||
+      grant.value.evidenceDigest !== input.evidenceDigest ||
+      !grant.value.spentBy.includes(input.failed) ||
+      (grant.value.recoveries ?? []).some(
+        (recovery) => recovery.failed === input.failed || recovery.reservation === input.failed,
+      )
+    ) {
+      return false;
+    }
+    const rows = yield* sql<{ readonly record_json: string }>`
+      SELECT record_json FROM factory_reservations WHERE reservation_id = ${input.failed}
+    `;
+    if (rows[0] === undefined) return false;
+    const failed = yield* decodeReservation(rows[0].record_json);
+    if (failed.state !== "released" || failed.releasedReason !== "outcome_verified") return false;
+    yield* writeGrant({
+      ...grant.value,
+      recoveries: [
+        ...(grant.value.recoveries ?? []),
+        { failed: input.failed, reservation: input.reservationId },
+      ],
+    });
+    return true;
+  });
+
   const reserveAdmission = Effect.fnUntraced(function* (
     input: ReserveExecutionInput,
     admission: OrchestrationV2FactoryAdmission,
@@ -1638,14 +1690,20 @@ const make = Effect.gen(function* () {
     const executionChoice = choice === undefined ? undefined : decodeURIComponent(choice);
     const reservationId = makeReservationId(`reservation:${input.commandId}`);
     if (admission.grant !== undefined) {
-      const spent = yield* spendGrant({
+      const subject = {
         grantId: admission.grant.grantId,
         factoryId: admission.factoryId,
         itemKey: admission.itemKey,
         stage: admission.grant.stage,
         evidenceDigest: admission.grant.evidenceDigest,
         reservationId,
-      });
+      };
+      // `|grx:` names the reservation whose environment failure this admission retries.
+      const failed = /\|grx:([^|]+)/.exec(admission.stageBasis ?? "")?.[1];
+      const spent =
+        failed === undefined
+          ? yield* spendGrant(subject)
+          : yield* recoverGrant({ ...subject, failed });
       if (!spent) return { type: "refused", refusal: "grant_unavailable" } as const;
     }
     const reservation: NativeReservation = {

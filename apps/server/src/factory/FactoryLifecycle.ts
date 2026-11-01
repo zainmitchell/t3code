@@ -5633,6 +5633,7 @@ const make = Effect.gen(function* () {
       };
     }
     let grant: FactoryAdmissionRequest["grant"];
+    let grantRetry = "";
     if (decision.requiresGrant !== undefined) {
       // A grant answers one exact binding: the same evidence text for another binding is another
       // request, so leftover units of an earlier answer never fund it.
@@ -5655,7 +5656,20 @@ const make = Effect.gen(function* () {
           candidateGrant.state === "active" &&
           candidateGrant.remaining > 0,
       );
-      if (available === undefined) {
+      const recovered =
+        available === undefined
+          ? yield* grantRecovery({
+              factoryId,
+              itemKey,
+              stage,
+              itemVersion: candidate.observation.itemVersion,
+              evidenceDigest: required.evidenceDigest,
+              events: candidate.events,
+              authorized,
+              owner: candidate.owner?.reservationId,
+            })
+          : undefined;
+      if (available === undefined && recovered === undefined) {
         yield* reserve("grant", required.reason, required.evidenceDigest);
         return {
           disposition: "awaiting_grant",
@@ -5663,10 +5677,11 @@ const make = Effect.gen(function* () {
         };
       }
       grant = {
-        grantId: available.grantId,
+        grantId: available?.grantId ?? recovered!.grantId,
         stage: stage.type,
         evidenceDigest: required.evidenceDigest,
       };
+      grantRetry = recovered === undefined ? "" : `|grx:${recovered.failed}`;
     }
     // The binding and its output root are part of the decision: a changed one is another decision.
     const notes = [bound?.note, noEdit?.note].filter((note) => note !== undefined);
@@ -5681,7 +5696,7 @@ const make = Effect.gen(function* () {
             stage: {
               type: stage.type,
               // The binding's output root stays last: the store reads it at the end.
-              basis: `${stageBasis(stage)}${environmentRetry}${resourceBasis(decision.resources)}${choiceBasis(decision)}${noEdit?.basis ?? ""}${bound?.basis ?? ""}`,
+              basis: `${stageBasis(stage)}${environmentRetry}${resourceBasis(decision.resources)}${choiceBasis(decision)}${grantRetry}${noEdit?.basis ?? ""}${bound?.basis ?? ""}`,
             },
             ...(candidate.owner === undefined ? {} : { continues: candidate.owner.reservationId }),
             ...(grant === undefined ? {} : { grant }),
@@ -6288,6 +6303,68 @@ const make = Effect.gen(function* () {
           : [],
       ),
     );
+  });
+
+  /**
+   * The spent grant one retry may reuse, or none: the stage's latest attempt failed in its
+   * environment (T3's own record), that attempt's reservation spent this grant on the same item,
+   * stage, evidence and item version, T3 released it on that verified outcome, nothing of the item
+   * is still held, and neither it nor a retry of it has been funded this way. The commit rechecks.
+   */
+  const grantRecovery = Effect.fnUntraced(function* (input: {
+    readonly factoryId: FactoryId;
+    readonly itemKey: FactoryItemKey;
+    readonly stage: Exclude<FactoryStage, { readonly type: "done" }>;
+    readonly itemVersion: string;
+    readonly evidenceDigest: string;
+    readonly events: ReadonlyArray<FactoryOutcomeStore.StoredItemEvent>;
+    readonly authorized: ReadonlySet<string>;
+    /** The held claim the stage continues under: custody, not a running writer. */
+    readonly owner: string | undefined;
+  }) {
+    const failure = environmentFailures(input.events).get(input.stage.type);
+    if (failure === undefined) return undefined;
+    const outcome = yield* outcomeStore.get(failure.outcomeId);
+    const failedId = Option.isSome(outcome) ? outcome.value.origin.reservationId : undefined;
+    if (failedId === undefined) return undefined;
+    const reservations = yield* store.listReservations(input.factoryId);
+    const failed = reservations.find((reservation) => reservation.reservationId === failedId);
+    if (
+      failed?.origin !== "admitted" ||
+      failed.state !== "released" ||
+      failed.releasedReason !== "outcome_verified" ||
+      failed.itemKey !== input.itemKey ||
+      failed.itemVersion !== input.itemVersion ||
+      failed.taskKind !== input.stage.type ||
+      !(failed.stageBasis ?? "").startsWith(stageBasis(input.stage)) ||
+      failed.grantId === undefined ||
+      reservations.some(
+        (reservation) =>
+          reservation.itemKey === input.itemKey &&
+          reservation.state === "held" &&
+          reservation.reservationId !== input.owner,
+      )
+    ) {
+      return undefined;
+    }
+    const grant = (yield* store.listGrants(input.factoryId)).find(
+      (candidate) => candidate.grantId === failed.grantId,
+    );
+    if (
+      grant === undefined ||
+      !input.authorized.has(grant.grantId) ||
+      grant.state === "revoked" ||
+      grant.itemKey !== input.itemKey ||
+      grant.stage !== input.stage.type ||
+      grant.evidenceDigest !== input.evidenceDigest ||
+      !grant.spentBy.includes(failedId) ||
+      (grant.recoveries ?? []).some(
+        (recovery) => recovery.failed === failedId || recovery.reservation === failedId,
+      )
+    ) {
+      return undefined;
+    }
+    return { grantId: grant.grantId, failed: failedId };
   });
 
   const resolveReservedDecision = Effect.fn("FactoryLifecycle.resolveReservedDecision")(

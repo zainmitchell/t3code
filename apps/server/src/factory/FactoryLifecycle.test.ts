@@ -26470,3 +26470,128 @@ it.effect(
       }),
     ),
 );
+
+/** The item's pending owner requests and its grants, as the owner sees them. */
+const grantView = (issueNumber: number) =>
+  Effect.gen(function* () {
+    const state = yield* (yield* FactoryLifecycle.FactoryLifecycle).readState({ factoryId });
+    return {
+      pending: state.reservedDecisions.filter(
+        (decision) => decision.itemKey === itemKeyFor(issueNumber) && decision.state === "pending",
+      ),
+      grants: state.grants.filter((grant) => grant.itemKey === itemKeyFor(issueNumber)),
+    };
+  });
+
+/** A supervised build of `issueNumber`, granted one start by the owner and admitted. */
+const grantedBuild = (issueNumber: number) =>
+  Effect.gen(function* () {
+    yield* usePolicy(proposeSupervised);
+    yield* seedIssue(issueNumber);
+    assert.deepStrictEqual(yield* advance("tracker_event", 2), []);
+    const [request] = (yield* grantView(issueNumber)).pending;
+    assert.strictEqual(request?.kind, "grant");
+    assert.isTrue(
+      yield* (yield* FactoryLifecycle.FactoryLifecycle).resolveReservedDecision({
+        factoryId,
+        decisionId: request!.decisionId,
+        answer: "grant",
+        by: "owner",
+        grantUnits: 1,
+      }),
+    );
+    return admittedBy(yield* advance("owner_decision", 1));
+  });
+
+it.effect(
+  "Grant/E2: a granted start that fails in its environment retries once on the unit it spent, across concurrent passes and a restart; a retry's own failure asks the owner again",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* configureLifecycleFactory;
+          const build = yield* grantedBuild(7961);
+          yield* failFast(build);
+          yield* startsNothing;
+          assert.isTrue(yield* waitsOnEnvironment(7961));
+          yield* configureFactory(
+            lifecycleConfiguration({
+              stageExecution: {
+                implement: { ...buildExecution, runtimeMode: "approval-required" },
+              },
+            }),
+          );
+          const [retry, ...others] = yield* concurrentPasses;
+          const { pending, grants } = yield* grantView(7961);
+          assert.deepStrictEqual(
+            pending.map((decision) => decision.kind),
+            [],
+            "no second owner card on the same scope",
+          );
+          assert.deepStrictEqual(others, []);
+          assert.deepStrictEqual(stageOf(retry!), [`github:${claimRepository}#7961`, "implement"]);
+          assert.deepStrictEqual(
+            grants.map((grant) => [grant.state, grant.remaining, grant.spentBy, grant.recoveries]),
+            [
+              [
+                "spent",
+                0,
+                [build.reservation.reservationId],
+                [
+                  {
+                    failed: build.reservation.reservationId,
+                    reservation: retry!.reservation.reservationId,
+                  },
+                ],
+              ],
+            ],
+          );
+          assert.deepStrictEqual(yield* restartedPass, []);
+          // The retry fails in its environment as well: no chain of retries on one unit.
+          yield* failFast(retry!);
+          yield* configureFactory(
+            lifecycleConfiguration({
+              stageExecution: { implement: { ...buildExecution, interactionMode: "plan" } },
+            }),
+          );
+          assert.deepStrictEqual(admittedOnly(yield* advance("tracker_event", 3)), []);
+          assert.strictEqual(yield* dispositionOf(7961), "awaiting_grant");
+          const after = yield* grantView(7961);
+          assert.strictEqual(after.pending.length, 1);
+          assert.strictEqual(after.grants[0]!.recoveries!.length, 1);
+        }),
+      ),
+    ),
+);
+
+it.effect("Grant/E2: a changed item or an unchanged execution never reuses a spent grant", () =>
+  runIsolated(
+    Effect.scoped(
+      Effect.gen(function* () {
+        yield* configureLifecycleFactory;
+        const build = yield* grantedBuild(7962);
+        yield* failFast(build);
+        // Same execution: the environment wait holds and nothing is funded.
+        yield* startsNothing;
+        assert.isTrue(yield* waitsOnEnvironment(7962));
+        assert.deepStrictEqual((yield* grantView(7962)).grants[0]!.recoveries, undefined);
+        // A new item version is another request: the owner is asked, the spent grant stays spent.
+        const fake = yield* GitHubFake;
+        fake.issues.get(issueKey(claimRepository, 7962))!.body = "Implement 7962, now with export.";
+        yield* configureFactory(
+          lifecycleConfiguration({
+            stageExecution: { implement: { ...buildExecution, runtimeMode: "approval-required" } },
+          }),
+        );
+        assert.deepStrictEqual(admittedOnly(yield* advance("tracker_event", 3)), []);
+        assert.strictEqual(yield* dispositionOf(7962), "awaiting_grant");
+        const { pending, grants } = yield* grantView(7962);
+        assert.strictEqual(pending.length, 1);
+        assert.deepStrictEqual(
+          grants.map((grant) => [grant.state, grant.recoveries]),
+          [["spent", undefined]],
+        );
+      }),
+    ),
+  ),
+);
