@@ -10,6 +10,8 @@ import {
   AuthSettingsWriteScope,
   type AuthEnvironmentScope,
   FactoryId,
+  ProviderInstanceId,
+  WS_METHODS,
 } from "@t3tools/contracts";
 import * as NetService from "@t3tools/shared/Net";
 import * as Cause from "effect/Cause";
@@ -25,6 +27,7 @@ import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import { Command } from "effect/cli";
+import { FetchHttpClient } from "effect/http";
 import { Rpc, RpcClient, RpcClientError, RpcGroup, RpcSerialization } from "effect/rpc";
 import * as Socket from "effect/socket/Socket";
 import * as TestClock from "effect/testing/TestClock";
@@ -36,12 +39,17 @@ import {
   decisionAnswerPlan,
   FACTORY_RPC_TRANSPORT,
   FactoryCliError,
+  FactoryDeliveryUnknown,
   hostAdminDestination,
+  installAtRevision,
+  makeClient,
   pendingDecisions,
   refusedHistoricalTermination,
   remoteDestination,
   retirementPlan,
   runAudited,
+  switchAuditOutcome,
+  switchProviders,
   unfinishedSwitches,
 } from "./factory.ts";
 
@@ -438,6 +446,8 @@ it("Switching providers: the batch fails unless every named factory ends on the 
     { factoryId: "connector", outcome: "switched", readback: { verified: false } },
     { factoryId: "delta", outcome: "conflict" },
     { factoryId: "other", outcome: "failed" },
+    // Its write may have applied: not proven switched either.
+    { factoryId: "lost", outcome: "unknown" },
     { factoryId: "typo", outcome: "no_match" },
     { factoryId: "signed-out", outcome: "refused" },
   ] as const;
@@ -445,6 +455,7 @@ it("Switching providers: the batch fails unless every named factory ends on the 
     "connector: switched (read back differently)",
     "delta: conflict",
     "other: failed",
+    "lost: unknown",
     "typo: no_match",
     "signed-out: refused",
   ]);
@@ -462,6 +473,8 @@ it("Switching providers: the batch fails unless every named factory ends on the 
 });
 
 const SESSION_TOKEN = "issued-session-token-never-audited";
+// Text a transport or a peer chose: kept in the cause, never shown or audited.
+const TRANSPORT_TEXT = "transport-text-never-shown";
 
 /** An EnvironmentAuth that records what the CLI issues and revokes, and nothing else. */
 const recordingAuth = () => {
@@ -527,7 +540,7 @@ it.effect(
       );
       const auth = recordingAuth();
       const connected: Array<readonly [string, string]> = [];
-      const run = (use: Effect.Effect<string, FactoryCliError>) =>
+      const run = (use: Effect.Effect<string, FactoryCliError | RpcClientError.RpcClientError>) =>
         runAudited(
           {
             stateDir,
@@ -562,6 +575,28 @@ it.effect(
         ["http://127.0.0.1:3773", SESSION_TOKEN],
         ["http://127.0.0.1:3773", SESSION_TOKEN],
       ]);
+
+      // A lost connection no write waited on keeps the transport error as its cause, and none of
+      // its text. A ping timeout is named with the bound it exceeded.
+      for (const [cause, category] of [
+        [new Error(TRANSPORT_TEXT), "the connection was lost: SocketReadError"],
+        [
+          new Error("ping timeout"),
+          "the connection was lost: SocketReadError (ping timeout: no frame from the server for 60 seconds)",
+        ],
+      ] as const) {
+        const lost = new RpcClientError.RpcClientError({
+          reason: new Socket.SocketReadError({ cause }),
+        });
+        auth.revoked.length = 0;
+        const dropped = yield* Effect.flip(run(Effect.fail(lost)));
+        assert.instanceOf(dropped, FactoryCliError);
+        assert.strictEqual(dropped.cause, lost);
+        assert.strictEqual(dropped.reason, category);
+        assert.notInclude(String(dropped), TRANSPORT_TEXT);
+        assert.deepStrictEqual(auth.revoked, ["session:host-admin"]);
+      }
+
       assert.deepStrictEqual(
         (yield* auditLines(stateDir)).map((line) => [
           line.operation,
@@ -571,9 +606,12 @@ it.effect(
         [
           ["state", "succeeded", "host-admin-cli"],
           ["state", "failed", "host-admin-cli"],
+          ["state", "failed", "host-admin-cli"],
+          ["state", "failed", "host-admin-cli"],
         ],
       );
       assert.notInclude(yield* auditText(stateDir), SESSION_TOKEN);
+      assert.notInclude(yield* auditText(stateDir), TRANSPORT_TEXT);
 
       // A request that applied is not reported as failed when its audit line cannot be written.
       const auditPath = path.join(stateDir, "factory-admin-audit.jsonl");
@@ -588,57 +626,6 @@ it.effect(
       // What it returned is still shown, as success would print it.
       assert.isTrue(unaudited.message.endsWith('; its result: "applied"'));
       assert.deepStrictEqual(auth.revoked, ["session:host-admin"]);
-    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
-);
-
-it.effect(
-  "Host admin: a reply lost after the request could have reached the host is unknown, never failed",
-  () =>
-    Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem;
-      const path = yield* Path.Path;
-      const stateDir = yield* fs.makeTempDirectoryScoped({ prefix: "factory-cli-" });
-      const runtimeStatePath = path.join(stateDir, "server-runtime.json");
-      yield* fs.writeFileString(
-        runtimeStatePath,
-        JSON.stringify({
-          version: 1,
-          pid: 1,
-          port: 3773,
-          origin: "http://127.0.0.1:3773",
-          startedAt: "2026-10-31T00:00:00.000Z",
-        }),
-      );
-      const auth = recordingAuth();
-      const run = (reason: RpcClientError.RpcClientError["reason"]) =>
-        Effect.flip(
-          runAudited(
-            {
-              stateDir,
-              call: { operation: "install", request: {} },
-              destination: hostAdminDestination("install", runtimeStatePath),
-              connect: () => Effect.void,
-            },
-            () => Effect.fail(new RpcClientError.RpcClientError({ reason })),
-          ).pipe(Effect.provide(auth.layer)),
-        );
-      const lost = yield* run(new Socket.SocketReadError({ cause: new Error("ping timeout") }));
-      assert.instanceOf(lost, FactoryCliError);
-      assert.include(lost.message, "SocketReadError: An error occurred during Read (ping timeout)");
-      assert.include(lost.message, "it may have applied");
-      // A connection that never opened carried no request: that failure is the server's answer.
-      const unopened = yield* run(
-        new Socket.SocketOpenError({ kind: "Timeout", cause: new Error("no open") }),
-      );
-      assert.instanceOf(unopened, RpcClientError.RpcClientError);
-      assert.deepStrictEqual(
-        (yield* auditLines(stateDir)).map((line) => [line.outcome, line.error]),
-        [
-          ["unknown", "SocketReadError: An error occurred during Read (ping timeout)"],
-          ["failed", String(unopened)],
-        ],
-      );
-      assert.deepStrictEqual(auth.revoked, ["session:host-admin", "session:host-admin"]);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
@@ -977,5 +964,346 @@ it.effect(
         "session:host-admin",
       ]);
       assert.notInclude(yield* auditText(stateDir), SESSION_TOKEN);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+interface Frame {
+  readonly _tag: string;
+  readonly id?: string;
+  readonly tag?: string;
+  readonly payload?: Readonly<Record<string, unknown>>;
+}
+
+/** The server's end of the CLI's one WebSocket: what the CLI sent, and how the server answers. */
+class ServerEnd {
+  readyState: number;
+  readonly frames: Array<Frame> = [];
+  readonly url: string;
+  private readonly received: Queue.Queue<void>;
+  private readonly listeners = new Map<string, Set<(event: object) => void>>();
+
+  constructor(url: string, received: Queue.Queue<void>, readyState: number) {
+    this.url = url;
+    this.received = received;
+    this.readyState = readyState;
+  }
+
+  addEventListener(type: string, listener: (event: object) => void) {
+    this.listeners.set(type, (this.listeners.get(type) ?? new Set()).add(listener));
+  }
+
+  removeEventListener(type: string, listener: (event: object) => void) {
+    this.listeners.get(type)?.delete(listener);
+  }
+
+  send(data: string) {
+    this.frames.push(JSON.parse(data) as Frame);
+    Queue.offerUnsafe(this.received, undefined);
+  }
+
+  close(code = 1000, reason = "") {
+    if (this.readyState === 3) return;
+    this.readyState = 3;
+    this.emit("close", { type: "close", code, reason });
+  }
+
+  reply(request: Frame, value: unknown) {
+    const exit = { _tag: "Success", value };
+    this.emit("message", {
+      type: "message",
+      data: JSON.stringify({ _tag: "Exit", requestId: request.id, exit }),
+    });
+  }
+
+  /** What Node's WebSocket reports when the connection drops: an empty error event, then 1006. */
+  drop() {
+    this.emit("error", { type: "error", message: "" });
+    this.close(1006);
+  }
+
+  requests(tag: string) {
+    return this.frames.filter((frame) => frame._tag === "Request" && frame.tag === tag);
+  }
+
+  private emit(type: string, event: object) {
+    for (const listener of this.listeners.get(type) ?? []) listener(event);
+  }
+}
+
+const FACTORY = FactoryId.make("factory-a");
+const overviewAt = (revision: number) => ({
+  factories: [
+    {
+      factoryId: FACTORY,
+      state: {
+        configured: true,
+        configurationRevision: revision,
+        pools: [],
+        issues: [],
+        reservations: [],
+        reservedDecisions: [],
+        grants: [],
+        lastCollection: [],
+      },
+    },
+  ],
+});
+const INSTALLED = {
+  factoryId: FACTORY,
+  enabled: false,
+  configurationRevision: 8,
+  policyRevision: "policy:a",
+};
+
+/**
+ * Runs `use` through the CLI's own client and audit, against a server end the test drives. The
+ * ticket fetch and socket are the only fakes; a socket still connecting can fail to open.
+ */
+const startAudited = Effect.fn("test.startAudited")(function* <A, E>(
+  stateDir: string,
+  call: { readonly operation: string; readonly request: unknown },
+  use: (client: Effect.Success<ReturnType<typeof makeClient>>) => Effect.Effect<A, E>,
+  outcome?: (result: A) => "succeeded" | "unknown",
+  readyState = 1,
+) {
+  const received = yield* Queue.unbounded<void>();
+  const opened = yield* Queue.unbounded<ServerEnd>();
+  const tickets: Array<readonly [string, string | null]> = [];
+  const fetchTicket = (input: string | URL | Request, init?: RequestInit) => {
+    tickets.push([String(input), new Headers(init?.headers).get("authorization")]);
+    return Promise.resolve(
+      Response.json({ ticket: "rpc-ticket", expiresAt: "2026-10-31T09:40:00.000Z" }),
+    );
+  };
+  const fiber = yield* runAudited(
+    {
+      stateDir,
+      call,
+      outcome,
+      destination: Effect.succeed({
+        origin: "http://127.0.0.1:3773",
+        token: SESSION_TOKEN,
+        actor: { kind: "host-admin-cli" },
+      }),
+      connect: (origin, token) =>
+        makeClient(origin, token).pipe(
+          Effect.provideService(Socket.WebSocketConstructor, (url) => {
+            const socket = new ServerEnd(url, received, readyState);
+            Queue.offerUnsafe(opened, socket);
+            return socket as unknown as globalThis.WebSocket;
+          }),
+        ),
+    },
+    use,
+  ).pipe(
+    Effect.provideService(FetchHttpClient.Fetch, fetchTicket as typeof globalThis.fetch),
+    Effect.forkChild,
+  );
+  const socket = yield* Queue.take(opened);
+  const request = Effect.fn("test.request")(function* (tag: string, index = 0) {
+    for (;;) {
+      const sent = socket.requests(tag)[index];
+      if (sent !== undefined) return sent;
+      yield* Queue.take(received);
+    }
+  });
+  return { fiber, socket, tickets, request };
+});
+
+/** `factory install --expect-revision 7`. */
+const startInstall = (stateDir: string) =>
+  startAudited(
+    stateDir,
+    { operation: "install", request: { factoryId: FACTORY, expectRevision: 7 } },
+    installAtRevision(FACTORY, 7, '{"factoryId":"factory-a","enabled":false}'),
+  );
+
+const outcomes = (stateDir: string) =>
+  Effect.map(auditLines(stateDir), (lines) => lines.map((line) => line.outcome));
+
+it.effect(
+  "Transport: a reply after 12 silent seconds is still the install's reply, over the ticketed socket",
+  () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const stateDir = yield* fs.makeTempDirectoryScoped({ prefix: "factory-cli-" });
+      const { fiber, socket, tickets, request } = yield* startInstall(stateDir);
+      socket.reply(yield* request(WS_METHODS.factoryOverview), overviewAt(7));
+      const configure = yield* request(WS_METHODS.factoryConfigure);
+      // The server's own revision check travels with the write.
+      assert.strictEqual(configure.payload?.expectRevision, 7);
+      // A loaded host delivers nothing, not even pongs, for longer than the protocol's 5 s default.
+      yield* TestClock.adjust("12 seconds");
+      socket.reply(configure, INSTALLED);
+
+      assert.deepStrictEqual(yield* Fiber.join(fiber), INSTALLED);
+      assert.deepStrictEqual(tickets, [
+        ["http://127.0.0.1:3773/api/auth/websocket-ticket", `Bearer ${SESSION_TOKEN}`],
+      ]);
+      const url = new URL(socket.url);
+      assert.strictEqual(url.searchParams.get("wsTicket"), "rpc-ticket");
+      assert.notInclude(socket.url, SESSION_TOKEN);
+      assert.deepStrictEqual(yield* outcomes(stateDir), ["succeeded"]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect.each([
+  {
+    name: "the socket drops",
+    lose: (socket: ServerEnd) => Effect.sync(() => socket.drop()),
+    cause: "socket error",
+  },
+  {
+    name: "the server stays silent past 60 seconds",
+    lose: () => TestClock.adjust("65 seconds"),
+    cause: "ping timeout: no frame from the server for 60 seconds",
+  },
+  {
+    name: "the server closes with a reason of its own",
+    lose: (socket: ServerEnd) => Effect.sync(() => socket.close(1011, TRANSPORT_TEXT)),
+    cause: "SocketCloseError (code 1011)",
+  },
+])(
+  "Transport: when $name after configure was sent, the install is reported as delivery unknown",
+  ({ lose, cause }) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const stateDir = yield* fs.makeTempDirectoryScoped({ prefix: "factory-cli-" });
+      const { fiber, socket, request } = yield* startInstall(stateDir);
+      socket.reply(yield* request(WS_METHODS.factoryOverview), overviewAt(7));
+      yield* request(WS_METHODS.factoryConfigure);
+      yield* lose(socket);
+
+      const exit = yield* Fiber.await(fiber);
+      const error = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined;
+      assert.instanceOf(error, FactoryDeliveryUnknown);
+      assert.include(String(error), cause);
+      assert.include(String(error), "read the factory back");
+      assert.notInclude(String(error), "nothing installed");
+      assert.instanceOf(error.cause, RpcClientError.RpcClientError);
+      assert.notInclude(String(error), TRANSPORT_TEXT);
+      // Sent once; the CLI never resends a write it cannot confirm.
+      assert.lengthOf(socket.requests(WS_METHODS.factoryConfigure), 1);
+      assert.deepStrictEqual(yield* outcomes(stateDir), ["unknown"]);
+      assert.notInclude(yield* auditText(stateDir), TRANSPORT_TEXT);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect("Transport: a stale revision, or a drop before configure, fails with no write sent", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    for (const [answer, reason, keepsTransportError] of [
+      [
+        (socket: ServerEnd, overview: Frame) => socket.reply(overview, overviewAt(8)),
+        "is at revision 8, not 7: nothing installed",
+        false,
+      ],
+      [(socket: ServerEnd) => socket.drop(), "socket error", true],
+    ] as const) {
+      const stateDir = yield* fs.makeTempDirectoryScoped({ prefix: "factory-cli-" });
+      const { fiber, socket, request } = yield* startInstall(stateDir);
+      answer(socket, yield* request(WS_METHODS.factoryOverview));
+
+      const exit = yield* Fiber.await(fiber);
+      const error = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined;
+      assert.instanceOf(error, FactoryCliError);
+      assert.include((error as FactoryCliError).reason, reason);
+      assert.strictEqual(isRpcClientError((error as FactoryCliError).cause), keepsTransportError);
+      assert.lengthOf(socket.requests(WS_METHODS.factoryConfigure), 0);
+      assert.deepStrictEqual(yield* outcomes(stateDir), ["failed"]);
+    }
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+const FROM = ProviderInstanceId.make("claude_second");
+const TO = ProviderInstanceId.make("claudeAgent");
+const switchResult = (factoryId: string, outcome: string, revision: number, switched?: number) => ({
+  factoryId,
+  outcome,
+  revision,
+  ...(switched === undefined ? {} : { switchedRevision: switched }),
+  from: { instanceId: FROM, displayName: null },
+  to: { instanceId: TO, displayName: null },
+  changes: [],
+  alreadyOnTarget: [],
+});
+const switchRequest = {
+  factoryIds: [FactoryId.make("alpha"), FactoryId.make("beta")],
+  from: FROM,
+  to: TO,
+};
+
+it.effect(
+  "Transport: a switch whose reply is lost is unknown, sent once and never read back, reported with the rest",
+  () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const stateDir = yield* fs.makeTempDirectoryScoped({ prefix: "factory-cli-" });
+      const started = yield* startAudited(
+        stateDir,
+        { operation: "switch-provider", request: switchRequest },
+        switchProviders({ ...switchRequest, apply: true }),
+        switchAuditOutcome,
+      );
+      const { fiber, socket } = started;
+      const sent = (index: number) => started.request(WS_METHODS.factorySwitchProvider, index);
+      socket.reply(yield* sent(0), switchResult("alpha", "switched", 3, 4));
+      socket.reply(yield* sent(1), switchResult("alpha", "already_switched", 4));
+      yield* sent(2);
+      socket.drop();
+
+      const report = yield* Fiber.join(fiber);
+      const [alpha, beta] = report.factories;
+      assert.deepInclude(alpha, {
+        outcome: "switched",
+        readback: { revision: 4, outcome: "already_switched", verified: true },
+      });
+      assert.deepInclude(beta, { factoryId: FactoryId.make("beta"), outcome: "unknown" });
+      assert.include(JSON.stringify(beta), "read the factory back");
+      assert.deepStrictEqual(
+        socket
+          .requests(WS_METHODS.factorySwitchProvider)
+          .map(({ payload }) => [payload?.factoryId, payload?.apply]),
+        [
+          ["alpha", true],
+          ["alpha", false],
+          ["beta", true],
+        ],
+      );
+      const lines = yield* auditLines(stateDir);
+      assert.deepStrictEqual(
+        lines.map((line) => line.outcome),
+        ["unknown"],
+      );
+      assert.deepStrictEqual(lines[0]?.result, JSON.parse(JSON.stringify(report)));
+      assert.deepStrictEqual(unfinishedSwitches(report.factories, true), ["beta: unknown"]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "Transport: a write whose connection never opened carried no request, so it failed, never unknown",
+  () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const stateDir = yield* fs.makeTempDirectoryScoped({ prefix: "factory-cli-" });
+      const { fiber, socket } = yield* startAudited(
+        stateDir,
+        { operation: "switch-provider", request: switchRequest },
+        switchProviders({ ...switchRequest, factoryIds: [FactoryId.make("alpha")], apply: true }),
+        switchAuditOutcome,
+        0,
+      );
+      socket.drop();
+
+      const report = yield* Fiber.join(fiber);
+      assert.deepStrictEqual(report.factories, [
+        {
+          factoryId: FactoryId.make("alpha"),
+          outcome: "failed",
+          reason: "the connection was lost: SocketOpenError (socket error)",
+        },
+      ]);
+      assert.lengthOf(socket.frames, 0);
+      assert.deepStrictEqual(yield* outcomes(stateDir), ["succeeded"]);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );

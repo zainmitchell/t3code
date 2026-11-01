@@ -28,6 +28,7 @@ import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import { identity } from "effect/Function";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
@@ -59,14 +60,79 @@ import { authLocationFlags, type CliAuthLocationFlags, resolveCliAuthConfig } fr
 export class FactoryCliError extends Schema.TaggedError<FactoryCliError>()("FactoryCliError", {
   operation: Schema.String,
   reason: Schema.String,
+  cause: Schema.optional(Schema.Defect()),
 }) {
   override get message(): string {
     return `factory ${this.operation}: ${this.reason}`;
   }
 }
 
+/** A write sent before the connection was lost may have applied; it is never resent. */
+export class FactoryDeliveryUnknown extends Schema.TaggedError<FactoryDeliveryUnknown>()(
+  "FactoryDeliveryUnknown",
+  {
+    operation: Schema.String,
+    write: Schema.String,
+    reason: Schema.String,
+    cause: Schema.Defect(),
+  },
+) {
+  override get message(): string {
+    return `factory ${this.operation}: delivery unknown: the connection was lost before the server acknowledged ${this.write} (${this.reason}); read the factory back before repeating it`;
+  }
+}
+
 const HOST_ADMIN_SUBJECT = "host-admin";
 const SESSION_TTL = Duration.minutes(10);
+
+/**
+ * The factory CLI's one connection, never retried. A busy host or CLI can be silent for seconds,
+ * so the connection is given up only after a minute without a frame, not the library's five.
+ */
+export const FACTORY_RPC_TRANSPORT = {
+  retryTransientErrors: false,
+  retryPolicy: Schedule.recurs(0),
+  pingTimeout: "60 seconds",
+} as const;
+
+const isRpcClientError = Schema.is(RpcClientError.RpcClientError);
+const isDeliveryUnknown = Schema.is(FactoryDeliveryUnknown);
+
+/**
+ * How the connection was lost, from bounded fields only. A ping timeout and a dropped socket share
+ * a SocketReadError message; transport and peer text (a close reason) stays in the error's cause.
+ */
+const connectionLost = ({ reason }: RpcClientError.RpcClientError) => {
+  const cause = "cause" in reason ? reason.cause : undefined;
+  if (cause instanceof Error && cause.message === "ping timeout") {
+    return `${reason._tag} (ping timeout: no frame from the server for ${FACTORY_RPC_TRANSPORT.pingTimeout})`;
+  }
+  if (typeof cause === "object" && cause !== null && "type" in cause && cause.type === "error") {
+    return `${reason._tag} (socket error)`;
+  }
+  return reason._tag === "SocketCloseError" ? `${reason._tag} (code ${reason.code})` : reason._tag;
+};
+
+/**
+ * Marks a write: a connection lost before its reply leaves whether it applied unknown. One that
+ * never opened or upgraded carried no request, so it stays the plain failure it is.
+ */
+const unacknowledged =
+  (operation: string, write: string) =>
+  <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+    Effect.mapError(effect, (error) =>
+      isRpcClientError(error) &&
+      error.reason._tag !== "SocketOpenError" &&
+      error.reason._tag !== "SocketUpgradeError"
+        ? new FactoryDeliveryUnknown({
+            operation,
+            write,
+            reason: connectionLost(error),
+            cause: error,
+          })
+        : error,
+    );
+
 const sha256 = (content: string | Uint8Array) =>
   NodeCrypto.createHash("sha256").update(content).digest("hex");
 
@@ -211,6 +277,8 @@ export const runAudited = Effect.fn("factoryCli.runAudited")(function* <C, A, E,
     readonly call: HostAdminCall;
     readonly destination: Effect.Effect<FactoryDestination, E2, R2 | Scope.Scope>;
     readonly connect: (origin: string, token: string) => Effect.Effect<C, E3, Scope.Scope>;
+    /** Whether a call that succeeded still left a write unacknowledged; by default it did not. */
+    readonly outcome?: ((result: A) => "succeeded" | "unknown") | undefined;
   },
   use: (client: C) => Effect.Effect<A, E, R>,
 ) {
@@ -238,26 +306,30 @@ export const runAudited = Effect.fn("factoryCli.runAudited")(function* <C, A, E,
       const destination = yield* input.destination;
       return yield* input.connect(destination.origin, destination.token).pipe(
         Effect.flatMap(use),
-        Effect.tapError((error) => {
-          const lost = lostReply(error);
-          return audit({
-            actor: destination.actor,
-            outcome: lost === undefined ? "failed" : "unknown",
-            error: lost ?? String(error),
-          }).pipe(Effect.ignore);
-        }),
-        Effect.mapError((error) => {
-          const lost = lostReply(error);
-          return lost === undefined
-            ? error
-            : new FactoryCliError({
+        // A lost connection no write was waiting on: nothing applied, so it failed.
+        Effect.mapError((error) =>
+          isRpcClientError(error)
+            ? new FactoryCliError({
                 operation: call.operation,
-                reason: `its reply was lost: ${lost}; it may have applied, so read the factory back before running it again`,
-              });
-        }),
+                reason: `the connection was lost: ${connectionLost(error)}`,
+                cause: error,
+              })
+            : error,
+        ),
+        Effect.tapError((error) =>
+          audit({
+            actor: destination.actor,
+            outcome: isDeliveryUnknown(error) ? "unknown" : "failed",
+            error: String(error),
+          }).pipe(Effect.ignore),
+        ),
         // The request already applied: a lost audit line must not read as the request failing.
         Effect.tap((result) =>
-          audit({ actor: destination.actor, outcome: "succeeded", result }).pipe(
+          audit({
+            actor: destination.actor,
+            outcome: input.outcome?.(result) ?? "succeeded",
+            result,
+          }).pipe(
             Effect.catch((cause) =>
               Effect.flatMap(
                 // Exactly what success prints, bounded; nothing more than its audit line holds.
@@ -287,6 +359,7 @@ const withHostAdmin = Effect.fn("factoryCli.withHostAdmin")(function* <A, E>(
   flags: FactoryLocationFlags,
   call: HostAdminCall,
   use: (client: FactoryClient) => Effect.Effect<A, E>,
+  outcome?: (result: A) => "succeeded" | "unknown",
 ) {
   const logLevel = yield* GlobalFlag.LogLevel;
   const config = yield* resolveCliAuthConfig(flags, logLevel);
@@ -298,8 +371,10 @@ const withHostAdmin = Effect.fn("factoryCli.withHostAdmin")(function* <A, E>(
       reason: "--server and --token-file go together: name both for another host, or neither",
     });
   }
+  const connect = (origin: string, token: string) =>
+    makeClient(origin, token).pipe(Effect.provide(Socket.layerWebSocketConstructorGlobal));
   const run = <E2, R>(destination: Effect.Effect<FactoryDestination, E2, R>) =>
-    runAudited({ stateDir: config.stateDir, call, destination, connect: makeClient }, use);
+    runAudited({ stateDir: config.stateDir, call, destination, connect, outcome }, use);
   return yield* server !== undefined && tokenFile !== undefined
     ? run(remoteDestination(call.operation, server, tokenFile))
     : run(hostAdminDestination(call.operation, config.serverRuntimeStatePath)).pipe(
@@ -312,43 +387,11 @@ const withHostAdmin = Effect.fn("factoryCli.withHostAdmin")(function* <A, E>(
       );
 });
 
-/**
- * The factory CLI's one connection, never retried. A busy host or CLI can be silent for seconds,
- * so the connection is given up only after a minute without a frame, not the library's five.
- */
-export const FACTORY_RPC_TRANSPORT = {
-  retryTransientErrors: false,
-  retryPolicy: Schedule.recurs(0),
-  pingTimeout: "60 seconds",
-} as const;
-
-const isRpcClientError = Schema.is(RpcClientError.RpcClientError);
-
-/**
- * Why a call's reply was lost once its request could have reached the host, or undefined. Such a
- * call may have applied: only reading the factory back says whether it did.
- */
-const lostReply = (error: unknown) => {
-  if (!isRpcClientError(error)) return undefined;
-  const { reason } = error;
-  if (reason._tag === "SocketOpenError" || reason._tag === "SocketUpgradeError") return undefined;
-  const cause = "cause" in reason ? (reason.cause as unknown) : undefined;
-  // A WebSocket error event carries a message, or at least its type.
-  const detail =
-    cause instanceof Error
-      ? cause.message
-      : typeof cause === "object" && cause !== null
-        ? "message" in cause && typeof cause.message === "string" && cause.message !== ""
-          ? cause.message
-          : "type" in cause
-            ? String(cause.type)
-            : undefined
-        : undefined;
-  return detail === undefined ? error.message : `${error.message} (${detail})`;
-};
-
 /** The running server's owner methods, over its WebSocket, as any client reaches them. */
-const makeClient = Effect.fn("factoryCli.makeClient")(function* (origin: string, token: string) {
+export const makeClient = Effect.fn("factoryCli.makeClient")(function* (
+  origin: string,
+  token: string,
+) {
   const http = yield* HttpApiClient.make(EnvironmentHttpApi, { baseUrl: origin });
   const issued = yield* http.auth.webSocketTicket({
     headers: { authorization: `Bearer ${token}` },
@@ -361,12 +404,7 @@ const makeClient = Effect.fn("factoryCli.makeClient")(function* (origin: string,
   const context = yield* Layer.build(
     Layer.effect(RpcClient.Protocol, RpcClient.makeProtocolSocket(FACTORY_RPC_TRANSPORT)).pipe(
       Layer.provide(
-        Layer.mergeAll(
-          Socket.layerWebSocket(url.toString()).pipe(
-            Layer.provide(Socket.layerWebSocketConstructorGlobal),
-          ),
-          RpcSerialization.layerJson,
-        ),
+        Layer.mergeAll(Socket.layerWebSocket(url.toString()), RpcSerialization.layerJson),
       ),
     ),
   );
@@ -399,6 +437,25 @@ const currentRevision = (
 ) =>
   overview.factories.find((factory) => factory.factoryId === factoryId)?.state
     .configurationRevision ?? 0;
+
+/** Installs `configuration` only while the factory is still at `expectRevision`. */
+export const installAtRevision =
+  (factoryId: FactoryId, expectRevision: number, configuration: string) =>
+  (client: FactoryClient) =>
+    Effect.gen(function* () {
+      // The server refuses a stale revision in the install's own write. This read only still
+      // refuses one on a server older than that check, which drops the field.
+      const revision = currentRevision(yield* client[WS_METHODS.factoryOverview]({}), factoryId);
+      if (revision !== expectRevision) {
+        return yield* new FactoryCliError({
+          operation: "install",
+          reason: `${factoryId} is at revision ${revision}, not ${expectRevision}: nothing installed`,
+        });
+      }
+      return yield* client[WS_METHODS.factoryConfigure]({ configuration, expectRevision }).pipe(
+        unacknowledged("install", "the configuration"),
+      );
+    });
 
 const stateCommand = Command.make("state", {
   ...factoryLocationFlags,
@@ -441,25 +498,7 @@ const installCommand = Command.make("install", {
           request: { factoryId, expectRevision: flags.expectRevision },
           documentSha256: document.sha256,
         },
-        (client) =>
-          Effect.gen(function* () {
-            // The server refuses a stale revision in the install's own write. This read only
-            // still refuses one on a server older than that check, which drops the field.
-            const revision = currentRevision(
-              yield* client[WS_METHODS.factoryOverview]({}),
-              factoryId,
-            );
-            if (revision !== flags.expectRevision) {
-              return yield* new FactoryCliError({
-                operation: "install",
-                reason: `${factoryId} is at revision ${revision}, not ${flags.expectRevision}: nothing installed`,
-              });
-            }
-            return yield* client[WS_METHODS.factoryConfigure]({
-              configuration: document.text,
-              expectRevision: flags.expectRevision,
-            });
-          }),
+        installAtRevision(factoryId, flags.expectRevision, document.text),
       );
     }).pipe(Effect.flatMap(printJson)),
   ),
@@ -512,7 +551,12 @@ const ceilingCommand = Command.make("ceiling", {
       const result = yield* withHostAdmin(
         flags,
         { operation: "ceiling", request: set === undefined ? {} : { set } },
-        (client) => client[WS_METHODS.factoryAgentCeiling](set === undefined ? {} : { set }),
+        (client) =>
+          set === undefined
+            ? client[WS_METHODS.factoryAgentCeiling]({})
+            : client[WS_METHODS.factoryAgentCeiling]({ set }).pipe(
+                unacknowledged("ceiling", "the ceiling"),
+              ),
       );
       if (set !== undefined && !result.applied) {
         return yield* new FactoryCliError({
@@ -532,7 +576,7 @@ const instanceFlag = (name: string, description: string) =>
 export const unfinishedSwitches = (
   factories: ReadonlyArray<{
     readonly factoryId: string;
-    readonly outcome: FactorySwitchProviderResult["outcome"] | "failed";
+    readonly outcome: FactorySwitchProviderResult["outcome"] | "failed" | "unknown";
     readonly readback?: { readonly verified: boolean } | undefined;
   }>,
   applied: boolean,
@@ -545,6 +589,68 @@ export const unfinishedSwitches = (
           `${factoryId}: ${outcome}${readback?.verified === false ? " (read back differently)" : ""}`,
         ],
   );
+
+/** Switches each factory at the revision it reads, then reads each switch back. */
+export const switchProviders =
+  (input: {
+    readonly factoryIds: ReadonlyArray<FactoryId>;
+    readonly from: ProviderInstanceId;
+    readonly to: ProviderInstanceId;
+    readonly apply: boolean;
+  }) =>
+  (client: FactoryClient) =>
+    Effect.forEach(input.factoryIds, (factoryId) => {
+      const call = (apply: boolean) =>
+        client[WS_METHODS.factorySwitchProvider]({
+          factoryId,
+          from: input.from,
+          to: input.to,
+          apply,
+        }).pipe(apply ? unacknowledged("switch-provider", `${factoryId}'s switch`) : identity);
+      return call(input.apply).pipe(
+        // A switch reads back as already switched, at exactly the revision it wrote.
+        Effect.filterOrElse(
+          (result) => result.outcome !== "switched",
+          (result) =>
+            Effect.map(call(false), (after) => ({
+              ...result,
+              readback: {
+                revision: after.revision,
+                outcome: after.outcome,
+                verified:
+                  after.outcome === "already_switched" &&
+                  after.revision === result.switchedRevision,
+              },
+            })),
+        ),
+        // One factory's failure is reported with the rest; nothing is retried or resent.
+        Effect.catchTags({
+          FactoryDeliveryUnknown: (error) =>
+            Effect.succeed({ factoryId, outcome: "unknown" as const, reason: error.message }),
+          RpcClientError: (error) =>
+            Effect.succeed({
+              factoryId,
+              outcome: "failed" as const,
+              reason: `the connection was lost: ${connectionLost(error)}`,
+            }),
+        }),
+        Effect.catch((error) =>
+          Effect.succeed({ factoryId, outcome: "failed" as const, reason: String(error) }),
+        ),
+      );
+    }).pipe(
+      Effect.map((factories) => ({
+        applied: input.apply,
+        from: input.from,
+        to: input.to,
+        factories,
+      })),
+    );
+
+/** A switch whose write went unacknowledged leaves the whole call's outcome unknown. */
+export const switchAuditOutcome = (report: {
+  readonly factories: ReadonlyArray<{ readonly outcome: string }>;
+}) => (report.factories.some((factory) => factory.outcome === "unknown") ? "unknown" : "succeeded");
 
 const switchProviderCommand = Command.make("switch-provider", {
   ...factoryLocationFlags,
@@ -567,51 +673,12 @@ const switchProviderCommand = Command.make("switch-provider", {
   ),
   Command.withHandler((flags) =>
     Effect.gen(function* () {
-      const factoryIds = [...new Set(flags.factory)];
+      const request = { factoryIds: [...new Set(flags.factory)], from: flags.from, to: flags.to };
       const report = yield* withHostAdmin(
         flags,
-        {
-          operation: flags.apply ? "switch-provider" : "switch-provider-plan",
-          request: { factoryIds, from: flags.from, to: flags.to },
-        },
-        (client) =>
-          Effect.forEach(factoryIds, (factoryId) => {
-            const call = (apply: boolean) =>
-              client[WS_METHODS.factorySwitchProvider]({
-                factoryId,
-                from: flags.from,
-                to: flags.to,
-                apply,
-              });
-            return call(flags.apply).pipe(
-              // A switch reads back as already switched, at exactly the revision it wrote.
-              Effect.filterOrElse(
-                (result) => result.outcome !== "switched",
-                (result) =>
-                  Effect.map(call(false), (after) => ({
-                    ...result,
-                    readback: {
-                      revision: after.revision,
-                      outcome: after.outcome,
-                      verified:
-                        after.outcome === "already_switched" &&
-                        after.revision === result.switchedRevision,
-                    },
-                  })),
-              ),
-              // One factory's failure is reported with the rest; nothing is retried.
-              Effect.catch((error) =>
-                Effect.succeed({ factoryId, outcome: "failed" as const, reason: String(error) }),
-              ),
-            );
-          }).pipe(
-            Effect.map((factories) => ({
-              applied: flags.apply,
-              from: flags.from,
-              to: flags.to,
-              factories,
-            })),
-          ),
+        { operation: flags.apply ? "switch-provider" : "switch-provider-plan", request },
+        switchProviders({ ...request, apply: flags.apply }),
+        switchAuditOutcome,
       );
       yield* printJson(report);
       const unfinished = unfinishedSwitches(report.factories, flags.apply);
@@ -637,7 +704,10 @@ const observeCommand = Command.make("observe", {
     withHostAdmin(
       flags,
       { operation: "observe", request: { factoryId: flags.factory } },
-      (client) => client[WS_METHODS.factoryObserveClaims]({ factoryId: flags.factory }),
+      (client) =>
+        client[WS_METHODS.factoryObserveClaims]({ factoryId: flags.factory }).pipe(
+          unacknowledged("observe", "the observed claims"),
+        ),
     ).pipe(Effect.flatMap(printJson)),
   ),
 );
@@ -663,7 +733,7 @@ const enterCommand = Command.make("enter", {
       issueNumber: flags.issue,
     };
     return withHostAdmin(flags, { operation: "enter", request }, (client) =>
-      client[WS_METHODS.factoryEnter](request),
+      client[WS_METHODS.factoryEnter](request).pipe(unacknowledged("enter", "the entry")),
     ).pipe(Effect.flatMap(printJson));
   }),
 );
@@ -686,7 +756,10 @@ const transferCommand = Command.make("transfer", {
       return yield* withHostAdmin(
         flags,
         { operation: "transfer", request: input, documentSha256: request.sha256 },
-        (client) => client[WS_METHODS.factoryTransfer](input),
+        (client) =>
+          client[WS_METHODS.factoryTransfer](input).pipe(
+            unacknowledged("transfer", "the transfer"),
+          ),
       );
     }).pipe(Effect.flatMap(printJson)),
   ),
@@ -868,7 +941,12 @@ const retireCommand = Command.make("retire", {
                 factoryId: flags.factory,
                 reservationId: FactoryReservationId.make(unit.reservationId),
                 reason: `owner takeover authorization ${receipt.sha256} ("${authorized.reply}"), retiring ${unit.unit}`,
-              });
+              }).pipe(
+                unacknowledged(
+                  "retire",
+                  `retiring ${unit.reservationId} after retiring ${retired.length}`,
+                ),
+              );
               if (!result.disposed) {
                 return yield* new FactoryCliError({
                   operation: "retire",
@@ -922,7 +1000,7 @@ const recoverCommand = Command.make("recover", {
           reservationId: flags.reservation,
           runId: flags.run,
           reason: flags.reason,
-        }),
+        }).pipe(unacknowledged("recover", "the recovery")),
     ).pipe(Effect.flatMap(printJson)),
   ),
 );
@@ -965,7 +1043,11 @@ const disposeCommand = Command.make("dispose", {
           reservationId: flags.reservation,
           reason: flags.reason,
           ...(Option.isSome(flags.expectDigest) ? { expectDigest: flags.expectDigest.value } : {}),
-        }),
+        }).pipe(
+          Option.isSome(flags.expectDigest)
+            ? unacknowledged("dispose", "the attestation")
+            : identity,
+        ),
     ).pipe(Effect.flatMap(printJson)),
   ),
 );
@@ -1032,6 +1114,10 @@ const historicalTerminationCommand = Command.make("historical-termination", {
         },
         (client) =>
           client[WS_METHODS.factoryHistoricalTermination](input).pipe(
+            // Without an expected digest it only reads.
+            input.expectDigest === undefined
+              ? identity
+              : unacknowledged("historical-termination", `the ${input.action} record`),
             Effect.flatMap(refusedHistoricalTermination),
           ),
       );
@@ -1272,7 +1358,9 @@ const decideCommand = Command.make("decide", {
                 );
         const before = yield* plan();
         if (before.type !== "send") return yield* settle(before, false);
-        const result = yield* client[WS_METHODS.factoryDecide](before.input);
+        const result = yield* client[WS_METHODS.factoryDecide](before.input).pipe(
+          unacknowledged("decide", "the answer"),
+        );
         // Another answer may have settled it between the read and ours: say which one counts.
         return yield* settle(yield* plan(), result.resolved);
       }),
