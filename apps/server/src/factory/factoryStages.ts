@@ -426,6 +426,17 @@ const ENVIRONMENT_RETRY = /:env:[0-9a-f]{12}:(?:owner:[0-9a-f]{16}|[0-9a-f]{32})
 /** A stage basis's core (before any `|` suffix) without its environment retry. */
 export const withoutEnvironmentRetry = (core: string) => core.replace(ENVIRONMENT_RETRY, "");
 
+/**
+ * The attempt a stage basis names: its exact environment retry (`env:<failure>:<run>` or
+ * `env:<failure>:owner:<rejection>`), or undefined for a first attempt. Read from the core only,
+ * so a `|`-led binding or resource suffix never passes for one.
+ */
+export const attemptOf = (stageBasis: string): string | undefined => {
+  const core = stageBasis.split("|")[0]!;
+  const retry = ENVIRONMENT_RETRY.exec(core);
+  return retry === null ? undefined : retry[0].slice(1);
+};
+
 /** The outcomes a stage may end in; workers report the agent stages' ones. */
 export const expectedOutcomes: Record<FactoryStageType, ReadonlyArray<FactoryOutcomeKind>> = {
   implement: ["implemented", "failed"],

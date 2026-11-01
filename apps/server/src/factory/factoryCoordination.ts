@@ -303,9 +303,18 @@ export const outputRootName = (input: {
   readonly failedOutcomeId: string;
   readonly commit: string;
   readonly templateSha256: string;
+  /** The retry attempt this root is for (`attemptOf` the basis); a first attempt names none. */
+  readonly attempt?: string | undefined;
 }) =>
   `${input.issue}-${sha256(
-    [input.itemKey, input.failedOutcomeId, input.commit, input.templateSha256].join("|"),
+    [
+      input.itemKey,
+      input.failedOutcomeId,
+      input.commit,
+      input.templateSha256,
+      // A root is one attempt's for ever; a retry derives its own, under the same first-attempt name.
+      ...(input.attempt === undefined ? [] : [input.attempt]),
+    ].join("|"),
   ).slice(0, 16)}`;
 
 /** The stage-basis suffix that makes a binding and its output root part of the decision. */

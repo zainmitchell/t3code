@@ -47,7 +47,7 @@ import { admittedBinding, deriveVerificationBinding, makeInsideRoot } from "./Fa
 import * as FactoryOutcomeStore from "./FactoryOutcomeStore.ts";
 import type { Landing } from "./factoryCoordination.ts";
 import { subjectOf } from "./factoryOutcomes.ts";
-import { withoutEnvironmentRetry } from "./factoryStages.ts";
+import { attemptOf, withoutEnvironmentRetry } from "./factoryStages.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 
@@ -683,6 +683,7 @@ const make = Effect.gen(function* () {
         execution: proposal.value.execution,
         workspace: { type: "worktree", baseRef: proposal.value.baseRef, startFromOrigin: false },
         itemVersion: reservation.itemVersion,
+        attempt: attemptOf(reservation.stageBasis ?? ""),
         record: "name",
       },
     );

@@ -18250,8 +18250,9 @@ const setupEndsWithoutExitCode = (workspace: string) =>
     };
   });
 
+/** A server run with the 32-hex id a process gets, so its retry basis parses as one. */
 const serverRun = (id: string, startedAt: number) => ({
-  id: id.repeat(32).slice(0, 32),
+  id: sha256(id).slice(0, 32),
   startedAt,
 });
 
@@ -18700,6 +18701,55 @@ it.effect(
           assert.strictEqual(yield* Ref.get(scans), 0);
           assert.strictEqual((yield* itemClaims)[0]?.[0], build.reservation.reservationId);
           assert.strictEqual(yield* dispositionOf(7965), "not_owned");
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "Environment/startup: a bound verification whose workspace preparation failed is run again in a later server run under its own new output root",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const { fs, outputs, failedOutcomeId } = yield* setUpBoundProof(7571, 7572, "c0007572");
+          const item = itemKeyFor(7571);
+          const first = serverRun("p", 0);
+          yield* setupEndsWithoutExitCode(yield* FactoryWorkspace);
+          const basisOf = (admission: FactoryLifecycle.FactoryAdmissionResult) =>
+            admission.reservation.origin === "admitted"
+              ? admission.reservation.stageBasis
+              : undefined;
+          const outOf = (basis: string | undefined) =>
+            /\|out:([0-9a-f]{32})$/.exec(basis ?? "")?.[1];
+
+          const rework = admittedBy(yield* inServerRun(first, advance("outcome")));
+          assert.deepStrictEqual(stageOf(rework), [item, "rework"]);
+          const firstOut = outOf(basisOf(rework));
+          assert.isDefined(firstOut);
+          const firstRoots = (yield* fs.readDirectory(outputs)).toSorted();
+          yield* inServerRun(first, startsNothing);
+          assert.isTrue(yield* waitsOnEnvironment(7571));
+          assert.include((yield* recordOf(7571))?.detail ?? "", failedOutcomeId.slice(0, 0));
+
+          // A later run: the same bound verification runs again, in an output root of its own.
+          const second = yield* laterServerRun("q");
+          const [retry, ...others] = yield* inServerRun(second, concurrentPasses);
+          assert.deepStrictEqual(others, []);
+          assert.deepStrictEqual(stageOf(retry!), [item, "rework"]);
+          const secondOut = outOf(basisOf(retry!));
+          assert.isDefined(secondOut);
+          assert.notStrictEqual(secondOut, firstOut);
+          assert.match(
+            basisOf(retry!) ?? "",
+            /:env:[0-9a-f]{12}:[0-9a-f]{32}\|vb:[0-9a-f]{32}\|out:[0-9a-f]{32}$/,
+          );
+          // The first attempt's root and record are untouched; the retry has its own beside them.
+          const roots = (yield* fs.readDirectory(outputs)).toSorted();
+          assert.includeMembers(roots, firstRoots);
+          assert.isAbove(roots.length, firstRoots.length);
+          yield* inServerRun(second, startsNothing);
+          assert.isTrue(yield* waitsOnEnvironment(7571));
         }),
       ),
     ),

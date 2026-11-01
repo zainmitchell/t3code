@@ -142,6 +142,7 @@ import {
 import { forkParked } from "../serverActivation.ts";
 import {
   AGENT_STAGES,
+  attemptOf,
   type EnvironmentFailure,
   environmentFailures,
   type FactoryStage,
@@ -1556,6 +1557,8 @@ export interface VerificationBindingInput {
   readonly workspace: OrchestrationV2ThreadLaunchWorkspaceStrategy | undefined;
   /** The item version the verification runs for; a unit prepared for another proves nothing. */
   readonly itemVersion: string;
+  /** The retry attempt the decision runs as (its basis's environment retry); none for a first. */
+  readonly attempt: string | undefined;
   /**
    * A binding derived from a template is recorded whole for its worker to read. Admission writes
    * the record if it is absent; a first use only names it, for its caller to check after the digest.
@@ -1830,6 +1833,7 @@ export const deriveVerificationBinding = Effect.fnUntraced(function* (
             failedOutcomeId: failed.outcomeId,
             commit: landed.commit,
             templateSha256: pointer.sha256,
+            attempt: input.attempt,
           }),
         );
   const named = path.relative(path.resolve(verification.outputBase), outputRoot);
@@ -5561,6 +5565,7 @@ const make = Effect.gen(function* () {
           execution: decision.execution,
           workspace: decision.workspaceStrategy,
           itemVersion: candidate.observation.itemVersion,
+          attempt: attemptOf(`${stageBasis(stage)}${environmentRetry}`),
           record: "write",
         },
       );

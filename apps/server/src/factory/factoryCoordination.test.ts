@@ -187,6 +187,18 @@ describe("binding naming", () => {
     );
     assert.strictEqual(roots.size, 4);
     assert.match(outputRootName(at), /^139-[0-9a-f]{16}$/);
+    // A first attempt names the root it always did; each retry attempt names its own, once.
+    const run = "env:0123456789ab:" + "b".repeat(32);
+    const owner = "env:0123456789ab:owner:" + "c".repeat(16);
+    assert.strictEqual(outputRootName({ ...at, attempt: undefined }), outputRootName(at));
+    assert.strictEqual(
+      outputRootName({ ...at, attempt: run }),
+      outputRootName({ ...at, attempt: run }),
+    );
+    assert.strictEqual(
+      new Set([at, { ...at, attempt: run }, { ...at, attempt: owner }].map(outputRootName)).size,
+      3,
+    );
   });
 
   it("reads a template or a whole binding, and nothing else", () => {

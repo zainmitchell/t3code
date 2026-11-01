@@ -1,6 +1,7 @@
 import { assert, describe, it } from "@effect/vitest";
 
 import {
+  attemptOf,
   correctedFailure,
   environmentFailures,
   type ItemEvent,
@@ -510,6 +511,25 @@ describe("an attempt that failed in its environment (connector #107)", () => {
     events.push(environment("review"), { type: "reopened", seq: ++seq, closureOutcomeId: "c" });
     assert.strictEqual(environmentFailures(events).size, 0);
   });
+});
+
+it("a stage basis names its exact retry attempt, or none; an id that is not a run's or an owner's is no attempt", () => {
+  const spec = "s".repeat(40);
+  const run = "b".repeat(32);
+  const env = `env:0123456789ab:${run}`;
+  const owner = `env:0123456789ab:owner:${"c".repeat(16)}`;
+  assert.strictEqual(attemptOf(`rework:${spec}:${env}`), env);
+  assert.strictEqual(
+    attemptOf(`rework:${spec}:${env}|vb:${"d".repeat(32)}|out:${"e".repeat(32)}`),
+    env,
+  );
+  assert.strictEqual(attemptOf(`rework:${spec}:${owner}|res:ocr`), owner);
+  assert.isUndefined(attemptOf(`rework:${spec}`));
+  assert.isUndefined(attemptOf(`rework:${spec}|vb:${"d".repeat(32)}|out:${"e".repeat(32)}`));
+  // Fails closed: a run id that is not 32 hex, a short failure digest, or an env in a suffix.
+  assert.isUndefined(attemptOf(`rework:${spec}:env:0123456789ab:${"q".repeat(32)}`));
+  assert.isUndefined(attemptOf(`rework:${spec}:env:0123:${run}`));
+  assert.isUndefined(attemptOf(`rework:${spec}|exe:${env}`));
 });
 
 it("a correction basis names the failure it corrects, whatever retry, environment or binding suffix follows (connector #123)", () => {
