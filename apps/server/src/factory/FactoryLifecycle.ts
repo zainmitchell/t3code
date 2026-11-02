@@ -2542,11 +2542,15 @@ const make = Effect.gen(function* () {
       if ("unread" in adoptions) return { unread: adoptions.unread };
       return adoptions.found.length === 1 ? { document: adoptions.found[0]!.document } : undefined;
     }),
-    settleThread: (reservation) =>
+    settleThread: (reservation, threadId) =>
       orchestrator.dispatch({
         type: "thread.settle",
-        commandId: CommandId.make(`factory-stage-settle:${reservation.reservationId}`),
-        threadId: reservation.execution.threadId,
+        commandId: CommandId.make(
+          threadId === reservation.execution.threadId
+            ? `factory-stage-settle:${reservation.reservationId}`
+            : `factory-stage-settle:${reservation.reservationId}:${threadId}`,
+        ),
+        threadId,
       }),
     custodyOf: (reservation) =>
       custodyOf(reservation).pipe(

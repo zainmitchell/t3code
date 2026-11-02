@@ -17664,11 +17664,17 @@ const settledAtOf = (threadId: ThreadId) =>
     thread.settledAt === null ? null : DateTime.toEpochMillis(thread.settledAt),
   );
 
-/** The `thread.settled` events the factory's own settle command for the stage committed. */
-const stageSettledEvents = (reservationId: FactoryReservationId) =>
+/** The `thread.settled` events the factory's own settle command for the stage, or a descendant, committed. */
+const stageSettledEvents = (reservationId: FactoryReservationId, descendant?: ThreadId) =>
   Effect.flatMap(EventSink.EventSinkV2, (sink) =>
     sink
-      .readByCommandId({ commandId: CommandId.make(`factory-stage-settle:${reservationId}`) })
+      .readByCommandId({
+        commandId: CommandId.make(
+          descendant === undefined
+            ? `factory-stage-settle:${reservationId}`
+            : `factory-stage-settle:${reservationId}:${descendant}`,
+        ),
+      })
       .pipe(
         Stream.filter((stored) => stored.event.type === "thread.settled"),
         Stream.runCollect,
@@ -18937,6 +18943,111 @@ it.effect(
             );
             assert.strictEqual(yield* stageSettledEvents(stage.reservation.reservationId), 1);
           }
+        }),
+      ),
+    ),
+);
+
+/** A child thread the provider opened under `parentThreadId` for its own subagent, as Codex does. */
+const providerChildOf = (parentThreadId: ThreadId, label: string) =>
+  Effect.gen(function* () {
+    const parent = yield* threadOf(parentThreadId);
+    const id = ThreadId.make(`thread:provider:codex:native-thread:${label}`);
+    const now = yield* DateTime.now;
+    yield* (yield* EventSink.EventSinkV2).write({
+      events: [
+        {
+          id: EventId.make(`event:provider-child:${label}`),
+          type: "thread.created",
+          threadId: id,
+          providerInstanceId: parent.providerInstanceId,
+          occurredAt: now,
+          payload: {
+            ...parent,
+            id,
+            title: label,
+            createdBy: "agent",
+            creationSource: "provider",
+            lineage: {
+              parentThreadId,
+              relationshipToParent: "subagent",
+              rootThreadId: parent.lineage.rootThreadId,
+            },
+            activeProviderThreadId: null,
+            forkedFrom: null,
+            createdAt: now,
+            updatedAt: now,
+            settledOverride: null,
+            settledAt: null,
+            lastVisitedAt: null,
+          },
+        },
+      ],
+    });
+    return id;
+  });
+
+it.effect(
+  "Lifecycle/settle: a finished stage's provider child threads settle with it, once; a live stage's and unrelated ones do not",
+  () =>
+    runIsolated(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* configureLifecycleFactory;
+          yield* seedIssue(7917);
+          const implement = admittedBy(yield* advance("tracker_event", 1));
+          yield* recordCommit("d0007917", [lifecycleBase]);
+          yield* workStage(implement, {
+            outcome: "implemented",
+            subject: subjectFor("d0007917", lifecycleBase),
+            summary: "Implemented.",
+          });
+          // A Codex review stage opens /root/spec, which opens /root/standards.
+          const review = admittedBy(yield* advance("outcome"));
+          const { threadId } = yield* startStage(review);
+          const spec = yield* providerChildOf(threadId, "7917-spec");
+          const standards = yield* providerChildOf(spec, "7917-standards");
+          const other = yield* completedConversation("7917-other");
+          const stray = yield* providerChildOf(other.threadId, "7917-stray");
+          yield* reportFrom(threadId, {
+            outcome: "review_failed",
+            subject: subjectFor("d0007917"),
+            failure: "test_a fails",
+            summary: "One failing check.",
+          });
+          yield* completeLatestRun(threadId);
+          const correct = admittedBy(yield* advance("outcome"));
+          const { reservationId } = review.reservation;
+          assert.strictEqual((yield* reservationOf(reservationId))?.state, "released");
+          for (const settled of [threadId, spec, standards]) {
+            assert.strictEqual((yield* threadOf(settled)).settledOverride, "settled");
+          }
+          assert.strictEqual((yield* threadOf(stray)).settledOverride, null);
+          // The correction under way keeps its own child as it is.
+          const live = yield* startStage(correct);
+          const liveChild = yield* providerChildOf(live.threadId, "7917-live");
+          // A replay settles nothing further.
+          const settledAt = [yield* settledAtOf(spec), yield* settledAtOf(standards)];
+          yield* TestClock.adjust("1 minute");
+          assert.deepStrictEqual(yield* advance("clock", 2), []);
+          assert.deepStrictEqual(
+            [yield* settledAtOf(spec), yield* settledAtOf(standards)],
+            settledAt,
+          );
+          assert.deepStrictEqual(
+            [
+              yield* stageSettledEvents(reservationId),
+              yield* stageSettledEvents(reservationId, spec),
+              yield* stageSettledEvents(reservationId, standards),
+            ],
+            [1, 1, 1],
+          );
+          assert.strictEqual(
+            (yield* reservationOf(correct.reservation.reservationId))?.state,
+            "held",
+          );
+          assert.strictEqual((yield* threadOf(liveChild)).settledOverride, null);
+          assert.strictEqual((yield* threadOf(stray)).settledOverride, null);
         }),
       ),
     ),

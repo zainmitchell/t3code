@@ -140,6 +140,23 @@ const endedWithNothingOwed = (projection: OrchestrationV2ThreadProjection) =>
   owedWakes(projection).length === 0 &&
   !awaitsPullRequestChecks(projection.thread);
 
+/** A thread the factory may settle: live, not overridden by a person, and owing nothing. */
+const nothingOwed = (projection: OrchestrationV2ThreadProjection) => {
+  const { thread } = projection;
+  return (
+    thread.archivedAt === null &&
+    thread.deletedAt === null &&
+    thread.settledOverride === null &&
+    projection.runs.every((run) => TERMINAL_RUN_STATUSES.has(run.status)) &&
+    !projection.runtimeRequests.some((request) => request.status === "pending") &&
+    owedWakes(projection).length === 0 &&
+    !awaitsPullRequestChecks(thread) &&
+    !projection.providerThreads.some(
+      (candidate) => (candidate.pendingBackgroundTasks?.length ?? 0) > 0,
+    )
+  );
+};
+
 const isReportFailure = Schema.is(FactoryReportFailure);
 
 const reportFailure = (code: FactoryReportFailure["code"], message: string) =>
@@ -160,9 +177,13 @@ export interface FactoryOutcomeDependencies {
   readonly custodyOf: (
     reservation: FactoryStore.FactoryReservation,
   ) => Effect.Effect<FactoryCustody>;
-  /** Settles the stage's thread in the inbox under a command id stable across passes. */
+  /**
+   * Settles the stage's thread, or one of its descendants, in the inbox under a command id stable
+   * across passes for that stage and thread.
+   */
   readonly settleThread: (
     reservation: FactoryStore.NativeReservation & { readonly origin: "admitted" },
+    threadId: ThreadId,
   ) => Effect.Effect<unknown, Orchestrator.OrchestratorV2Error>;
   /**
    * The digest of the reported artifacts when every one is inside the artifact root and its bytes
@@ -674,31 +695,29 @@ export const makeFactoryOutcomes = (deps: FactoryOutcomeDependencies) => {
   });
 
   /**
-   * Settles a released stage's thread once nothing on it is owed; a person's un-settle or any
-   * owed work leaves it for a later pass. One command id per stage: a replay is a no-op.
+   * Settles a released stage's thread, and first each of its descendants (the provider's own
+   * child threads included), once nothing on it is owed; a person's un-settle or any owed work
+   * leaves it for a later pass. One command id per stage and thread: a replay is a no-op.
    */
   const settleStageThread = Effect.fnUntraced(function* (
     reservation: FactoryStore.NativeReservation & { readonly origin: "admitted" },
   ) {
-    const projection = yield* projections.getThreadProjection(reservation.execution.threadId);
-    const { thread } = projection;
-    if (
-      thread.archivedAt !== null ||
-      thread.deletedAt !== null ||
-      thread.settledOverride !== null ||
-      !projection.runs.every((run) => TERMINAL_RUN_STATUSES.has(run.status)) ||
-      projection.runtimeRequests.some((request) => request.status === "pending") ||
-      owedWakes(projection).length > 0 ||
-      awaitsPullRequestChecks(thread) ||
-      projection.providerThreads.some(
-        (candidate) => (candidate.pendingBackgroundTasks?.length ?? 0) > 0,
-      )
-    ) {
-      return;
+    const stageThreadId = reservation.execution.threadId;
+    const settleQuiet = (threadId: ThreadId) =>
+      deps
+        .settleThread(reservation, threadId)
+        .pipe(Effect.catchTags({ OrchestratorCommandPreviouslyRejectedError: () => Effect.void }));
+    if (!nothingOwed(yield* projections.getThreadProjection(stageThreadId))) return;
+    // The stage settles last, so a pass that stops partway leaves it for the next to finish.
+    const lineage =
+      projections.getLineageDescendants === undefined
+        ? { threadIds: [] }
+        : yield* projections.getLineageDescendants([stageThreadId]);
+    for (const childId of lineage.threadIds) {
+      const child = yield* projections.getThreadProjection(childId).pipe(Effect.option);
+      if (Option.isSome(child) && nothingOwed(child.value)) yield* settleQuiet(childId);
     }
-    yield* deps
-      .settleThread(reservation)
-      .pipe(Effect.catchTags({ OrchestratorCommandPreviouslyRejectedError: () => Effect.void }));
+    yield* settleQuiet(stageThreadId);
   });
 
   /**
