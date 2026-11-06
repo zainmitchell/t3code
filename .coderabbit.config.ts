@@ -36,10 +36,10 @@ export default defineConfig((ctx) => ({
     allow_author_approval: !isGated(ctx),
     auto_review: {
       enabled: true,
-      auto_incremental_review: true,
+      auto_incremental_review: false,
       auto_pause_after_reviewed_commits: 0,
       base_branches: [".*"],
-      drafts: true,
+      drafts: false,
     },
     tools: {
       gitleaks: { enabled: true },
