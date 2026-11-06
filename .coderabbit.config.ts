@@ -113,12 +113,12 @@ export default defineConfig((ctx) => ({
           "Use only committed engineering source and rules as context. Do not copy private identifiers into findings.",
       },
     ],
-    issues: { scope: "local" },
-    pull_requests: { scope: "local" },
+    issues: { scope: localScope },
+    pull_requests: { scope: localScope },
     learnings: { scope: localScope },
-    jira: { usage: "disabled" },
-    linear: { usage: "disabled" },
-    mcp: { usage: "disabled" },
+    jira: { usage: disabledIntegration },
+    linear: { usage: disabledIntegration },
+    mcp: { usage: disabledIntegration },
     web_search: { enabled: true },
     code_guidelines: {
       filePatterns: [
