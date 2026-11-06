@@ -35,6 +35,7 @@ export default defineConfig((ctx) => ({
     related_prs: true,
     allow_author_approval: !isGated(ctx),
     auto_review: {
+      ignore_title_keywords: ["chore", "docs", "test", "ci", "build", "style", "WIP"],
       enabled: true,
       auto_incremental_review: false,
       auto_pause_after_reviewed_commits: 0,
