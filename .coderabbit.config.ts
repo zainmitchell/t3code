@@ -106,13 +106,7 @@ export default defineConfig((ctx) => ({
   knowledge_base: {
     opt_out: false,
     automatic_linking_mode: "disabled",
-    linked_repositories: [
-      {
-        repository: "zainmitchell/t3-native-connectors",
-        instructions:
-          "Use only committed engineering source and rules as context. Do not copy private identifiers into findings.",
-      },
-    ],
+    linked_repositories: [],
     issues: { scope: localScope },
     pull_requests: { scope: localScope },
     learnings: { scope: localScope },
